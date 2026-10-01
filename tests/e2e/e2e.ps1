@@ -160,6 +160,27 @@ Start-Sleep -Milliseconds 500
 #    等于每跑一次测试就毁掉用户一次密钥（实测确实丢了）。
 #    改为：跑前备份到 .e2e-backup，跑完在退出处还原（见文件末尾）。
 $cfgBak = $cfgFile + ".e2e-backup"
+# 还原用户配置：删除测试产生的临时配置，把备份放回原位。
+# 做成函数是为了让"正常结束"与"异常退出兜底"共用同一实现，避免逻辑分叉。
+function Restore-UserConfig {
+  if ($script:cfgRestored) { return }
+  $script:cfgRestored = $true
+  try {
+    if (Test-Path $script:cfgFile) { Remove-Item $script:cfgFile -Force }
+    if (Test-Path $script:cfgBak) {
+      Move-Item $script:cfgBak $script:cfgFile -Force
+      Write-Host "[INFO] 已还原用户配置（含 DPAPI 密钥）"
+    } else {
+      Write-Host "[INFO] 本次运行无可还原的用户配置（运行前本就没有 config）"
+    }
+  } catch { Write-Host ("[WARN] 还原用户配置失败: " + $_.Exception.Message) }
+}
+# 兜底：脚本因任何原因（报错 / Ctrl-C / 被外部终止）提前结束，也要把配置还回去。
+# 实测踩到过：上一次 E2E 被中断后只留下 .e2e-backup，用户的 config 一直处于缺失状态。
+$script:cfgFile = $cfgFile
+$script:cfgBak  = $cfgBak
+$script:cfgRestored = $false
+Register-EngineEvent PowerShell.Exiting -SupportEvent -Action { Restore-UserConfig } | Out-Null
 # 兜底：若上次运行异常中断、留下未还原的备份，先把用户配置还回去再做本次备份
 #（否则会拿"上次残留的临时配置"当用户配置，把真正的那份覆盖掉）
 if ((Test-Path $cfgBak) -and -not (Test-Path $cfgFile)) {
@@ -267,6 +288,10 @@ for ($i = 0; $i -lt 3 -and ($okFetch -eq $null); $i++) {
 Note ($okFetch -ne $null) "2.1 自动获取模型列表（mock 返回 2 个模型）" ""
 $okTest = $null
 for ($i = 0; $i -lt 3 -and ($okTest -eq $null); $i++) {
+  # 等"获取模型列表"真正收尾再点：SetupDialog.Guarded 有 `if (busy) return;`，
+  # 上一次请求未完成时点击会被**静默忽略**（不报错、无提示）。
+  # 不等就会偶发 2.2 失败（实测 3 次里挂 1 次），属测试时序不稳，非产品缺陷。
+  Start-Sleep -Milliseconds 1200
   Click-Fg $p ($dx + 88) ($dy + 290)                          # 测试连接
   $okTest = Find-NameLike $p "✓ 模型可用*" 20
 }
@@ -465,12 +490,7 @@ Note ($null -eq $alive) "7.1 正常退出（无残留进程）" ""
 
 # 还原用户配置（含 DPAPI 密钥）：先删测试产生的临时配置，再把备份放回原位。
 # 绝不能只删不还——那等于每跑一次 E2E 就毁掉用户一次密钥。
-if (Test-Path $cfgFile) { Remove-Item $cfgFile -Force }
-if (Test-Path $cfgBak) {
-  Move-Item $cfgBak $cfgFile -Force
-  Write-Host "[INFO] 已还原用户配置（含 DPAPI 密钥）"
-} else {
-  Write-Host "[INFO] 本次运行无可还原的用户配置（运行前本就没有 config）"
-}
+# 这里调用共用函数，保证与"异常退出兜底"走同一条还原逻辑。
+Restore-UserConfig
 Write-Host ("===== E2E RESULT: PASS=" + $script:pass + " FAIL=" + $script:fail + " =====")
 if ($script:fail -gt 0) { exit 2 } else { exit 0 }

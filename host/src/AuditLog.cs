@@ -17,9 +17,16 @@ namespace OfficeAgent.Host
     {
         const long MaxBytes = 5L * 1024 * 1024;
         static object gate = new object();
-        static bool loaded = false;
         static long lastSeq = 0;
         static string lastHash = "GENESIS";
+        // 跨进程互斥用的锁文件。为什么需要它：
+        //   `lock (gate)` 只能串行化**同一进程内**的线程；而 lastSeq/lastHash 是本进程缓存。
+        //   两个进程（例如 GUI 开着、同时跑 CLI 自测）各自 LoadTail 后都会算出
+        //   seq = lastSeq + 1 并各自 Append，于是产生重复 seq 与"分叉链"
+        //   （同一 prev 被两条后续记录引用）→ VerifyChain 会误报"审计日志可能被篡改"。
+        //   审计哈希链的价值全在于"任何异常都可检出"，因此这种**正常并发造成的假告警**
+        //   必须消除：任何一次写之前都要重新读尾部，并持有跨进程文件锁。
+        static readonly string LockFile = Path.Combine(Dir(), "audit.lock");
 
         public static string Dir()
         {
@@ -70,20 +77,43 @@ namespace OfficeAgent.Host
                 }
             }
             catch { }
-            loaded = true;
         }
 
-        // 记录一条事件（任何线程可调；失败静默——审计不阻断业务）
+        // 记录一条事件（任何线程/任何进程可调；失败静默——审计不阻断业务）
+        //
+        // 并发正确性（本方法的核心约束）：
+        //   * 进程内：lock (gate) 串行化线程；
+        //   * 跨进程：持有 audit.lock 的 FileStream 独占句柄，保证"重读尾部 → 算 seq → 追加"
+        //     整段原子。**每次写前都 LoadTail()**，绝不用可能过期的进程内缓存——
+        //     否则另一进程刚追加的记录会被我们覆盖式地重排，产生重复 seq 与分叉链。
         public static void Record(string type, string detail)
         {
+            FileStream flock = null;
             try
             {
                 lock (gate)
                 {
-                    if (!loaded) LoadTail();
                     string dir = Dir();
                     if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
                     string path = FilePath();
+
+                    // 1) 取跨进程锁（最多等 10s；拿不到就放弃本次审计，绝不阻塞业务）
+                    //    注意：锁文件与日志文件必须分开，否则轮转时 Move 会与锁句柄冲突。
+                    for (int i = 0; i < 100 && flock == null; i++)
+                    {
+                        try
+                        {
+                            flock = new FileStream(LockFile, FileMode.OpenOrCreate,
+                                FileAccess.ReadWrite, FileShare.None);
+                        }
+                        catch { System.Threading.Thread.Sleep(100); }
+                    }
+                    if (flock == null) return;   // 拿不到锁：放弃记录，不阻断业务
+
+                    // 2) 持锁后重新读尾部（关键：跨进程时进程内缓存不可信）
+                    LoadTail();
+
+                    // 3) 轮转（>5MB）
                     try
                     {
                         FileInfo fi = new FileInfo(path);
@@ -96,6 +126,8 @@ namespace OfficeAgent.Host
                         }
                     }
                     catch { }
+
+                    // 4) 算链并追加
                     long seq = lastSeq + 1;
                     string t = NowText();
                     string h = ComputeHash(lastHash, seq, t, type, detail);
@@ -111,6 +143,10 @@ namespace OfficeAgent.Host
                 }
             }
             catch { }
+            finally
+            {
+                if (flock != null) { try { flock.Close(); } catch { } }
+            }
         }
 
         // 校验全链（含轮转前的当前文件）：返回 null=通过，否则错误描述；brokenSeq=断点

@@ -23,6 +23,10 @@ namespace OfficeAgent.Host
         public int ConvTargetIndex = 0;    // 转换偏好：上次目标格式（0=PDF 1=CSV 2=XLSX）
         public int PrivacyLevel = 1;       // 隐私分级（设计方案 §7.2）：0=全本地 1=脱敏出网(默认) 2=全量
         public bool WebSearch = true;      // 联网搜索工具（智谱系端点 web_search；关=纯本地对话）
+        // 最终答复流式输出。开启时：模型给出答复的那一跳会再发一次 stream:true 请求来逐字显示，
+        // 代价是该跳多一次请求（token 与时间成本翻一倍）。纯问答场景收益有限，
+        // 因此仅在"已经执行过工具"的长任务里才流式（见 AgentLoop），单轮问答自动跳过。
+        public bool StreamFinal = true;
         public string WorkspaceDir = "";   // 默认工作区目录：空=文档\OfficeAgentFiles（侧边栏可为项目单独设工作区）
         public string ActiveWorkspaceId = "";   // 当前激活的工作区 id（对应 workspaces.json）
 
@@ -95,6 +99,7 @@ namespace OfficeAgent.Host
                 sb.Append("  \"convTargetIndex\": ").Append(ConvTargetIndex).Append(",\n");
                 sb.Append("  \"privacyLevel\": ").Append(PrivacyLevel >= 0 && PrivacyLevel <= 2 ? PrivacyLevel : 1).Append(",\n");
                 sb.Append("  \"webSearch\": ").Append(WebSearch ? "true" : "false").Append(",\n");
+                sb.Append("  \"streamFinal\": ").Append(StreamFinal ? "true" : "false").Append(",\n");
                 sb.Append("  \"workspaceDir\": \"").Append(Js(WorkspaceDir)).Append("\",\n");
                 sb.Append("  \"activeWorkspaceId\": \"").Append(Js(ActiveWorkspaceId)).Append("\",\n");
                 sb.Append("  \"keyBlob\": \"").Append(KeyBlob == null ? "" : Convert.ToBase64String(KeyBlob)).Append("\"\n");
@@ -124,6 +129,7 @@ namespace OfficeAgent.Host
                 int pl;
                 if (int.TryParse(JsGet(json, "privacyLevel"), out pl) && pl >= 0 && pl <= 2) c.PrivacyLevel = pl;
                 c.WebSearch = GetBool(json, "webSearch", true);
+                c.StreamFinal = GetBool(json, "streamFinal", true);
                 c.WorkspaceDir = JsGet(json, "workspaceDir");
                 if (c.WorkspaceDir == null) c.WorkspaceDir = "";
                 c.ActiveWorkspaceId = JsGet(json, "activeWorkspaceId");

@@ -89,13 +89,19 @@ namespace OfficeAgent.Host
                     if (!reply.HasToolCalls)
                     {
                         // 这一跳就是最终答复（模型不再要工具）。
-                        // 若开了流式：用同样的 messages 再发一次 stream:true，让用户看到文字逐段出现。
-                        // 代价：仅在最后一跳多一次请求；失败则直接用已拿到的文本，不影响正确性。
-                        if (onDelta != null && reply.Content != null && reply.Content.Length > 0)
+                        // 流式策略：只有当本回合**已经跑过工具**（长任务，用户等待久、逐字显示有实感）
+                        // 且配置开启时才复查一次 stream:true。
+                        // 理由：流式复现要**再发一次请求**，而单轮问答是最常见场景，
+                        // 让它每次多花一倍 token/时间不划算（用户明确对成本敏感）。
+                        bool wantStream = onDelta != null && r.UsedTools &&
+                                          (config == null || config.StreamFinal) &&
+                                          reply.Content != null && reply.Content.Length > 0;
+                        if (wantStream)
                         {
                             string serr;
                             string sbody = client.ChatFinalStream(
                                 LlmClient.BuildMessagesJson(sysPrompt, request), onDelta, out serr);
+                            // 流式那次是独立采样：为空说明这次没拿到内容，回退到已得的文本。
                             r.FinalText = (sbody != null && sbody.Length > 0) ? sbody : reply.Content;
                         }
                         else r.FinalText = reply.Content;
@@ -118,6 +124,9 @@ namespace OfficeAgent.Host
                     {
                         r.UsedTools = true;
                         bool ok = true;
+                        // 三态：正常执行 / 主动跳过（重复调用）/ 失败。
+                        // 跳过不能算失败——否则日志渲染成 ✗、审计写 ok=False，语义就错了。
+                        bool skipped = false;
                         string result;
                         if (call[1] == "task_plan")
                         {
@@ -129,14 +138,16 @@ namespace OfficeAgent.Host
                         {
                             // 重复调用检测：同一工具+同一参数第二次出现时，不再重复执行，
                             // 直接把"你刚做过同样的调用"告诉模型，逼它换策略或收尾。
-                            // （只读类工具重复无副作用但也无意义；写类工具重复执行更危险。）
-                            string sig = (call[1] ?? "") + "|" + (call[2] ?? "");
+                            // 分隔符用 \u0001（不可见控制字符）而非 "|"：后者不可单射——
+                            // ("a","b|c") 与 ("a|b","c") 会拼出同一个 "a|b|c" 而误判为重复调用。
+                            // 模型的 argsJson 里确实可能出现 "|"（如 create_presentation 的 outline）。
+                            string sig = (call[1] ?? "") + "\u0001" + (call[2] ?? "");
                             int seenTimes = 0;
                             if (callCount.ContainsKey(sig)) { seenTimes = callCount[sig]; callCount[sig] = seenTimes + 1; }
                             else { callCount[sig] = 1; }
                             if (seenTimes >= 1)
                             {
-                                ok = false;
+                                skipped = true;
                                 result = "你已经用完全相同的参数调用过 " + call[1] +
                                     " 了，结果在上面，不要重复调用。" +
                                     "请换一种做法（换参数/换路径/换工具），或者如果信息已经够了就直接给出最终答复。";
@@ -149,8 +160,11 @@ namespace OfficeAgent.Host
                         }
                         request.Add(new LlmTurn("tool@" + call[0], result));
                         if (log.Length > 0) log.Append("\n");
-                        log.Append("🔧 ").Append(call[1]).Append(ok ? " ✓" : " ✗");
-                        AuditLog.Record("tool_call", call[1] + "; ok=" + ok);
+                        log.Append("🔧 ").Append(call[1]).Append(skipped ? " ↷跳过" : (ok ? " ✓" : " ✗"));
+                        // 审计值用小写 true/false（bool.ToString() 会给 True/False，
+                        // 与既有审计记录约定不一致，也会让 grep "ok=false" 漏掉）。
+                        AuditLog.Record("tool_call", call[1] + "; " +
+                            (skipped ? "skipped=duplicate" : ("ok=" + (ok ? "true" : "false"))));
                         if (onToolLog != null)
                         {
                             try { onToolLog(log.ToString()); } catch { }

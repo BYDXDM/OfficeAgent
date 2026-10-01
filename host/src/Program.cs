@@ -974,8 +974,9 @@ namespace OfficeAgent.Host
         Console.WriteLine((pptxOk ? "[OK]  " : "[FAIL] ") + "CreatePresentation 直测（" + genMsg + "）");
 
         // 9b. 同名产物避让（回归：agent 不能静默覆盖用户既有文件）
-        // 无界面时 ConfirmOverwrite=null → 自动改名 t(2).xlsx，旧文件内容保持不动。
-        AgentTools.ConfirmOverwrite = null;
+        // 现在不再询问用户（询问需阻塞后台线程），一律自动改名并回调通知。
+        string notified = "";
+        AgentTools.OnOverwriteAvoided = delegate(string existing) { notified = existing; };
         string keepPath = System.IO.Path.Combine(genDir, "keep.xlsx");
         System.IO.File.WriteAllText(keepPath, "OLD", System.Text.Encoding.UTF8);
         bool owOk;
@@ -985,10 +986,24 @@ namespace OfficeAgent.Host
         try { keptText = System.IO.File.ReadAllText(keepPath, System.Text.Encoding.UTF8); } catch { }
         bool renamed = owOk && System.IO.File.Exists(System.IO.Path.Combine(genDir, "keep(2).xlsx"));
         bool preserved = keptText == "OLD";
-        if (!renamed || !preserved) failed++;
-        Console.WriteLine(((renamed && preserved) ? "[OK]  " : "[FAIL] ") +
+        bool notifiedOk = notified == keepPath;
+        if (!renamed || !preserved || !notifiedOk) failed++;
+        Console.WriteLine(((renamed && preserved && notifiedOk) ? "[OK]  " : "[FAIL] ") +
             "同名产物避让（旧文件" + (preserved ? "保留" : "被改动") + "，新文件" +
-            (renamed ? "改名为 keep(2).xlsx" : "未改名") + "）");
+            (renamed ? "改名为 keep(2).xlsx" : "未改名") +
+            "，通知回调" + (notifiedOk ? "已触发" : "未触发") + "）");
+        AgentTools.OnOverwriteAvoided = null;   // 复位，避免影响后续用例
+
+        // 9c. 避让通知回调抛异常时不得影响产物落盘（回调是"锦上添花"）
+        AgentTools.OnOverwriteAvoided = delegate(string existing) { throw new InvalidOperationException("模拟通知失败"); };
+        bool robOk = false;
+        string robMsg = AgentTools.CreateSpreadsheet(
+            System.IO.Path.Combine(genDir, "keep.xlsx"), "姓名,金额\n赵六,2", out robOk);
+        AgentTools.OnOverwriteAvoided = null;
+        bool robFile = System.IO.File.Exists(System.IO.Path.Combine(genDir, "keep(3).xlsx"));
+        if (!robOk || !robFile) failed++;
+        Console.WriteLine(((robOk && robFile) ? "[OK]  " : "[FAIL] ") +
+            "避让通知异常不影响落盘（产物" + (robFile ? "已生成 keep(3).xlsx" : "未生成") + "）");
 
         Console.WriteLine("（产物保留在 " + genDir + " 供人工抽查，下次运行时清理）");
 

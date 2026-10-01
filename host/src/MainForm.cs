@@ -607,18 +607,23 @@ namespace OfficeAgent.Host
             chat.OnOpenSettings += delegate { ShowSetup(false); };
             chat.OnSessionSaved += delegate { RefreshSessions(); };
             chat.OnOpenPreview += delegate(string path) { ShowPreview(path); SelectPage(5); };
-            // 同名产物覆盖确认：agent 要写一个已存在的文件时先问用户（选"否"则自动改名，不丢旧文件）
-            AgentTools.ConfirmOverwrite = delegate(string path)
+            // 同名产物避让通知（**非阻塞**）：agent 的后台线程发现目标已存在时不会覆盖，
+            // 而是自动改名并回调到这里；这里只把它转成一条聊天区提示。
+            // 注意：回调发生在后台线程，所有 UI 操作必须经 Invoke 封送；
+            // 且这里绝不能弹模态框（会自建消息泵并挂住 worker 线程）。
+            AgentTools.OnOverwriteAvoided = delegate(string existingPath)
             {
                 try
                 {
-                    DialogResult dr = MessageBox.Show(this,
-                        "工作区里已经有同名文件：\n\n" + path + "\n\n要覆盖它吗？\n" +
-                        "选「否」会保留旧文件，新产物改用「文件名(2)」保存。",
-                        "文件已存在", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-                    return dr == DialogResult.Yes;
+                    if (chat == null) return;
+                    if (chat.InvokeRequired)
+                    {
+                        try { chat.BeginInvoke((MethodInvoker)delegate { chat.NotifyOverwriteAvoided(existingPath); }); }
+                        catch { }
+                    }
+                    else chat.NotifyOverwriteAvoided(existingPath);
                 }
-                catch { return false; }
+                catch { }
             };
             p.Controls.Add(chat);
             return p;

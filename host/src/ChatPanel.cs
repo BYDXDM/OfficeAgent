@@ -379,6 +379,9 @@ namespace OfficeAgent.Host
 
         public void NewConversation()
         {
+            // 先作废流式状态：msgs/list.Items 即将被清空，若不复位 streamingBubble，
+            // 残留的旧索引会在新会话里"看起来合法"，把流式文本写进新会话的无关消息。
+            CancelStreamBubble();
             sessionId = null;            // 新会话：首次发言时才创建 id
             msgs.Clear();
             list.Items.Clear();
@@ -408,6 +411,7 @@ namespace OfficeAgent.Host
         {
             List<string[]> rows = SessionStore.Load(id);
             if (rows.Count == 0) { NewConversation(); return; }
+            CancelStreamBubble();   // 同上：清列表前必须作废流式索引
             sessionId = id;
             msgs.Clear();
             list.Items.Clear();
@@ -786,6 +790,14 @@ namespace OfficeAgent.Host
             EndStreamBubble();
         }
 
+        // 放弃流式状态但不动 msgs/list（调用方马上就要整体 Clear 的场景：新建/切换会话）。
+        // 必须先关闸再清列表：否则定时器可能在列表清空后按残留索引写入无关消息。
+        void CancelStreamBubble()
+        {
+            streamClosed = true;
+            EndStreamBubble();
+        }
+
         // 流式期间的日志视图：ListBox 单条目高度超过视口后底部不可见（TopIndex 只能钉住条目顶部），
         // 表现为"AI 回复时不自动滚动"。进行中只显示最近几步保持气泡矮小，完整日志结束后再分块。
         static string TailOfLog(string log)
@@ -859,6 +871,20 @@ namespace OfficeAgent.Host
                 }
             }
             MarkDirty();
+        }
+
+        // 同名产物避让提示（UI 线程调用；由 MainForm 从后台线程 BeginInvoke 过来）。
+        // 只提示不阻塞：旧文件已保留，新产物落在不重名的路径上，用户无需做任何决定。
+        public void NotifyOverwriteAvoided(string existingPath)
+        {
+            try
+            {
+                string nm = existingPath == null ? "" : Path.GetFileName(existingPath);
+                Append("assistant", "注意：工作区里已经有「" + nm + "」，我没有覆盖它（旧文件保持不动），" +
+                    "新产物会自动存成不重名的文件名。如果你确实想覆盖，先把旧文件删掉再让我重做。", false, false);
+                MarkDirty();
+            }
+            catch { }
         }
 
         // 追加附件卡片气泡（并持久化到会话）

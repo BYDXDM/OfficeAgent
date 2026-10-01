@@ -21,31 +21,40 @@ namespace OfficeAgent.Host
         // 最近一次成功产出的文件路径（附件卡片用）
         public static string LastProduct = "";
 
-        // 同名产物覆盖确认：UI 注入（弹"已存在，是否覆盖"对话框）。
-        // 参数=目标全路径；返回 true=覆盖，false=改用不重名的新文件名。
-        // null（CLI/无界面）时自动改名，绝不静默覆盖用户既有文件。
-        public static Func<string, bool> ConfirmOverwrite = null;
+        // 同名产物的"已改名"通知：UI 注入。
+        // 参数 = 用户原本想要的文件全路径（已存在、未被覆盖）。
+        // ⚠️ 实现必须是**非阻塞**的（典型做法：BeginInvoke 到 UI 线程后在气泡里加一条提示）。
+        // 绝不能在这里弹模态对话框：本方法在 agent 的后台线程上被调用
+        // （ChatPanel.DoSend → new Thread → AgentLoop.Run → CreateSpreadsheet → 这里），
+        // 后台线程弹模态框会自建消息泵（行为不可预期），且用户不点就会一直挂住 worker 线程。
+        // 可空：CLI/无界面时不做任何通知。
+        public static Action<string> OnOverwriteAvoided = null;
 
-        // 产物路径避让：目标已存在时先问用户；不问或用户选"否"时自动加 (2)/(3) 后缀。
-        // 返回最终可写路径（保证不与既有文件重名，除非用户明确同意覆盖）。
+        // 产物路径避让：目标已存在时不覆盖，自动加 (2)/(3) 后缀，并通知 UI。
+        // 这是纯函数式的"绝不丢数据"策略：旧文件永远保留，新产物总有一个不重名的落点。
+        // 之所以不问用户：询问需要阻塞后台线程（见 OnOverwriteAvoided 注释）。
+        // 用户若要覆盖，删掉旧文件后让 agent 重做即可。
         static string AvoidOverwrite(string p)
         {
             if (p == null || !File.Exists(p)) return p;
-            if (ConfirmOverwrite != null)
-            {
-                bool overwrite = false;
-                try { overwrite = ConfirmOverwrite(p); } catch { }
-                if (overwrite) return p;
-            }
             string dir = Path.GetDirectoryName(p);
             string baseName = Path.GetFileNameWithoutExtension(p);
             string ext = Path.GetExtension(p);
+            string chosen = null;
             for (int i = 2; i < 1000; i++)
             {
                 string cand = Path.Combine(dir, baseName + "(" + i + ")" + ext);
-                if (!File.Exists(cand)) return cand;
+                if (!File.Exists(cand)) { chosen = cand; break; }
             }
-            return Path.Combine(dir, baseName + "_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ext);
+            if (chosen == null)
+                chosen = Path.Combine(dir, baseName + "_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ext);
+            // 通知是"锦上添花"：回调自身抛异常绝不能影响产物落盘
+            if (OnOverwriteAvoided != null)
+            {
+                try { OnOverwriteAvoided(p); } catch { }
+            }
+            AuditLog.Record("file_write", "avoid_overwrite existing=" + p + " -> " + chosen);
+            return chosen;
         }
         // 工具 schema（OpenAI function calling 格式；智谱等兼容端点同格式）
         public static string SchemasJson()
@@ -437,7 +446,8 @@ namespace OfficeAgent.Host
             catch (Exception ex) { err = "输出路径非法: " + ex.Message; return null; }
             if (!p.EndsWith(ext, StringComparison.OrdinalIgnoreCase)) { err = "输出路径必须是 " + ext + " 文件"; return null; }
             try { string parent = Path.GetDirectoryName(p); if (parent != null && parent.Length > 0) Directory.CreateDirectory(parent); } catch { }
-            // 同名文件已存在：先问用户是否覆盖（无界面时自动改名），避免 agent 静默毁掉用户的旧产物
+            // 同名文件已存在：自动改名（不改名会静默毁掉用户旧产物）；
+            // 不问用户，因为询问要阻塞 agent 的后台线程——详见 AvoidOverwrite 上方注释。
             p = AvoidOverwrite(p);
             return p;
         }

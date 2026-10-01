@@ -30,7 +30,10 @@ namespace OfficeAgent.Core
                 si.RedirectStandardError = true;
                 si.StandardOutputEncoding = Encoding.UTF8;
                 si.StandardErrorEncoding = Encoding.UTF8;
-                si.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
+                // 经 EnvSafe 注入（不能直接写 si.EnvironmentVariables：Windows 上代理软件
+                // 会同时设 HTTP_PROXY/http_proxy、NO_PROXY/no_proxy，而那个属性是大小写不敏感的
+                // 字典，一访问就抛 ArgumentException → 本启动点全部报 ExitRejected）
+                EnvSafe.SetEnv(si, "PYTHONIOENCODING", "utf-8");
                 using (Process p = Process.Start(si))
                 {
                     job = JobObject.Create(JobObject.DefaultMemoryLimit);

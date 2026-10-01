@@ -86,7 +86,9 @@ namespace OfficeAgent.Core
                 si.RedirectStandardError = true;
                 si.StandardOutputEncoding = Encoding.UTF8;
                 si.StandardErrorEncoding = Encoding.UTF8;
-                si.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
+                // 经 EnvSafe 注入（原因同 JobProbeRunner：大小写重复环境变量会让
+                // 直接访问 si.EnvironmentVariables 抛异常，导致探测一律失败）
+                EnvSafe.SetEnv(si, "PYTHONIOENCODING", "utf-8");
                 using (Process p = Process.Start(si))
                 {
                     StringBuilder so = new StringBuilder(), se = new StringBuilder();

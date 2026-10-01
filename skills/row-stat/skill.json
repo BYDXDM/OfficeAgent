@@ -1,0 +1,13 @@
+{
+  "id": "row-stat",
+  "name": "表格行列统计",
+  "version": "1.0.0",
+  "host": "1.0.0",
+  "runtime": "python38",
+  "entry": "main.py",
+  "scenarios": "统计,行列,多少行",
+  "depsTools": "",
+  "network": false,
+  "officeCom": false,
+  "signature": ""
+}

@@ -1,0 +1,13 @@
+{
+  "id": "make-xlsx",
+  "name": "生成 Excel 表格",
+  "version": "1.0.0",
+  "host": "1.0.0",
+  "runtime": "python38",
+  "entry": "main.py",
+  "scenarios": "",
+  "depsTools": "",
+  "network": false,
+  "officeCom": false,
+  "signature": ""
+}

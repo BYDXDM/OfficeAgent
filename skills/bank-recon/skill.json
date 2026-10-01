@@ -1,0 +1,13 @@
+{
+  "id": "bank-recon",
+  "name": "银行流水核对",
+  "version": "1.2.0",
+  "host": "1.0.0",
+  "runtime": "builtin",
+  "entry": "recon",
+  "scenarios": "表格核对,对账,勾稽,流水核对",
+  "depsTools": "libreoffice?",
+  "network": false,
+  "officeCom": false,
+  "signature": ""
+}

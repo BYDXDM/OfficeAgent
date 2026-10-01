@@ -1,0 +1,15 @@
+# OfficeAgent 技能依赖（Python 3.8 / Win7，全部钉死版本）
+# M2 前用下面两条命令生成双架构离线 wheel（py3.8 时代均有官方 wheel）：
+#   pip download -r store\wheels-requirements.txt -d store\wheels --only-binary=:all: --platform win32     --python-version 38 --implementation cp
+#   pip download -r store\wheels-requirements.txt -d store\wheels --only-binary=:all: --platform win_amd64 --python-version 38 --implementation cp
+# 注意：pdfminer.six 会连带 cryptography/cffi/pycparser，生成后核对 store\wheels 是否齐全。
+# 刻意不引入 pandas/PyMuPDF（体积与 AGPL 授权原因，见设计方案 §3.2）。
+
+openpyxl==3.1.2
+pdfplumber==0.9.0
+pdfminer.six==20221105
+python-pptx==0.6.23
+lxml==4.9.3
+Pillow==9.5.0
+pypdf==3.17.4
+charset-normalizer==3.3.2

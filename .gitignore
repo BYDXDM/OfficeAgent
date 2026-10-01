@@ -1,0 +1,31 @@
+# Build outputs and local runtime
+build/
+dist/
+runtime/
+lo76/
+*.user
+
+# Offline payload binaries are rebuilt from store/components.ini
+payload/**/*.msu
+payload/**/*.exe
+payload/**/*.zip
+payload/**/*.py
+
+# Local tool state, secrets, settings, and logs
+.mimosa/
+**/.mimosa/
+logs/
+tests/e2e/mock-server.log
+tests/e2e/sample.csv
+tests/e2e/sample_conv.xlsx
+tests/fixtures/*_conv.*
+tests/fixtures/invoice-list.xlsx
+tests/fixtures/recon/*_vs_*.xlsx
+*.local.json
+config.json
+memory.json
+history.jsonl
+audit.jsonl
+
+# Unrelated third-party local data that landed in this folder (not part of OfficeAgent)
+Data/

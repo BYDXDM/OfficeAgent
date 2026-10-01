@@ -154,6 +154,19 @@ try {
   Get-NetTCPConnection -LocalPort 18080 -State Listen -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }
 } catch {}
 Start-Sleep -Milliseconds 500
+# 本测试需要"干净首启"来走向导，因此会临时移走用户配置。
+# ⚠️ 但绝不能把它**删掉**：config.json 里含经 DPAPI 加密的 API Key，
+#    删了就再也解不回来（用户必须重新填一遍）。此前 E2E 直接 Remove-Item，
+#    等于每跑一次测试就毁掉用户一次密钥（实测确实丢了）。
+#    改为：跑前备份到 .e2e-backup，跑完在退出处还原（见文件末尾）。
+$cfgBak = $cfgFile + ".e2e-backup"
+# 兜底：若上次运行异常中断、留下未还原的备份，先把用户配置还回去再做本次备份
+#（否则会拿"上次残留的临时配置"当用户配置，把真正的那份覆盖掉）
+if ((Test-Path $cfgBak) -and -not (Test-Path $cfgFile)) {
+  Move-Item $cfgBak $cfgFile -Force
+  Write-Host "[INFO] 发现上次未还原的备份，已先还原用户配置"
+}
+if (Test-Path $cfgFile) { Copy-Item $cfgFile $cfgBak -Force }
 if (Test-Path $cfgFile) { Remove-Item $cfgFile -Force }
 if (Test-Path $mockLog) { Remove-Item $mockLog -Force }
 if (Test-Path $outXlsx) { Remove-Item $outXlsx -Force }
@@ -192,16 +205,27 @@ $gridCsv = Join-Path $repo "build\test\e2e-grid.csv"
 $gridXlsx = Join-Path $repo "build\test\e2e-grid_conv.xlsx"   # /convert 产物带 _conv 后缀
 Set-Content -LiteralPath $gridCsv -Value "科目,金额`r`n库存现金,100.50`r`n银行存款,9876.00" -Encoding UTF8
 $null = (Start-Process -FilePath $exe -ArgumentList "/convert", $gridCsv, "xlsx" -PassThru -Wait -WindowStyle Hidden).ExitCode
-$rc = (Start-Process -FilePath $exe -ArgumentList "/gridtest", $gridXlsx -PassThru -Wait -WindowStyle Hidden -RedirectStandardOutput $gridOut).ExitCode
+# 启动子进程并抓 stdout/stderr 到文件，返回退出码。
+# 为什么不用 Start-Process -RedirectStandardOutput：在有"大小写重复环境变量"
+# （代理软件写入 HTTP_PROXY/http_proxy 等）的机器上，PS 的该参数会触碰
+# ProcessStartInfo.EnvironmentVariables 并抛 ArgumentException 导致整条调用失败。
+# run-capture.ps1 用 .NET 直接启动并绕开该字典，行为等价且可移植。
+function Invoke-Capture([string]$exePath, [string]$argLine, [string]$outFile) {
+  $cap = Join-Path $repo "tests\e2e\run-capture.ps1"
+  & powershell -NoProfile -ExecutionPolicy Bypass -File $cap -Exe $exePath -ArgLine $argLine -OutFile $outFile | Out-Null
+  return $LASTEXITCODE
+}
+
+$rc = Invoke-Capture $exe ("/gridtest|" + $gridXlsx) $gridOut
 $gridTxt = if (Test-Path $gridOut) { Get-Content $gridOut -Raw -Encoding UTF8 } else { "" }   # exe 输出是 UTF-8，PS5.1 默认按 ANSI 读会变乱码
 Note (($rc -eq 0) -and ($gridTxt -like '*表头行=科目|金额*') -and ($gridTxt -like '*总行数=3*')) "0.5b xlsx 网格读取（表头保留、行不重复）" ("exit=" + $rc)
 $srOut = Join-Path $repo "build\test\e2e-skillrun.txt"
 # 确认门禁：不带 --yes 必须先拒绝（exit=2，零执行）；带 --yes 才真正执行
-$rcGate = (Start-Process -FilePath $exe -ArgumentList "/skillrun", "row-stat", $flowCsv -PassThru -Wait -WindowStyle Hidden -RedirectStandardOutput $srOut).ExitCode
+$rcGate = Invoke-Capture $exe ("/skillrun|row-stat|" + $flowCsv) $srOut
 $gateTxt = if (Test-Path $srOut) { Get-Content $srOut -Raw } else { "" }
 Note (($rcGate -eq 2) -and ($gateTxt -notlike '*"ok": true*')) "0.6a CLI /skillrun 无 --yes 被拒（确认门禁）" ("exit=" + $rcGate)
 
-$rc = (Start-Process -FilePath $exe -ArgumentList "/skillrun", "row-stat", $flowCsv, "--yes" -PassThru -Wait -WindowStyle Hidden -RedirectStandardOutput $srOut).ExitCode
+$rc = Invoke-Capture $exe ("/skillrun|row-stat|" + $flowCsv + "|--yes") $srOut
 $srTxt = if (Test-Path $srOut) { Get-Content $srOut -Raw } else { "" }
 Note (($srTxt -like '*"ok": true*') -or ($rc -eq 0)) "0.6b CLI /skillrun --yes 执行 python 技能（row-stat）" ("exit=" + $rc)
 
@@ -216,8 +240,14 @@ $cw = $win.Rt; $ch = $win.B
 $contentTop = 52; $contentH = $ch - $contentTop
 Note ($cw -gt 800) "1.1 启动主窗口" ("client=" + $cw + "x" + $ch)
 # 向导居中于主窗口客户区
-$dx = [int]($cw / 2) - 280
-$dy = [int]($ch / 2) - 226
+# ⚠️ 半宽/半高必须与 SetupDialog 的 ClientSize 一致（当前 560x496，见 SetupDialog.cs:37）。
+#    曾因这里写死 452（旧尺寸）导致整体偏差 22px：dy 偏大 22px → 所有点击落到目标**下方** 22px，
+#    向导 URL/Key 输不进去、按钮点不到 → 2.1/2.2/2.3 连锁失败且 mock 零请求。
+#    改动向导尺寸时**必须同步这两个常量**（实测：新公式算出的客户区原点
+#    与向导窗口实测位置完全吻合）。
+$wizardW = 560; $wizardH = 496
+$dx = [int]($cw / 2) - [int]($wizardW / 2)
+$dy = [int]($ch / 2) - [int]($wizardH / 2)
 Shot $p "01-wizard-fresh.png"
 
 # ---------- 2. 向导 ----------
@@ -433,6 +463,14 @@ Start-Sleep -Seconds 3
 $alive = Get-Process -Id $p.Id -ErrorAction SilentlyContinue
 Note ($null -eq $alive) "7.1 正常退出（无残留进程）" ""
 
+# 还原用户配置（含 DPAPI 密钥）：先删测试产生的临时配置，再把备份放回原位。
+# 绝不能只删不还——那等于每跑一次 E2E 就毁掉用户一次密钥。
 if (Test-Path $cfgFile) { Remove-Item $cfgFile -Force }
+if (Test-Path $cfgBak) {
+  Move-Item $cfgBak $cfgFile -Force
+  Write-Host "[INFO] 已还原用户配置（含 DPAPI 密钥）"
+} else {
+  Write-Host "[INFO] 本次运行无可还原的用户配置（运行前本就没有 config）"
+}
 Write-Host ("===== E2E RESULT: PASS=" + $script:pass + " FAIL=" + $script:fail + " =====")
 if ($script:fail -gt 0) { exit 2 } else { exit 0 }

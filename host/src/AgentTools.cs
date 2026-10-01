@@ -20,6 +20,33 @@ namespace OfficeAgent.Host
         public static string WorkspaceRoot = "";
         // 最近一次成功产出的文件路径（附件卡片用）
         public static string LastProduct = "";
+
+        // 同名产物覆盖确认：UI 注入（弹"已存在，是否覆盖"对话框）。
+        // 参数=目标全路径；返回 true=覆盖，false=改用不重名的新文件名。
+        // null（CLI/无界面）时自动改名，绝不静默覆盖用户既有文件。
+        public static Func<string, bool> ConfirmOverwrite = null;
+
+        // 产物路径避让：目标已存在时先问用户；不问或用户选"否"时自动加 (2)/(3) 后缀。
+        // 返回最终可写路径（保证不与既有文件重名，除非用户明确同意覆盖）。
+        static string AvoidOverwrite(string p)
+        {
+            if (p == null || !File.Exists(p)) return p;
+            if (ConfirmOverwrite != null)
+            {
+                bool overwrite = false;
+                try { overwrite = ConfirmOverwrite(p); } catch { }
+                if (overwrite) return p;
+            }
+            string dir = Path.GetDirectoryName(p);
+            string baseName = Path.GetFileNameWithoutExtension(p);
+            string ext = Path.GetExtension(p);
+            for (int i = 2; i < 1000; i++)
+            {
+                string cand = Path.Combine(dir, baseName + "(" + i + ")" + ext);
+                if (!File.Exists(cand)) return cand;
+            }
+            return Path.Combine(dir, baseName + "_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ext);
+        }
         // 工具 schema（OpenAI function calling 格式；智谱等兼容端点同格式）
         public static string SchemasJson()
         {
@@ -82,8 +109,45 @@ namespace OfficeAgent.Host
             catch (Exception ex)
             {
                 ok = false;
-                return "工具执行异常: " + ex.Message;
+                return ExplainToolError(name, ex);
             }
+        }
+
+        // 工具异常 → 人话：讲清「为什么失败 + 可以怎么办」，而不是抛原始异常串。
+        // 常见根因：缺 VC++ 运行库（Python/LibreOffice 起不来）、Office COM 未安装或挂死、
+        //           文件被占用、权限不足。
+        static string ExplainToolError(string tool, Exception ex)
+        {
+            string raw = ex == null ? "" : (ex.Message == null ? ex.GetType().Name : ex.Message);
+            string hint = "";
+            string low = (raw ?? "").ToLowerInvariant();
+            if (low.Contains("msvcp") || low.Contains("vcruntime") || low.Contains("msvcr") ||
+                low.Contains("api-ms-win-crt") || low.Contains("dll") && low.Contains("not found"))
+            {
+                hint = "看起来缺 Visual C++ 运行库。可以让 agent 调用 repair_environment 工具，" +
+                       "或在引导器里点「安装缺失组件」补装 VC++ 后重试。";
+            }
+            else if (low.Contains("0x80070005") || low.Contains("access") && low.Contains("denied") ||
+                     low.Contains("拒绝访问"))
+            {
+                hint = "文件或目录没有写权限。请确认目标文件没有被 Excel/WPS 打开，" +
+                       "或换一个有写权限的输出目录后重试。";
+            }
+            else if (low.Contains("being used") || low.Contains("被占用") || low.Contains("sharing violation"))
+            {
+                hint = "文件正被其他程序占用（通常是 Excel/WPS 打开了它）。关闭后重试即可。";
+            }
+            else if (low.Contains("ocr") || low.Contains("扫描") || low.Contains("no text"))
+            {
+                hint = "该 PDF 可能没有文字层（扫描件）。可以先用其他工具转成图片，再让我看图识别。";
+            }
+            else if (low.Contains("out of memory") || low.Contains("内存"))
+            {
+                hint = "文件太大导致内存不足。建议先拆分文件，或改用核对/汇总功能分批处理。";
+            }
+            if (hint.Length == 0)
+                return "工具 " + tool + " 执行失败：" + raw + "。可以换个参数或换一种做法重试；若反复失败请把这句话发给开发者。";
+            return "工具 " + tool + " 执行失败：" + raw + "\n可能的原因与建议：" + hint;
         }
 
         static Dictionary<string, string> ParseArgs(string argsJson)
@@ -326,13 +390,27 @@ namespace OfficeAgent.Host
             else if (t == "csv") ct = ConvTarget.Csv;
             else if (t == "xlsx") ct = ConvTarget.Xlsx;
             else return "不支持的目标格式: " + t + "（仅 pdf/csv/xlsx）";
-            if (conv == null) return "转换引擎未就绪";
+            if (conv == null) return "转换引擎未就绪（内部状态异常）。请让用户改用「批量转换」页手动转换，或调用 repair_environment 修复环境后重试。";
             string outPath;
             string err = conv.Convert(input, ct, out outPath);
-            if (err != null) return "转换失败: " + err;
+            if (err != null) return ExplainConvertError(input, t, err);
             ok = true;
             LastProduct = outPath;
             return "转换完成，输出文件: " + outPath;
+        }
+
+        // 转换失败 → 按格式给出可操作建议（xlsx→pdf 依赖 LibreOffice/Office，是最常见的失败点）
+        static string ExplainConvertError(string input, string target, string err)
+        {
+            string hint;
+            if (target == "pdf")
+                hint = "转换 PDF 需要 LibreOffice 或本机 Office。请在引导器里确认 LibreOffice 已安装（缺失组件会显示为待补全）；" +
+                       "若本机有 Office 但仍失败，可能是 Office 隐藏会话挂死，可改用 LibreOffice 重试。";
+            else if (target == "csv" || target == "xlsx")
+                hint = "请确认源文件是有效的表格且没有加密/受损；若文件正被 Excel/WPS 打开，请先关闭再重试。";
+            else
+                hint = "请确认源文件格式正确且未被其他程序占用。";
+            return "转换失败：" + err + "\n可能的原因与建议：" + hint;
         }
 
         // ---------- create_spreadsheet / create_presentation ----------
@@ -359,6 +437,8 @@ namespace OfficeAgent.Host
             catch (Exception ex) { err = "输出路径非法: " + ex.Message; return null; }
             if (!p.EndsWith(ext, StringComparison.OrdinalIgnoreCase)) { err = "输出路径必须是 " + ext + " 文件"; return null; }
             try { string parent = Path.GetDirectoryName(p); if (parent != null && parent.Length > 0) Directory.CreateDirectory(parent); } catch { }
+            // 同名文件已存在：先问用户是否覆盖（无界面时自动改名），避免 agent 静默毁掉用户的旧产物
+            p = AvoidOverwrite(p);
             return p;
         }
 

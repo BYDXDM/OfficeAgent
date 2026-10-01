@@ -253,6 +253,8 @@ namespace OfficeAgent.Host
             flushTimer.Interval = 100;
             flushTimer.Tick += delegate
             {
+                // 流式最终答复：把后台线程累积的文本刷进气泡（与下面的整表重绘节流同一节拍）
+                try { FlushStream(); } catch { }
                 // 等待中气泡显示已等待秒数（非流式请求体感优化，1s 粒度）
                 if (busy && pendingIdx >= 0 && pendingIdx < msgs.Count && msgs[pendingIdx].Pending
                     && msgs[pendingIdx].Text.StartsWith("思考中"))
@@ -636,6 +638,7 @@ namespace OfficeAgent.Host
             pendingShownSecs = -1;
             busy = true;
             send.Enabled = false;
+            ResetStreamState();   // 新一轮：允许创建流式预览气泡
             string question = text;
 
             // 隐私分级（设计方案 §7.2）：L0 禁止出网；L1 出网前规则脱敏（命中规则交审计）
@@ -712,12 +715,75 @@ namespace OfficeAgent.Host
             // 历史快照（后台线程读，UI 线程写，加锁拷贝）
             List<LlmTurn> hist;
             lock (llmHistory) { hist = new List<LlmTurn>(llmHistory); }
+            // 流式接收槽：最终答复逐段到达时，先落到这里再由 UI 定时刷新，
+            // 避免每个 token 都 Invoke 一次把 UI 线程压满。
+            streamText = "";
+            streamDirty = false;
             AgentLoop.Result r = AgentLoop.Run(client, config, sysPrompt, userPayload,
                 delegate(string log) { SetBubbleText(idx, TailOfLog(log) + "\n…"); },
-                HandlePlanTool, hist);
+                HandlePlanTool, hist,
+                delegate(string acc) { streamText = acc; streamDirty = true; });
             sw.Stop();
             if (InvokeRequired) { try { Invoke((MethodInvoker)delegate { AgentDone(idx, r, sw.ElapsedMilliseconds); }); } catch { } }
             else AgentDone(idx, r, sw.ElapsedMilliseconds);
+        }
+
+        // 流式预览：后台线程写 streamText，UI 定时器读并刷新气泡（见 flushTimer）
+        string streamText = "";
+        volatile bool streamDirty;
+        int streamingBubble = -1;
+        // 收尾后置 true：阻止定时器在 AgentDone 之后又重建一条预览气泡（会变成重复答复）
+        volatile bool streamClosed;
+
+        // 开一条"正在输入"的气泡，后续流式文本回填到它（没有流式时保持隐藏）
+        void BeginStreamBubble()
+        {
+            if (streamingBubble >= 0) return;
+            streamingBubble = Append("assistant", "", true, false);
+        }
+
+        // UI 定时器：把最新流式文本刷进气泡（增量更新，只在有变化时重绘）
+        void FlushStream()
+        {
+            if (streamClosed) { streamDirty = false; return; }
+            if (!streamDirty) return;
+            streamDirty = false;
+            if (streamingBubble < 0) BeginStreamBubble();
+            if (streamingBubble >= 0 && streamingBubble < msgs.Count)
+            {
+                msgs[streamingBubble].Text = streamText;
+                msgs[streamingBubble].Pending = false;
+                msgs[streamingBubble].CachedTextH = -1; msgs[streamingBubble].CachedHeight = -1;
+                dirty = true;   // 交给同一定时器里的滚动/重绘逻辑
+            }
+        }
+
+        // 新一轮对话开始前复位（DoSend 里调用），允许再次创建预览气泡
+        void ResetStreamState()
+        {
+            streamClosed = false;
+            streamingBubble = -1;
+            streamText = "";
+            streamDirty = false;
+        }
+
+        void EndStreamBubble()
+        {
+            streamingBubble = -1;
+            streamText = "";
+            streamDirty = false;
+        }
+
+        // 移除流式预览气泡（收尾时调用；正式答复会重新创建一条，避免重复显示）
+        void DiscardStreamBubble()
+        {
+            streamClosed = true;   // 先关闸，防定时器在删除后又重建
+            if (streamingBubble >= 0 && streamingBubble < msgs.Count && streamingBubble < list.Items.Count)
+            {
+                msgs.RemoveAt(streamingBubble);
+                list.Items.RemoveAt(streamingBubble);
+            }
+            EndStreamBubble();
         }
 
         // 流式期间的日志视图：ListBox 单条目高度超过视口后底部不可见（TopIndex 只能钉住条目顶部），
@@ -739,6 +805,9 @@ namespace OfficeAgent.Host
         {
             busy = false;
             send.Enabled = true;
+            // 流式预览气泡只用于"边写边看"，收尾时移除，由下面的正式答复路径重建，
+            // 否则会出现同一条答复显示两次。
+            DiscardStreamBubble();
             if (r.Error.Length > 0)
             {
                 FinishReply(idx, "✗ " + r.Error, true, 0);
@@ -1432,9 +1501,17 @@ namespace OfficeAgent.Host
                 "规则：凡是需要上述能力的请求，一律直接发起工具调用去完成；绝不输出代码示例、调用语法或操作步骤说明，" +
                 "也不让用户自己去处理。缺信息时先自己用工具查证（列目录/读文件），查不到再向用户追问，一次只问最关键的一项。" +
                 ws +
+                // 效率策略：明确"先定位→再一次做对"，抑制重复列目录/反复试探
+                "执行效率要求（重要）：" +
+                "① 先用 list_directory 定位目标一次，记住结果，不要为了确认同一件事反复列同一个目录；" +
+                "② 目标文件确认后，直接一次调用就把动作做完（读就读、转就转、建就建），不要分成多次试探性调用；" +
+                "③ 同一个工具用完全相同的参数不要调用第二次——那不会得到新信息，只会浪费时间；" +
+                "④ 参数不确定时用一次工具查证后再动手，不要靠连续试错碰运气；" +
+                "⑤ 信息足够时立即给出最终答复，不要为了「再确认一下」多跑工具。" +
                 "三步以上的多步骤任务，先创建任务计划，随着执行逐项更新，全部完成后再标记完成。" +
                 "系统还内置：文件预览（xlsx/csv/pdf）、批量转换队列、两表核对、报表汇总、发票提取、长期记忆（记住/记忆/忘记）。" +
                 "用简体中文回答；回答使用纯文本，不要用 markdown 语法（不要 ** 星号加粗、# 标题、表格线）；" +
+                "回答时明确说出产物保存在哪个路径，方便用户直接打开；" +
                 "不要编造用户未提供的文件内容；涉及金额计算时提醒用户以软件的核对功能结果为准。";
             return mem.Length > 0 ? mem + "\n" + basePrompt : basePrompt;
         }

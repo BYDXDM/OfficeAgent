@@ -1,4 +1,4 @@
-﻿// 主窗体（M1.5）：WorkBuddy 风格布局 —— 左侧导航栏 + 主内容区（会话/任务台/预览/系统状态/审计）
+// 主窗体（M1.5）：WorkBuddy 风格布局 —— 左侧导航栏 + 主内容区（会话/任务台/预览/系统状态/审计）
 // 首次启动弹出模型配置向导（SetupDialog）；导航自绘高亮；GDI+ 圆角与双缓冲。
 using System;
 using System.Collections.Generic;
@@ -14,7 +14,7 @@ namespace OfficeAgent.Host
 {
     public partial class MainForm : Form
     {
-        const string Version = "0.6.2 (M2)";
+        const string Version = "0.6.3 (M2)";
 
         class NavEntry
         {
@@ -607,6 +607,19 @@ namespace OfficeAgent.Host
             chat.OnOpenSettings += delegate { ShowSetup(false); };
             chat.OnSessionSaved += delegate { RefreshSessions(); };
             chat.OnOpenPreview += delegate(string path) { ShowPreview(path); SelectPage(5); };
+            // 同名产物覆盖确认：agent 要写一个已存在的文件时先问用户（选"否"则自动改名，不丢旧文件）
+            AgentTools.ConfirmOverwrite = delegate(string path)
+            {
+                try
+                {
+                    DialogResult dr = MessageBox.Show(this,
+                        "工作区里已经有同名文件：\n\n" + path + "\n\n要覆盖它吗？\n" +
+                        "选「否」会保留旧文件，新产物改用「文件名(2)」保存。",
+                        "文件已存在", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                    return dr == DialogResult.Yes;
+                }
+                catch { return false; }
+            };
             p.Controls.Add(chat);
             return p;
         }

@@ -352,6 +352,68 @@ namespace OfficeAgent.Host
             return null;
         }
 
+        // 最终答复流式：把已构造好的 messages JSON 发出去，stream:true 逐段回调累计文本。
+        // 用于 agent 循环「模型不再调工具、要给出最终答复」的那一跳——工具轮次仍非流式。
+        // 返回：累计文本；出错或端点不支持流式时返回 null 并置 err（调用方回退到非流式 ChatRaw）。
+        // 注意：本方法不发 tools，纯文本答复，因此不会出现 tool_calls 分片拼接问题。
+        public string ChatFinalStream(string messagesJson, Action<string> onDelta, out string err)
+        {
+            err = null;
+            try
+            {
+                if (Model == null || Model.Length == 0) { err = "未选择模型"; return null; }
+                StringBuilder body = new StringBuilder();
+                body.Append("{\"model\":\"").Append(JsonEscape(Model)).Append("\",\"messages\":").Append(messagesJson);
+                body.Append(",\"temperature\":0.3,\"max_tokens\":4096,\"stream\":true}");
+                LastRequestBody = body.ToString();
+
+                string url = BaseUrl + "/chat/completions";
+                string guardErr = HostGuard.Check(url, AllowLan);
+                if (guardErr != null) { err = "安全守卫：" + guardErr; return null; }
+
+                StringBuilder acc = new StringBuilder();
+                HttpWebRequest req = Request(url, "POST", ApiKey, 180000);
+                byte[] data = Encoding.UTF8.GetBytes(body.ToString());
+                req.ContentType = "application/json";
+                req.ContentLength = data.Length;
+                using (Stream s = req.GetRequestStream()) s.Write(data, 0, data.Length);
+                using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+                {
+                    if ((int)resp.StatusCode >= 300) { err = "HTTP " + (int)resp.StatusCode; return null; }
+                    using (StreamReader sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                    {
+                        string line;
+                        while ((line = sr.ReadLine()) != null)
+                        {
+                            if (!line.StartsWith("data:")) continue;
+                            string payload = line.Substring(5).Trim();
+                            if (payload.Length == 0) continue;
+                            if (payload == "[DONE]") break;
+                            string delta = JsonGetString(payload, "content");
+                            if (delta != null && delta.Length > 0)
+                            {
+                                acc.Append(delta);
+                                if (onDelta != null) { try { onDelta(acc.ToString()); } catch { } }
+                            }
+                            else if (acc.Length == 0)
+                            {
+                                // 有的网关把错误塞在流里的 message 字段
+                                string emsg = JsonGetString(payload, "message");
+                                if (emsg != null && emsg.Length > 0) { err = "服务端返回: " + TrimMsg(emsg); return null; }
+                            }
+                        }
+                    }
+                }
+                if (acc.Length == 0) { err = "流式响应为空"; return null; }   // 调用方回退非流式
+                return acc.ToString();
+            }
+            catch (Exception ex)
+            {
+                err = ex.Message;
+                return null;
+            }
+        }
+
         // 兼容旧调用（连通性测试、列映射建议）：单轮、不带工具
         public string Chat(string userText, string systemPrompt, out string err)
         {
@@ -363,6 +425,8 @@ namespace OfficeAgent.Host
         }
 
         // 流式对话（SSE）：逐段回调 onDelta(累计文本)；服务端不支持流式时自动回退一次性请求。
+        // 说明：本方法只用于「最终答复」这一跳——带 tools 的工具轮次一律走非流式 ChatRaw，
+        // 因为流式分片里的 tool_calls 需要跨片拼接，收益低而风险高。
         public string ChatStream(string userText, string systemPrompt, Action<string> onDelta, out string err)
         {
             err = null;

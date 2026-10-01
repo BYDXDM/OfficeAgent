@@ -972,6 +972,24 @@ namespace OfficeAgent.Host
         bool pptxOk = genOk && System.IO.File.Exists(System.IO.Path.Combine(genDir, "t.pptx"));
         if (!pptxOk) failed++;
         Console.WriteLine((pptxOk ? "[OK]  " : "[FAIL] ") + "CreatePresentation 直测（" + genMsg + "）");
+
+        // 9b. 同名产物避让（回归：agent 不能静默覆盖用户既有文件）
+        // 无界面时 ConfirmOverwrite=null → 自动改名 t(2).xlsx，旧文件内容保持不动。
+        AgentTools.ConfirmOverwrite = null;
+        string keepPath = System.IO.Path.Combine(genDir, "keep.xlsx");
+        System.IO.File.WriteAllText(keepPath, "OLD", System.Text.Encoding.UTF8);
+        bool owOk;
+        string owMsg = AgentTools.CreateSpreadsheet(
+            System.IO.Path.Combine(genDir, "keep.xlsx"), "姓名,金额\n王五,1", out owOk);
+        string keptText = "";
+        try { keptText = System.IO.File.ReadAllText(keepPath, System.Text.Encoding.UTF8); } catch { }
+        bool renamed = owOk && System.IO.File.Exists(System.IO.Path.Combine(genDir, "keep(2).xlsx"));
+        bool preserved = keptText == "OLD";
+        if (!renamed || !preserved) failed++;
+        Console.WriteLine(((renamed && preserved) ? "[OK]  " : "[FAIL] ") +
+            "同名产物避让（旧文件" + (preserved ? "保留" : "被改动") + "，新文件" +
+            (renamed ? "改名为 keep(2).xlsx" : "未改名") + "）");
+
         Console.WriteLine("（产物保留在 " + genDir + " 供人工抽查，下次运行时清理）");
 
         Console.WriteLine(failed == 0 ? "ALL PASS" : (failed + " FAILED"));

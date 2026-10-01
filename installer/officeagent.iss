@@ -1,4 +1,4 @@
-﻿; OfficeAgent Inno Setup installer script (design doc section 8.3, dual SKU).
+; OfficeAgent Inno Setup installer script (design doc section 8.3, dual SKU).
 ; Build:  ISCC /DSKU=complete officeagent.iss   -> full offline (payload bundled)
 ;         ISCC /DSKU=lite officeagent.iss       -> lite online (boot fetches missing parts)
 ; Inno Setup 6.x; Win7 SP1+; PrivilegesRequired=lowest (per-user, no admin).
@@ -6,7 +6,7 @@
 ; File must be saved as UTF-8 with BOM (Inno requirement for non-ASCII).
 
 #define AppName "OfficeAgent"
-#define AppVersion "0.6.2"
+#define AppVersion "0.6.3"
 #define AppPublisher "OfficeAgent Project"
 
 [Setup]

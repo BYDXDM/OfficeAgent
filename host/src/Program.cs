@@ -911,14 +911,27 @@ namespace OfficeAgent.Host
         if (!t3) failed++;
         Console.WriteLine((t3 ? "[OK]  " : "[FAIL] ") + "HasHotfix 兼容语义（Absent→false）");
 
-        // 4. 磁盘迟滞高低水位必须有带宽（防 5L/2 整数除法回归）
-        //    这里通过公开的检测结果间接验证：disk 项应存在且状态合理。
+        // 4. 磁盘迟滞算术：**直接断言常量**，不依赖运行机的实际剩余空间。
+        //    这里正是为了钉住那个真实犯过的错：初版写成 5L / 2 * 1024 * 1024 * 1024，
+        //    C# 整数除法先算成 2 → 高水位退化为 2GiB，与低水位相等，迟滞宽度为 0、完全失效，
+        //    而注释却声称 2.5GiB。（旧的断言只看"disk 项状态是否合法"，把高水位改回 2GB
+        //    照样通过，抓不到这个回归——审计指出后改为断言算术本身。）
+        const long GiB = 1024L * 1024 * 1024;
+        bool t4a = EnvDetect.DiskLowWater == 2L * GiB;
+        bool t4b = EnvDetect.DiskHighWater == 2684354560L;        // 2.5 GiB，写死数值防止"两边一起改错"
+        bool t4c = EnvDetect.DiskHighWater > EnvDetect.DiskLowWater;   // 带宽必须 > 0，否则迟滞无意义
+        bool t4 = t4a && t4b && t4c;
+        if (!t4) failed++;
+        Console.WriteLine((t4 ? "[OK]  " : "[FAIL] ") + "磁盘迟滞算术（低=" + EnvDetect.DiskLowWater +
+            " 高=" + EnvDetect.DiskHighWater + " 带宽=" + (EnvDetect.DiskHighWater - EnvDetect.DiskLowWater) + " B）");
+
+        // 4b. 磁盘项本身存在且状态合法（弱检查，仅保证检测没崩）
         List<DetectItem> items = EnvDetect.DetectAll(EnvDetect.FindRoot());
         DetectItem disk = null;
         foreach (DetectItem it in items) { if (it.Id == "disk") { disk = it; break; } }
-        bool t4 = disk != null && (disk.State == DetectState.Ok || disk.State == DetectState.Missing);
-        if (!t4) failed++;
-        Console.WriteLine((t4 ? "[OK]  " : "[FAIL] ") + "磁盘检测项存在且状态合法（" +
+        bool t4d = disk != null && (disk.State == DetectState.Ok || disk.State == DetectState.Missing);
+        if (!t4d) failed++;
+        Console.WriteLine((t4d ? "[OK]  " : "[FAIL] ") + "磁盘检测项存在且状态合法（" +
             (disk == null ? "未找到" : disk.State + " - " + disk.Detail) + "）");
 
         // 5. Unknown 不得被当成 Missing：统计一遍，确认没有把 Unknown 混入缺失
@@ -944,9 +957,14 @@ namespace OfficeAgent.Host
     // 回归目标：Record 过去只 lock 进程内 + 用进程内缓存的 lastSeq/lastHash，
     // 两个进程（GUI 开着同时跑 CLI）会各自算出同一 seq 并追加，产生**重复 seq 与分叉链**，
     // 于是 VerifyChain 把正常并发误报为"审计日志可能被篡改"。
-    // 本用例无法在单进程内制造真正的跨进程竞争，因此做两件事：
-    //   ① 多线程并发 Record，断言无重复 seq、无分叉、链可校验；
-    //   ② 断言写盘后 lastSeq 严格递增且与文件尾一致（跨进程正确性的同构检查）。
+    //
+    // ⚠️ 覆盖面说明（不要说成"已验证跨进程"）：
+    //   本用例在**单进程**内用 8 线程并发调 Record，断言"链可校验 / 无重复 seq / 无分叉"。
+    //   但同进程的线程已被 AuditLog 内的 lock(gate) 串行化，audit.lock 这个**跨进程**文件锁
+    //   在这里根本不会被竞争到 —— 也就是说，即便把整个文件锁删掉，本用例**照样 ALL PASS**。
+    //   它真正验证的是"每次都重新 LoadTail()、不复用过期进程内缓存"这一必要成分
+    //  （对跨进程正确性也必需），而不是跨进程锁本身。
+    //   真跨进程验证靠实机演练：开 GUI 的同时跑 CLI，再用 VerifyChain 校验；本用例不覆盖。
     static int RunAuditTest()
     {
         int failed = 0;

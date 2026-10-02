@@ -1,4 +1,4 @@
-// OfficeAgent - 环境检测（boot 与 host 共用源码）
+﻿// OfficeAgent - 环境检测（boot 与 host 共用源码）
 // 语法约束：.NET 3.5 / C# 3.0 兼容（无 LINQ、无 HashSet、无 System.Core、Path.Combine 仅两参）
 using System;
 using System.Collections.Generic;
@@ -375,13 +375,10 @@ namespace OfficeAgent.Core
                 string driveRoot = Path.GetPathRoot(Path.GetFullPath(root));
                 DriveInfo d = new DriveInfo(driveRoot);
                 long free = d.IsReady ? d.AvailableFreeSpace : 0;
-                // 低水位 2GiB；高水位 2.5GiB。
+                // 低水位 2GiB；高水位 2.5GiB（常量提到类级，便于自测直接断言算术）。
                 // 注意必须先乘后除：写成 5L / 2 * 1024 * 1024 * 1024 会因**整数除法**
                 // 先算成 2，高水位退化为 2GiB 与低水位相等 → 迟滞完全失效。
-                const long GiB = 1024L * 1024 * 1024;
-                const long LowWater = 2L * GiB;        // 低于此值 → 缺失
-                const long HighWater = 5L * GiB / 2;   // 已缺失时需恢复到此处才转 Ok（2.5GiB）
-                long threshold = diskWasLow ? HighWater : LowWater;
+                long threshold = diskWasLow ? DiskHighWater : DiskLowWater;
                 if (free >= threshold)
                 {
                     diskWasLow = false;
@@ -459,6 +456,11 @@ namespace OfficeAgent.Core
 
         // 磁盘检测的迟滞状态：记住"上次是否判为空间不足"，避免在阈值上下抖动
         static bool diskWasLow = false;
+
+        // 磁盘阈值（公开常量，供自测直接断言算术，防止 5L/2 整数除法回归）
+        public const long DiskLowWater = 2L * 1024 * 1024 * 1024;        // 2 GiB：低于此值判缺失
+        public const long DiskHighWater = 5L * 1024 * 1024 * 1024 / 2;   // 2.5 GiB：已缺失时回到此值才转 Ok
+
 
         // 一次 WMI 查询枚举全部热修并缓存（低配机优化：避免每个 KB 各跑一遍 WMI，4 次→1 次）
         public static bool HasHotfix(string kbId)

@@ -136,16 +136,23 @@ namespace OfficeAgent.Host
                         }
                         else
                         {
-                            // 重复调用检测：同一工具+同一参数第二次出现时，不再重复执行，
-                            // 直接把"你刚做过同样的调用"告诉模型，逼它换策略或收尾。
+                            // 重复调用检测：同一工具+同一参数第二次出现时的处理。
                             // 分隔符用 \u0001（不可见控制字符）而非 "|"：后者不可单射——
                             // ("a","b|c") 与 ("a|b","c") 会拼出同一个 "a|b|c" 而误判为重复调用。
                             // 模型的 argsJson 里确实可能出现 "|"（如 create_presentation 的 outline）。
+                            //
+                            // ★ 只对"写型"工具拒绝重复，读型工具允许重放：
+                            //   读型（list_directory/read_text_file）的结果**会随时间变化**——
+                            //   同一回合里先列目录、再建表/转换/下载，然后重列同一目录是完全正当的
+                            //   （要确认新产物落盘了）。若无条件跳过，模型会拿到"你以为你列过了"的
+                            //   假信息，反而错过刚生成的文件。
+                            //   写型（create_*/convert_*/download_*）重放才会真的产生副作用或重复劳动，
+                            //   这才是该拦的对象。
                             string sig = (call[1] ?? "") + "\u0001" + (call[2] ?? "");
                             int seenTimes = 0;
                             if (callCount.ContainsKey(sig)) { seenTimes = callCount[sig]; callCount[sig] = seenTimes + 1; }
                             else { callCount[sig] = 1; }
-                            if (seenTimes >= 1)
+                            if (seenTimes >= 1 && IsMutatingTool(call[1]))
                             {
                                 skipped = true;
                                 result = "你已经用完全相同的参数调用过 " + call[1] +
@@ -156,6 +163,11 @@ namespace OfficeAgent.Host
                             {
                                 result = AgentTools.Dispatch(call[1], call[2], config, conv, products, out ok);
                                 result = TruncToolResult(result);
+                                // 读型工具重放时明确告知：这次是重新读取，结果可能与上面不同
+                                if (seenTimes >= 1)
+                                {
+                                    result = "（注意：这是对同一目标的重新读取，内容可能与上面那次不同）\n" + result;
+                                }
                             }
                         }
                         request.Add(new LlmTurn("tool@" + call[0], result));
@@ -178,6 +190,18 @@ namespace OfficeAgent.Host
                 r.Error = "Agent 循环异常: " + ex.Message;
                 return r;
             }
+        }
+
+        // 工具是否"写型"（有副作用/产出文件）。
+        // 写型工具重放会真的重复干活或覆盖产物，应当拦；读型工具重放是正当的
+        //（目标内容可能在上一次调用之后变了），只提示不拦。
+        static bool IsMutatingTool(string name)
+        {
+            if (name == null) return false;
+            // 与 AgentTools 的白名单一一对应；新增工具时同步这里，否则默认按"读型"放行（更安全）
+            return name == "create_spreadsheet" || name == "create_presentation"
+                || name == "convert_document" || name == "download_file"
+                || name == "repair_environment";
         }
 
         // 工具结果截断：超长结果只回传前 MaxToolResultChars 字符。

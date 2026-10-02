@@ -751,6 +751,11 @@ namespace OfficeAgent.Host
         {
             if (streamClosed) { streamDirty = false; return; }
             if (!streamDirty) return;
+            // 再次复查关闸：本方法在 UI 线程由定时器驱动，DiscardStreamBubble/CancelStreamBubble
+            // 也在 UI 线程，二者理论上不会交错；但"先检查、后使用"之间隔着一次 BeginStreamBubble
+            // 调用，未来若有人在其中插入消息泵就会变成真实竞态。这里廉价地再挡一次，
+            // 保证关闸后绝不会重建预览气泡（重建会导致正文重复显示）。
+            if (streamClosed) { streamDirty = false; return; }
             streamDirty = false;
             if (streamingBubble < 0) BeginStreamBubble();
             if (streamingBubble >= 0 && streamingBubble < msgs.Count)

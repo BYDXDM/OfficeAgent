@@ -73,7 +73,13 @@ namespace OfficeAgent.Boot
             if (!File.Exists(adminExe)) return "缺少提权引导器 OfficeAgentBootAdmin.exe";
             try
             {
-                System.Diagnostics.Process.Start(adminExe, "/adminfix /root:\"" + root + "\"");
+                // 必须带 /ui：新版引导器有"缺失项只提醒一次"闸门（core\src\BootGate.cs）。
+                // 不带 /ui 时，若缺失集合与上次相同，引导器会判定"无需提示"→ 直接启动主程序
+                // 然后 return 0 退出，**窗口根本不会出现**；用户点了"安装缺失组件"、过了 UAC，
+                // 却什么都没看到，还会多开一个 host 实例。
+                // 这与 host 侧 RepairLauncher 是同一处缺陷（那边已修），此处是等价路径，必须一并修。
+                // /adminfix 让窗口打开后自动开始补全（本进程已是 requireAdministrator 变体）。
+                System.Diagnostics.Process.Start(adminExe, "/ui /adminfix /root:\"" + root + "\"");
                 return null;
             }
             catch (Exception ex) { return "提权重启失败（可能被拒绝）: " + ex.Message; }

@@ -550,6 +550,137 @@ def iit_of(cum_taxable):
     return 0.45, 181920.0
 
 
+# 年终奖（全年一次性奖金）单独计税用的月度税率表：
+# 先把奖金 ÷12 查"按月换算后的综合所得税率表"，再对**全额**乘税率减速算扣除数。
+# 注意这张表的速算扣除数是"月度"口径（与年度表的 2520/16920 等不同），
+# 两者混用是最常见的算错原因。
+BONUS_BRACKETS = [
+    (3000.0, 0.03, 0.0),
+    (12000.0, 0.10, 210.0),
+    (25000.0, 0.20, 1410.0),
+    (35000.0, 0.25, 2660.0),
+    (55000.0, 0.30, 4410.0),
+    (80000.0, 0.35, 7160.0),
+    (float("inf"), 0.45, 15160.0),
+]
+
+
+def bonus_tax_of(bonus):
+    """年终奖单独计税：奖金 ÷12 定档，再对全额计税。返回 (税额, 税率, 速算扣除数, 月均)。"""
+    avg = bonus / 12.0
+    for cap, rate, deduct in BONUS_BRACKETS:
+        if avg <= cap:
+            tax = bonus * rate - deduct
+            if tax < 0:
+                tax = 0.0
+            return round(tax, 2), rate, deduct, round(avg, 2)
+    tax = bonus * 0.45 - 15160.0
+    return round(max(tax, 0.0), 2), 0.45, 15160.0, round(avg, 2)
+
+
+# 社保公积金默认费率（个人部分）。各地差异大，这里的默认值仅作示例，
+# 实际请用 params.socialRates 覆盖；单位部分另计，本工具只算个人扣缴。
+DEFAULT_SOCIAL_RATES = {
+    "pension": 0.08,     # 养老 8%
+    "medical": 0.02,     # 医疗 2%
+    "unemploy": 0.005,   # 失业 0.5%
+    "housing": 0.12,     # 公积金 12%
+}
+
+
+def calc_social(base, params):
+    """按缴费基数 × 费率算个人应缴社保与公积金。
+    params.socialRates 可覆盖默认费率；params.socialBaseCap 可设基数上限。
+    返回 (社保合计, 公积金, 明细dict)。
+    """
+    rates = dict(DEFAULT_SOCIAL_RATES)
+    custom = params.get("socialRates")
+    if isinstance(custom, dict):
+        for k in list(rates.keys()):
+            if k in custom:
+                try:
+                    rates[k] = float(custom[k])
+                except (TypeError, ValueError):
+                    pass
+    cap = params.get("socialBaseCap")
+    b = base
+    if cap is not None:
+        try:
+            capv = float(cap)
+            if capv > 0 and b > capv:
+                b = capv
+        except (TypeError, ValueError):
+            pass
+    detail = {}
+    si = 0.0
+    for k in ("pension", "medical", "unemploy"):
+        v = round(b * rates[k], 2)
+        detail[k] = v
+        si += v
+    hf = round(b * rates["housing"], 2)
+    detail["housing"] = hf
+    detail["base"] = round(b, 2)
+    detail["rates"] = {k: rates[k] for k in rates}
+    return round(si, 2), hf, detail
+
+
+def do_bonus(params):
+    """年终奖单独计税（全年一次性奖金）。
+    参数：bonus（奖金金额）或 bonusList（多人：[{"姓名","奖金"}]）。
+    可选：compareWithCombined=true 时同时给出"并入综合所得"的估算对比，
+         需要提供年度应纳税所得额（annualTaxable，不含该奖金）。
+    """
+    lst = params.get("bonusList")
+    rows = []
+    if isinstance(lst, list) and lst:
+        for it in lst:
+            if not isinstance(it, dict):
+                continue
+            nm = str(it.get("姓名") or it.get("name") or "").strip()
+            b = to_num(it.get("奖金") if it.get("奖金") is not None else it.get("bonus"))
+            if b is None or b < 0:
+                continue
+            tax, rate, deduct, avg = bonus_tax_of(b)
+            rows.append({"姓名": nm, "奖金": round(b, 2), "月均": avg,
+                         "税率": "%.0f%%" % (rate * 100), "速算扣除数": deduct,
+                         "税额": tax, "税后": round(b - tax, 2)})
+    else:
+        b = to_num(params.get("bonus"))
+        if b is None or b < 0:
+            return None, "需要 bonus（奖金金额）或 bonusList（多人列表）"
+        tax, rate, deduct, avg = bonus_tax_of(b)
+        rows.append({"姓名": "（单人）", "奖金": round(b, 2), "月均": avg,
+                     "税率": "%.0f%%" % (rate * 100), "速算扣除数": deduct,
+                     "税额": tax, "税后": round(b - tax, 2)})
+
+    tot_b = sum(r["奖金"] for r in rows)
+    tot_t = sum(r["税额"] for r in rows)
+
+    # 可选：与"并入综合所得"对比
+    compare = None
+    if params.get("compareWithCombined"):
+        at = to_num(params.get("annualTaxable"))
+        if at is not None:
+            # 单独计税：奖金按上面算；综合所得部分按年度表
+            sep_bonus_tax = tot_t
+            rate_a, quick_a = iit_of(max(at, 0.0))
+            sep_other_tax = round(max(at * rate_a - quick_a, 0.0), 2)
+            # 并入后：综合所得 + 全部奖金 一起查年度表
+            rate_c, quick_c = iit_of(max(at + tot_b, 0.0))
+            comb_tax = round(max((at + tot_b) * rate_c - quick_c, 0.0), 2)
+            compare = {
+                "annualTaxableExBonus": round(at, 2),
+                "separate": {"bonusTax": sep_bonus_tax, "otherTax": sep_other_tax,
+                             "total": round(sep_bonus_tax + sep_other_tax, 2)},
+                "combined": {"totalTax": comb_tax},
+                "savingBySeparate": round(comb_tax - (sep_bonus_tax + sep_other_tax), 2),
+            }
+
+    return {"rows": rows, "totalBonus": round(tot_b, 2), "totalTax": round(tot_t, 2),
+            "totalNet": round(tot_b - tot_t, 2), "count": len(rows),
+            "compare": compare}, None
+
+
 def do_payroll(header, rows, params):
     """工资表与个税。
     输入列（同义词自动识别）：姓名、应发工资、社保、公积金、专项附加扣除；
@@ -562,6 +693,8 @@ def do_payroll(header, rows, params):
     c_hf = find_col(header, ["公积金", "住房公积", "housing", "个人公积金"])
     c_extra = find_col(header, ["专项附加扣除", "专扣", "附加扣除", "extra", "专项附加"])
     c_month = find_col(header, ["月份", "月", "month"])
+    # 社保缴费基数：给了就按基数×费率自动算社保公积金（见下方优先级说明）
+    c_base = find_col(header, ["缴费基数", "社保基数", "基数", "base", "社保缴费基数"])
 
     if c_name < 0 or c_gross < 0:
         return None, "需要「姓名」与「应发工资」列（可用表头：姓名/员工/name；应发工资/工资/gross）"
@@ -591,6 +724,20 @@ def do_payroll(header, rows, params):
         si = si or 0.0
         hf = hf or 0.0
         extra = extra or 0.0
+
+        # 社保/公积金：给了金额就用金额；没给金额但给了缴费基数，就按基数×费率算。
+        # 优先级：显式金额 > 基数×费率。两者都给时以金额为准（便于手工调整个别员工）。
+        social_detail = None
+        if si == 0 and hf == 0:
+            base_v = None
+            if c_base >= 0 and c_base < len(r):
+                base_v = to_num(r[c_base])
+            if base_v is None and params.get("socialBase") is not None:
+                base_v = to_num(params.get("socialBase"))
+            if base_v is None and params.get("useGrossAsBase"):
+                base_v = gross
+            if base_v is not None and base_v > 0:
+                si, hf, social_detail = calc_social(base_v, params)
         m = month
         if c_month >= 0 and c_month < len(r):
             try:
@@ -647,6 +794,7 @@ def do_payroll(header, rows, params):
         out.append({
             "姓名": nm, "月份": m, "应发工资": round(gross, 2),
             "社保": round(si, 2), "公积金": round(hf, 2),
+            "社保基数": (social_detail or {}).get("base", None),
             "专项附加扣除": round(extra, 2),
             "累计应纳税所得额": round(cum_taxable, 2),
             "累计应纳税额": round(cum_tax, 2),
@@ -948,6 +1096,35 @@ def main():
     base_dir = os.path.dirname(inputs[0]) if inputs else os.getcwd()
 
     try:
+        if action in ("bonus", "年终奖", "全年一次性奖金"):
+            data, err = do_bonus(params)
+            if err:
+                print(json.dumps({"ok": False, "message": err}, ensure_ascii=False))
+                return 1
+            if not out:
+                out = os.path.join(base_dir, "年终奖计税.xlsx")
+            elif not os.path.isabs(out):
+                out = os.path.join(base_dir, out)
+            write_result(out, "年终奖个人所得税（单独计税）",
+                         ["姓名", "奖金", "月均", "税率", "速算扣除数", "税额", "税后"],
+                         [[r["姓名"], r["奖金"], r["月均"], r["税率"], r["速算扣除数"],
+                           r["税额"], r["税后"]] for r in data["rows"]])
+            msg = "%d 人年终奖合计 %.2f，个税合计 %.2f，税后合计 %.2f" % (
+                data["count"], data["totalBonus"], data["totalTax"], data["totalNet"])
+            if data.get("compare"):
+                c = data["compare"]
+                saving = c["savingBySeparate"]
+                if saving > 0:
+                    msg += "；单独计税比并入综合所得**省 %.2f 元**" % saving
+                elif saving < 0:
+                    msg += "；并入综合所得更省 %.2f 元" % (-saving)
+                else:
+                    msg += "；两种方式税负相同"
+            msg += "；已输出 " + out
+            print(json.dumps({"ok": True, "message": msg, "data": dict(data, out=out)},
+                             ensure_ascii=False))
+            return 0
+
         if action in ("payroll", "工资", "个税"):
             if not inputs:
                 print(json.dumps({"ok": False, "message": "payroll 需要输入文件（含姓名/应发工资列的 xlsx/csv）"},

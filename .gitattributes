@@ -1,0 +1,38 @@
+# 行尾与编码策略（Windows 7 目标机 + PS 2.0 兼容）
+#
+# 背景：本仓库开发机 core.autocrlf=true，默认会把文本检出为 CRLF。
+# 但下列文件对行尾/编码有硬性要求，必须显式固定，否则在目标机上会静默出错。
+#
+# 1. 构建/安装脚本（build*.ps1 / *.ps1）：
+#    - 必须 LF + 无 BOM。纯 ASCII 的 PS 脚本被 PS 2.0 解析时，
+#      行尾无需 CRLF；而 BOM 会让某些工具链判断失误。
+# 2. JSON 清单（skill.json 等）：Python 端以 utf-8 显式读取，
+#    CRLF 无害，但统一 LF 可避免跨机 diff 噪声。
+# 3. 含中文的 .cs 源文件：csc 以 /codepage:65001 编译，
+#    编码必须是 UTF-8；行尾随意，保持 LF 与仓库一致。
+#
+# 注意：行尾策略用 `text eol=lf`（而不是 `-text`），
+# 这样 Git 仍会做 CRLF 归一化，仓库内始终是 LF。
+
+# 构建与部署脚本
+*.ps1 text eol=lf
+*.cmd text eol=lf
+*.bat text eol=lf
+
+# 技能清单与配置
+*.json text eol=lf
+
+# 文档
+*.md text eol=lf
+
+# 二进制资源：不参与任何行尾转换
+*.png binary
+*.ico binary
+*.pptx binary
+*.xlsx binary
+*.docx binary
+*.pdf binary
+*.whl binary
+*.zip binary
+*.exe binary
+*.dll binary

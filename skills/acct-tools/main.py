@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """acct-tools —— 会计工具箱（python38 技能）
 
 协议（SkillRunner 约定）：
@@ -10,6 +10,12 @@
   trial-balance  试算平衡 / 科目余额表：按科目汇总借贷，检查借贷是否相等
   aging          账龄分析：按到期日/发生日把应收应付分到 0-30/31-60/61-90/90+ 区间
   depreciation   折旧计算：直线法 / 双倍余额递减法，输出逐期折旧表
+  vat            增值税：一般计税 / 简易计税
+  statements     财务报表：资产负债表 + 利润表（含平衡校验）
+  payroll        工资表与个税：中国累计预扣法（2019 起口径），含社保公积金
+  bank-recon     银行余额调节表：对账单 vs 日记账，输出调节表并验证调节后相等
+  consolidation  合并报表抵消：多公司汇总 + 内部交易抵消分录
+  journal        凭证/日记账生成：按分录生成记账凭证并登记日记账
 
 输入约定（表头名可用同义词，见下方 HEADER_ALIAS）：
   trial-balance 需要：科目、借方、贷方（至少一组）
@@ -521,6 +527,378 @@ def do_statements(params):
     }, None
 
 
+# ---------------- 工资表与个税（累计预扣法） ----------------
+
+# 中国居民工资薪金个税预扣率表（累计预扣法，2019 起）：
+# (累计应纳税所得额上限, 税率, 速算扣除数)
+IIT_BRACKETS = [
+    (36000.0, 0.03, 0.0),
+    (144000.0, 0.10, 2520.0),
+    (300000.0, 0.20, 16920.0),
+    (420000.0, 0.25, 31920.0),
+    (660000.0, 0.30, 52920.0),
+    (960000.0, 0.35, 85920.0),
+    (float("inf"), 0.45, 181920.0),
+]
+
+
+def iit_of(cum_taxable):
+    """按累计应纳税所得额查表得 (税率, 速算扣除数)。"""
+    for cap, rate, deduct in IIT_BRACKETS:
+        if cum_taxable <= cap:
+            return rate, deduct
+    return 0.45, 181920.0
+
+
+def do_payroll(header, rows, params):
+    """工资表与个税。
+    输入列（同义词自动识别）：姓名、应发工资、社保、公积金、专项附加扣除；
+    可选：月份（1-12，用于累计）。不给月份时按"本月即第 month 个月"处理，
+    并把之前的累计视为 0（适合只算单月的场景）。
+    """
+    c_name = find_col(header, ["姓名", "员工", "名字", "name", "人员"])
+    c_gross = find_col(header, ["应发工资", "应发", "工资", "gross", "应付工资", "应发合计"])
+    c_si = find_col(header, ["社保", "社会保险", "五险", "social", "个人社保"])
+    c_hf = find_col(header, ["公积金", "住房公积", "housing", "个人公积金"])
+    c_extra = find_col(header, ["专项附加扣除", "专扣", "附加扣除", "extra", "专项附加"])
+    c_month = find_col(header, ["月份", "月", "month"])
+
+    if c_name < 0 or c_gross < 0:
+        return None, "需要「姓名」与「应发工资」列（可用表头：姓名/员工/name；应发工资/工资/gross）"
+
+    try:
+        month = int(params.get("month") or 1)
+    except (TypeError, ValueError):
+        month = 1
+    month = max(1, min(month, 12))
+    basic = float(params.get("basicDeduction") if params.get("basicDeduction") is not None else 5000)
+
+    out = []
+    tot_gross = tot_tax = tot_net = tot_si = tot_hf = 0.0
+    skipped = 0
+
+    for r in rows:
+        nm = str(r[c_name]).strip() if c_name < len(r) and r[c_name] is not None else ""
+        if nm == "":
+            continue
+        gross = to_num(r[c_gross]) if c_gross < len(r) else None
+        if gross is None:
+            skipped += 1
+            continue
+        si = to_num(r[c_si]) if (c_si >= 0 and c_si < len(r)) else 0.0
+        hf = to_num(r[c_hf]) if (c_hf >= 0 and c_hf < len(r)) else 0.0
+        extra = to_num(r[c_extra]) if (c_extra >= 0 and c_extra < len(r)) else 0.0
+        si = si or 0.0
+        hf = hf or 0.0
+        extra = extra or 0.0
+        m = month
+        if c_month >= 0 and c_month < len(r):
+            try:
+                m = int(float(str(r[c_month]).strip()))
+                m = max(1, min(m, 12))
+            except (TypeError, ValueError):
+                m = month
+
+        # 累计预扣法。
+        # 有两种用法，务必分清（口径不同，结果不同）：
+        #   A) 算"某个月的这一期"（默认）：假设本月的收入/扣除与前几个月相同，
+        #      于是累计 = 本月值 × 月份 m。适合快速估算或每月都一样的场景。
+        #      ⚠ 这是**估算**：真实情况里月度收入与社保常有波动。
+        #   B) 精确累计（推荐用于真实申报）：用 params.prior* 传入**截至上月的累计数**，
+        #      本工具只负责加上本月并算出本期应预扣。此时月份 m 仅作展示。
+        prior_income = params.get("priorIncome")
+        prior_si = params.get("priorSocialInsurance")
+        prior_hf = params.get("priorHousingFund")
+        prior_extra = params.get("priorExtra")
+        prior_tax = params.get("priorTaxPaid")
+        has_prior = any(x is not None for x in (prior_income, prior_si, prior_hf, prior_extra, prior_tax))
+
+        if has_prior:
+            try:
+                pi = float(prior_income or 0)
+                psi = float(prior_si or 0)
+                phf = float(prior_hf or 0)
+                pex = float(prior_extra or 0)
+                ptax = float(prior_tax or 0)
+            except (TypeError, ValueError):
+                return None, "prior* 参数必须为数字（截至上月的累计数）"
+            cum_gross = pi + gross
+            cum_deduct = (basic * m) + (psi + si) + (phf + hf) + (pex + extra)
+            mode_note = "精确累计（含传入的截至上月累计）"
+        else:
+            cum_gross = gross * m
+            cum_deduct = basic * m + (si + hf) * m + extra * m
+            ptax = 0.0
+            mode_note = "单月估算（假设前 %d 个月与本月相同）" % (m - 1) if m > 1 else "单月"
+
+        cum_taxable = cum_gross - cum_deduct
+        if cum_taxable < 0:
+            cum_taxable = 0.0
+        rate, quick = iit_of(cum_taxable)
+        cum_tax = cum_taxable * rate - quick
+        if cum_tax < 0:
+            cum_tax = 0.0
+        # 本期应预扣 = 累计应纳税额 - 已预扣（精确模式）；估算模式已预扣按 0
+        tax = round(cum_tax - ptax, 2)
+        if tax < 0:
+            tax = 0.0
+        net = round(gross - si - hf - tax, 2)
+
+        out.append({
+            "姓名": nm, "月份": m, "应发工资": round(gross, 2),
+            "社保": round(si, 2), "公积金": round(hf, 2),
+            "专项附加扣除": round(extra, 2),
+            "累计应纳税所得额": round(cum_taxable, 2),
+            "累计应纳税额": round(cum_tax, 2),
+            "已预扣": round(ptax, 2),
+            "口径": mode_note,
+            "税率": "%.0f%%" % (rate * 100),
+            "速算扣除数": round(quick, 2),
+            "个税": tax,
+            "实发工资": net,
+        })
+        tot_gross += gross
+        tot_si += si
+        tot_hf += hf
+        tot_tax += tax
+        tot_net += net
+
+    return {
+        "month": month, "basicDeduction": basic,
+        "rows": out,
+        "totalGross": round(tot_gross, 2),
+        "totalSocialInsurance": round(tot_si, 2),
+        "totalHousingFund": round(tot_hf, 2),
+        "totalTax": round(tot_tax, 2),
+        "totalNet": round(tot_net, 2),
+        "employeeCount": len(out),
+        "skippedRows": skipped,
+    }, None
+
+
+# ---------------- 银行余额调节表 ----------------
+
+def do_bank_recon(header, rows, params):
+    """银行余额调节表。
+    输入列：日期、摘要、金额、类型（收/付 或 借/贷）；可选：来源（银行/企业）。
+    也可传两文件：inputs[0]=对账单, inputs[1]=日记账，分别读再合并。
+    输出调节表：银行对账单余额 + 企业已收银行未收 - 企业已付银行未付
+                = 企业日记账余额 + 银行已收企业未收 - 银行已付企业未付
+    """
+    try:
+        bank_bal = float(params.get("bankBalance") or 0)
+        book_bal = float(params.get("bookBalance") or 0)
+    except (TypeError, ValueError):
+        return None, "需要 bankBalance（对账单余额）与 bookBalance（日记账余额）"
+
+    # 从传入的记录里挑出"未达账项"：按 params.unmatched 给的两组
+    # 结构：unmatched = {"bankReceived": [...], "bankPaid": [...],
+    #                    "bookReceived": [...], "bookPaid": [...]}
+    um = params.get("unmatched") or {}
+
+    def total(key):
+        t = 0.0
+        for x in (um.get(key) or []):
+            if isinstance(x, dict):
+                v = to_num(x.get("金额") or x.get("amount"))
+            else:
+                v = to_num(x)
+            if v is not None:
+                t += v
+        return round(t, 2)
+
+    br = total("bankReceived")    # 银行已收、企业未收 → 加在日记账侧
+    bp = total("bankPaid")        # 银行已付、企业未付 → 减在日记账侧
+    er = total("bookReceived")    # 企业已收、银行未收 → 加在对账单侧
+    ep = total("bookPaid")        # 企业已付、银行未付 → 减在对账单侧
+
+    adj_bank = round(bank_bal + er - ep, 2)
+    adj_book = round(book_bal + br - bp, 2)
+    diff = round(adj_bank - adj_book, 2)
+
+    rows = [
+        ["银行对账单余额", round(bank_bal, 2)],
+        ["加：企业已收、银行未收", er],
+        ["减：企业已付、银行未付", ep],
+        ["调节后银行余额", adj_bank],
+        ["", ""],
+        ["企业日记账余额", round(book_bal, 2)],
+        ["加：银行已收、企业未收", br],
+        ["减：银行已付、企业未付", bp],
+        ["调节后企业余额", adj_book],
+        ["", ""],
+        ["差额", diff],
+    ]
+
+    return {
+        "bankBalance": round(bank_bal, 2), "bookBalance": round(book_bal, 2),
+        "bookReceived": er, "bookPaid": ep,
+        "bankReceived": br, "bankPaid": bp,
+        "adjustedBank": adj_bank, "adjustedBook": adj_book,
+        "difference": diff, "balanced": abs(diff) < 0.005,
+        "rows": rows,
+    }, None
+
+
+# ---------------- 合并报表抵消 ----------------
+
+def do_consolidation(params):
+    """合并报表抵消。
+    params.companies: [{"name":"A","assets":{...},"liabilities":{...},"equity":{...},
+                        "revenue":{...},"expense":{...}}]
+    params.eliminations: [{"desc":"内部销售抵消","debit":"主营业务收入","credit":"主营业务成本","amount":1000}]
+    简化口径：只做"内部交易抵消分录"对损益与往来余额的影响汇总，
+    输出各公司个别数 → 抵消分录 → 合并数 三栏对照。
+    """
+    companies = params.get("companies")
+    if not companies:
+        return None, "需要 companies 数组"
+    elims = params.get("eliminations") or []
+
+    def num(d, k):
+        try:
+            return float(d.get(k) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    # 个别数汇总
+    tot = {"资产": 0.0, "负债": 0.0, "权益": 0.0, "收入": 0.0, "费用": 0.0}
+    detail = []
+    for c in companies:
+        a = sum(num(v, "金额") if isinstance(v, dict) else 0.0 for v in (c.get("assets") or {}).values()) \
+            if isinstance(c.get("assets"), dict) else num(c, "assets")
+        l = sum(num(v, "金额") if isinstance(v, dict) else 0.0 for v in (c.get("liabilities") or {}).values()) \
+            if isinstance(c.get("liabilities"), dict) else num(c, "liabilities")
+        e = sum(num(v, "金额") if isinstance(v, dict) else 0.0 for v in (c.get("equity") or {}).values()) \
+            if isinstance(c.get("equity"), dict) else num(c, "equity")
+        r = sum(num(v, "金额") if isinstance(v, dict) else 0.0 for v in (c.get("revenue") or {}).values()) \
+            if isinstance(c.get("revenue"), dict) else num(c, "revenue")
+        x = sum(num(v, "金额") if isinstance(v, dict) else 0.0 for v in (c.get("expense") or {}).values()) \
+            if isinstance(c.get("expense"), dict) else num(c, "expense")
+        detail.append({"name": c.get("name") or "?", "资产": a, "负债": l, "权益": e,
+                       "收入": r, "费用": x, "利润": r - x})
+        tot["资产"] += a
+        tot["负债"] += l
+        tot["权益"] += e
+        tot["收入"] += r
+        tot["费用"] += x
+
+    # 抵消分录：按借贷科目归类，抵减对应大类
+    elim_rows = []
+    elim_effect = {"资产": 0.0, "负债": 0.0, "权益": 0.0, "收入": 0.0, "费用": 0.0}
+
+    def classify(subj):
+        s = str(subj or "")
+        for kw, cat in (("收入", "收入"), ("成本", "费用"), ("费用", "费用"), ("资产", "资产"),
+                        ("应收", "资产"), ("存货", "资产"), ("负债", "负债"),
+                        ("应付", "负债"), ("权益", "权益"), ("资本", "权益")):
+            if kw in s:
+                return cat
+        return None
+
+    unmatched = []
+    for el in elims:
+        amt = to_num(el.get("amount"))
+        if amt is None:
+            continue
+        dj = classify(el.get("debit"))
+        cj = classify(el.get("credit"))
+        if dj is None or cj is None:
+            unmatched.append(el.get("desc") or str(el))
+            continue
+        # 抵消分录：借某科目 = 该类别减少（收入类借减）；贷某科目 = 该类别减少（费用/资产类贷减）
+        # 简化：只在"同类相抵"（如内部收入 vs 内部成本）时把两边各自冲减
+        elim_effect[dj] -= amt
+        elim_effect[cj] -= amt
+        elim_rows.append([el.get("desc") or "", el.get("debit") or "", el.get("credit") or "", amt])
+
+    merged = {}
+    for k in ("资产", "负债", "权益", "收入", "费用"):
+        merged[k] = round(tot[k] + elim_effect[k], 2)
+    merged["利润"] = round(merged["收入"] - merged["费用"], 2)
+
+    # 合并口径勾稽：资产 = 负债 + 权益（利润并入权益）
+    lhs = merged["资产"]
+    rhs = round(merged["负债"] + merged["权益"] + merged["利润"], 2)
+    diff = round(lhs - rhs, 2)
+
+    return {
+        "companies": detail,
+        "eliminations": elim_rows,
+        "unmatchedEliminations": unmatched,
+        "individual": {k: round(v, 2) for k, v in tot.items()},
+        "merged": merged,
+        "balanceDiff": diff,
+        "balanced": abs(diff) < 0.005,
+    }, None
+
+
+# ---------------- 凭证 / 日记账生成 ----------------
+
+def do_journal(params):
+    """按分录生成记账凭证并登记日记账。
+    params.entries: [{"date":"2026-10-02","voucher":"记-001","summary":"收到货款",
+                      "lines":[{"科目":"银行存款","借方":10000},{"科目":"应收账款","贷方":10000}]}]
+    校验：每张凭证借贷必须相等；不等的凭证**不登记**并列入错误清单（绝不静默计入）。
+    """
+    entries = params.get("entries")
+    if not entries:
+        return None, "需要 entries 数组"
+
+    vouchers = []
+    journal = []
+    errors = []
+    vno = 0
+
+    for e in entries:
+        vno += 1
+        lines = e.get("lines") or []
+        if not lines:
+            errors.append("第 %d 张凭证没有分录行" % vno)
+            continue
+        td = tc = 0.0
+        norm = []
+        for ln in lines:
+            subj = str(ln.get("科目") or "").strip()
+            d = to_num(ln.get("借方"))
+            c = to_num(ln.get("贷方"))
+            d = d or 0.0
+            c = c or 0.0
+            if subj == "":
+                errors.append("第 %d 张凭证存在无科目的分录行" % vno)
+                norm = None
+                break
+            if d != 0 and c != 0:
+                errors.append("第 %d 张凭证科目「%s」借贷同时有值" % (vno, subj))
+                norm = None
+                break
+            td += d
+            tc += c
+            norm.append({"科目": subj, "借方": round(d, 2), "贷方": round(c, 2)})
+        if norm is None:
+            continue
+        if abs(td - tc) >= 0.005:
+            errors.append("第 %d 张凭证借贷不平（借 %.2f / 贷 %.2f）— 未登记" % (vno, td, tc))
+            continue
+
+        dt = str(e.get("date") or "").strip()
+        v = str(e.get("voucher") or ("记-%03d" % vno)).strip()
+        summ = str(e.get("summary") or "").strip()
+        vouchers.append({"序号": vno, "日期": dt, "凭证号": v, "摘要": summ,
+                         "借方合计": round(td, 2), "贷方合计": round(tc, 2)})
+        for ln in norm:
+            journal.append({"日期": dt, "凭证号": v, "摘要": summ,
+                            "科目": ln["科目"], "借方": ln["借方"], "贷方": ln["贷方"]})
+
+    return {
+        "vouchers": vouchers,
+        "journal": journal,
+        "errors": errors,
+        "voucherCount": len(vouchers),
+        "journalLineCount": len(journal),
+    }, None
+
+
 # ---------------- 写结果到 xlsx ----------------
 
 def write_result(out_path, title, header, rows):
@@ -570,6 +948,148 @@ def main():
     base_dir = os.path.dirname(inputs[0]) if inputs else os.getcwd()
 
     try:
+        if action in ("payroll", "工资", "个税"):
+            if not inputs:
+                print(json.dumps({"ok": False, "message": "payroll 需要输入文件（含姓名/应发工资列的 xlsx/csv）"},
+                                 ensure_ascii=False))
+                return 1
+            header, rows = read_table(inputs[0], params.get("sheet"), params.get("headerRow") or 1)
+            data, err = do_payroll(header, rows, params)
+            if err:
+                print(json.dumps({"ok": False, "message": err, "data": {"header": header}},
+                                 ensure_ascii=False))
+                return 1
+            if not out:
+                out = os.path.join(base_dir, "工资表.xlsx")
+            elif not os.path.isabs(out):
+                out = os.path.join(base_dir, out)
+            write_result(out, "工资表（%d 月，累计预扣法）" % data["month"],
+                         ["姓名", "应发工资", "社保", "公积金", "专项附加扣除",
+                          "累计应纳税所得额", "税率", "速算扣除数", "个税", "实发工资"],
+                         [[r["姓名"], r["应发工资"], r["社保"], r["公积金"], r["专项附加扣除"],
+                           r["累计应纳税所得额"], r["税率"], r["速算扣除数"], r["个税"], r["实发工资"]]
+                          for r in data["rows"]])
+            print(json.dumps({
+                "ok": True,
+                "message": "%d 人工资表：应发合计 %.2f，个税合计 %.2f，实发合计 %.2f；已输出 %s" % (
+                    data["employeeCount"], data["totalGross"], data["totalTax"], data["totalNet"], out),
+                "data": dict(data, out=out),
+            }, ensure_ascii=False))
+            return 0
+
+        if action in ("bank-recon", "bankrecon", "银行余额调节表", "调节表"):
+            data, err = do_bank_recon(None, None, params)
+            if err:
+                print(json.dumps({"ok": False, "message": err}, ensure_ascii=False))
+                return 1
+            if not out:
+                out = os.path.join(base_dir, "银行余额调节表.xlsx")
+            elif not os.path.isabs(out):
+                out = os.path.join(base_dir, out)
+            write_result(out, "银行存款余额调节表", ["项目", "金额"], data["rows"])
+            verdict = "调节后双方相等 ✓" if data["balanced"] else \
+                "调节后仍差 %.2f ✗（请核对未达账项）" % data["difference"]
+            print(json.dumps({
+                "ok": True,
+                "message": "调节后银行 %.2f / 企业 %.2f；%s；已输出 %s" % (
+                    data["adjustedBank"], data["adjustedBook"], verdict, out),
+                "data": dict(data, out=out),
+            }, ensure_ascii=False))
+            return 0
+
+        if action in ("consolidation", "合并", "抵消"):
+            data, err = do_consolidation(params)
+            if err:
+                print(json.dumps({"ok": False, "message": err}, ensure_ascii=False))
+                return 1
+            if not out:
+                out = os.path.join(base_dir, "合并报表.xlsx")
+            elif not os.path.isabs(out):
+                out = os.path.join(base_dir, out)
+            # 三栏对照：个别数 / 抵消 / 合并数
+            rows = []
+            for k in ("资产", "负债", "权益", "收入", "费用", "利润"):
+                indiv = data["individual"].get(k, 0.0) if k != "利润" else \
+                    round(data["individual"]["收入"] - data["individual"]["费用"], 2)
+                merged = data["merged"].get(k, 0.0)
+                rows.append([k, indiv, r2(merged - indiv), merged])
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "合并报表"
+            ws.append(["合并报表工作底稿"]); ws["A1"].font = openpyxl.styles.Font(bold=True, size=13)
+            ws.append([])
+            ws.append(["项目", "个别数合计", "抵消", "合并数"])
+            for c in range(1, 5):
+                ws.cell(row=3, column=c).font = openpyxl.styles.Font(bold=True)
+            for r in rows:
+                ws.append(r)
+            if data["eliminations"]:
+                ws.append([])
+                ws.append(["抵消分录", "借方科目", "贷方科目", "金额"])
+                for c in range(1, 5):
+                    ws.cell(row=ws.max_row, column=c).font = openpyxl.styles.Font(bold=True)
+                for e in data["eliminations"]:
+                    ws.append(e)
+            ws.column_dimensions["A"].width = 24
+            for col in ("B", "C", "D"):
+                ws.column_dimensions[col].width = 16
+            if os.path.dirname(out) and not os.path.isdir(os.path.dirname(out)):
+                os.makedirs(os.path.dirname(out))
+            wb.save(out)
+            verdict = "合并后资产 = 负债+权益+利润 ✓" if data["balanced"] else \
+                "合并后不平 ✗（差 %.2f）" % data["balanceDiff"]
+            extra = ""
+            if data["unmatchedEliminations"]:
+                extra = "；%d 条抵消分录科目无法归类，已跳过（见 unmatchedEliminations）" % \
+                    len(data["unmatchedEliminations"])
+            print(json.dumps({
+                "ok": True,
+                "message": "%d 家公司合并，抵消 %d 笔；%s%s；已输出 %s" % (
+                    len(data["companies"]), len(data["eliminations"]), verdict, extra, out),
+                "data": dict(data, out=out),
+            }, ensure_ascii=False))
+            return 0
+
+        if action in ("journal", "凭证", "日记账"):
+            data, err = do_journal(params)
+            if err:
+                print(json.dumps({"ok": False, "message": err}, ensure_ascii=False))
+                return 1
+            if not out:
+                out = os.path.join(base_dir, "记账凭证.xlsx")
+            elif not os.path.isabs(out):
+                out = os.path.join(base_dir, out)
+            wb = openpyxl.Workbook()
+            ws1 = wb.active
+            ws1.title = "凭证汇总"
+            ws1.append(["记账凭证汇总"]); ws1["A1"].font = openpyxl.styles.Font(bold=True, size=13)
+            ws1.append([])
+            ws1.append(["序号", "日期", "凭证号", "摘要", "借方合计", "贷方合计"])
+            for c in range(1, 7):
+                ws1.cell(row=3, column=c).font = openpyxl.styles.Font(bold=True)
+            for v in data["vouchers"]:
+                ws1.append([v["序号"], v["日期"], v["凭证号"], v["摘要"], v["借方合计"], v["贷方合计"]])
+            ws2 = wb.create_sheet("日记账")
+            ws2.append(["日期", "凭证号", "摘要", "科目", "借方", "贷方"])
+            for c in range(1, 7):
+                ws2.cell(row=1, column=c).font = openpyxl.styles.Font(bold=True)
+            for j in data["journal"]:
+                ws2.append([j["日期"], j["凭证号"], j["摘要"], j["科目"], j["借方"], j["贷方"]])
+            for ws in (ws1, ws2):
+                ws.column_dimensions["A"].width = 12
+                ws.column_dimensions["C"].width = 24
+                ws.column_dimensions["D"].width = 18
+            if os.path.dirname(out) and not os.path.isdir(os.path.dirname(out)):
+                os.makedirs(os.path.dirname(out))
+            wb.save(out)
+            msg = "生成 %d 张凭证、%d 行日记账" % (data["voucherCount"], data["journalLineCount"])
+            if data["errors"]:
+                msg += "；%d 张被拒（借贷不平或科目缺失）：%s" % (len(data["errors"]), data["errors"][0])
+            msg += "；已输出 " + out
+            print(json.dumps({"ok": True, "message": msg, "data": dict(data, out=out)},
+                             ensure_ascii=False))
+            return 0
+
         if action in ("vat", "增值税"):
             data, err = do_vat(params)
             if err:

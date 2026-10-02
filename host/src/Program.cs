@@ -40,6 +40,7 @@ namespace OfficeAgent.Host
             bool skillTest = false;
             bool auditTest = false;
             bool detectTest = false;
+            bool bridgeTest = false;
             string[] skillRunArgs = null;
             string[] agentTestArgs = null;
             string[] reconArgs = null;
@@ -60,6 +61,7 @@ namespace OfficeAgent.Host
                 else if (a == "/skilltest") skillTest = true;
                 else if (a == "/audittest") auditTest = true;
                 else if (a == "/detecttest") detectTest = true;
+                else if (a == "/bridgetest") bridgeTest = true;
                 else if (a == "/skillrun")
                 {
                     List<string> rest = new List<string>();
@@ -95,7 +97,7 @@ namespace OfficeAgent.Host
 
             // CLI 无头链同样落审计（设计方案 §7.3：每个动作可审计；GUI 的 app_start 在 MainForm）
             if (selftest || guardTest || maskTest || intentTest || suggestTest || skillTest || caretTest
-                || auditTest || detectTest
+                || auditTest || detectTest || bridgeTest
                 || gridTestInput != null
                 || skillRunArgs != null || agentTestArgs != null || reconArgs != null || mergeArgs != null
                 || invoiceArgs != null || convertInput != null || renderInput != null
@@ -174,6 +176,14 @@ namespace OfficeAgent.Host
                 try { AllocConsole(); } catch { }
                 try { Console.OutputEncoding = Encoding.UTF8; } catch { }
                 return RunDetectTest();
+            }
+
+            if (bridgeTest)
+            {
+                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
+                try { AllocConsole(); } catch { }
+                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                return RunBridgeTest();
             }
 
             if (skillRunArgs != null)
@@ -1227,6 +1237,176 @@ namespace OfficeAgent.Host
             "避让通知异常不影响落盘（产物" + (robFile ? "已生成 keep(3).xlsx" : "未生成") + "）");
 
         Console.WriteLine("（产物保留在 " + genDir + " 供人工抽查，下次运行时清理）");
+
+        Console.WriteLine(failed == 0 ? "ALL PASS" : (failed + " FAILED"));
+        return failed == 0 ? 0 : 2;
+    }
+
+    // 技能→工具投影自测（规划层第一期）：OfficeAgent.exe /bridgetest
+    // 验证 skill.json 的 actions/actionParams 能被正确投影成 function-calling schema，
+    // 并且模型给出的工具名能反查回技能、参数能正确落成 request.json。
+    static int RunBridgeTest()
+    {
+        int failed = 0;
+        string root = EnvDetect.FindRoot();
+        SkillToolBridge.InvalidateCache();
+
+        // 1. 投影：五个技能的动作总数应为 19
+        List<SkillActionSpec> all = SkillToolBridge.Collect(root);
+        bool ok = all.Count == 19;
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "动作投影（" + all.Count + " 个动作，期望 19）");
+
+        // 2. 每个动作都能定位到技能且名字唯一
+        Dictionary<string, int> nameCount = new Dictionary<string, int>();
+        bool uniq = true;
+        foreach (SkillActionSpec sp in all)
+        {
+            string n = sp.SkillId + "/" + sp.Action;
+            if (nameCount.ContainsKey(n)) uniq = false;
+            else nameCount[n] = 1;
+        }
+        if (!uniq) failed++;
+        Console.WriteLine((uniq ? "[OK]  " : "[FAIL] ") + "动作名唯一性");
+
+        // 3. schema JSON 结构合法：括号配平、逗号数量正确
+        string schemas = SkillToolBridge.BuildSchemas(root);
+        int depth = 0; bool balanced = true;
+        foreach (char c in schemas)
+        {
+            if (c == '{' || c == '[') depth++;
+            else if (c == '}' || c == ']') { depth--; if (depth < 0) { balanced = false; break; } }
+        }
+        balanced = balanced && depth == 0 && schemas.Length > 0;
+        // 不能出现空的 properties 后紧跟空 required 造成 "[," 之类的非法拼接
+        bool noDangling = schemas.IndexOf(",]") < 0 && schemas.IndexOf("[,]") < 0 && schemas.IndexOf("{,") < 0;
+        ok = balanced && noDangling;
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "schema JSON 配平（len=" + schemas.Length +
+            " balanced=" + balanced + " dangling=" + !noDangling + "）");
+
+        // 4. 拼接进完整工具表后仍是合法 JSON 片段（回归：空技能表时不得产生 "[...,]"）
+        string baseTools = AgentTools.SchemasJson(true);
+        string joined = baseTools.Substring(0, baseTools.Length - 1) + "," + schemas + "]";
+        depth = 0; balanced = true;
+        foreach (char c in joined)
+        {
+            if (c == '{' || c == '[') depth++;
+            else if (c == '}' || c == ']') { depth--; if (depth < 0) { balanced = false; break; } }
+        }
+        balanced = balanced && depth == 0;
+        // 顶层应是 8 个基础工具（6 通用 + task_plan + repair_environment 等）+ 19 个技能动作 = 27 个 "name"
+        // 注意：此处的 "name" 计数也包含每个工具 parameters 里名为 name 的参数（如 xlsx-ops 的 add-sheet.name），
+        // 所以这里比对的是"拼接后总数必须 = 基础数 + 技能数"，基础数由同一函数单独取一次保证一致。
+        string baseOnly = AgentTools.SchemasJson(true);
+        int baseNames = 0;
+        int bi = 0;
+        while (true)
+        {
+            int at = baseOnly.IndexOf("\"name\":\"", bi, StringComparison.Ordinal);
+            if (at < 0) break;
+            baseNames++;
+            bi = at + 8;
+        }
+        int skillNames = 0;
+        int si = 0;
+        while (true)
+        {
+            int at = schemas.IndexOf("\"name\":\"", si, StringComparison.Ordinal);
+            if (at < 0) break;
+            skillNames++;
+            si = at + 8;
+        }
+        int toolCount = 0;
+        int idx = 0;
+        while (true)
+        {
+            int at = joined.IndexOf("\"name\":\"", idx, StringComparison.Ordinal);
+            if (at < 0) break;
+            toolCount++;
+            idx = at + 8;
+        }
+        ok = balanced && toolCount == baseNames + skillNames && toolCount > baseNames;
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "完整工具表拼接（基础=" + baseNames +
+            " 技能=" + skillNames + " 合计=" + toolCount + "，balanced=" + balanced + "）");
+
+        // 5. 反查：用生成的名字能找回原技能动作（含 '-' 被转 '_' 的情形）
+        SkillActionSpec r1 = SkillToolBridge.Resolve(root, "skill_acct_tools_trial_balance");
+        SkillActionSpec r2 = SkillToolBridge.Resolve(root, "skill_xlsx_ops_add_sheet");
+        SkillActionSpec r3 = SkillToolBridge.Resolve(root, "skill_acct_tools_nonexistent");
+        ok = r1 != null && r1.SkillId == "acct-tools" && r1.Action == "trial-balance"
+            && r2 != null && r2.SkillId == "xlsx-ops" && r2.Action == "add-sheet"
+            && r3 == null;
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "工具名反查（trial-balance=" +
+            (r1 == null ? "?" : r1.Action) + " add-sheet=" + (r2 == null ? "?" : r2.Action) +
+            " 未知名=" + (r3 == null ? "null(正确)" : "误命中") + "）");
+
+        // 6. 参数解析：acct-tools/vat 应有两个 number 必填参数
+        SkillActionSpec vat = SkillToolBridge.Resolve(root, "skill_acct_tools_vat");
+        ok = vat != null && vat.Params.Count == 2;
+        if (ok)
+        {
+            foreach (string[] p in vat.Params)
+            {
+                if (p[1] != "number" || p[2] != "required") ok = false;
+            }
+        }
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "参数解析（vat 参数数=" +
+            (vat == null ? "?" : vat.Params.Count.ToString()) + "）");
+
+        // 7. 必填缺失 → 结构化报错，而不是让 Python 端报晦涩错误
+        SkillActionSpec dv = SkillToolBridge.Resolve(root, "skill_acct_tools_depreciation");
+        bool missOk = false;
+        string missMsg = SkillToolBridge.Invoke(root, dv, new Dictionary<string, string>(), null, out missOk);
+        ok = !missOk && missMsg.IndexOf("cost") >= 0 && missMsg.IndexOf("years") >= 0;
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "必填缺失拦截（" + missMsg + "）");
+
+        // 8. 端到端：走 AgentTools.Dispatch 真实执行 vat（纯计算，无输入文件）
+        Dictionary<string, string> vatArgs = new Dictionary<string, string>();
+        vatArgs["sales"] = "100000";
+        vatArgs["purchases"] = "60000";
+        List<string> prods = new List<string>();
+        bool vatOk = false;
+        string vatMsg = AgentTools.Dispatch("skill_acct_tools_vat", "{\"sales\":\"100000\",\"purchases\":\"60000\"}",
+            null, new ConvertEngine(), prods, out vatOk);
+        // 一般计税 100000*13% - 60000*13% = 5200
+        ok = vatOk && vatMsg.IndexOf("5200") >= 0;
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "Dispatch 执行技能（" + vatMsg.Replace("\n", " ") + "）");
+
+        // 9. 未知技能工具名 → 明确报错（不得静默当成基础工具）
+        bool unkOk = false;
+        string unkMsg = AgentTools.Dispatch("skill_does_not_exist", "{}", null, new ConvertEngine(), null, out unkOk);
+        ok = !unkOk && unkMsg.IndexOf("未知技能工具") >= 0;
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "未知技能工具拦截（" + unkMsg + "）");
+
+        // 10. 向后兼容：无 actions 段的老技能不投影，且不影响其余技能
+        string tmpUserSkills = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "oa-bridgetest-user");
+        try
+        {
+            if (System.IO.Directory.Exists(tmpUserSkills)) System.IO.Directory.Delete(tmpUserSkills, true);
+            string legacy = System.IO.Path.Combine(tmpUserSkills, "legacy-skill");
+            System.IO.Directory.CreateDirectory(legacy);
+            System.IO.File.WriteAllText(System.IO.Path.Combine(legacy, "skill.json"),
+                "{\"id\":\"legacy-skill\",\"name\":\"老技能\",\"version\":\"1.0.0\",\"host\":\"1.0.0\"," +
+                "\"runtime\":\"builtin\",\"entry\":\"recon\",\"scenarios\":\"老\"}",
+                new UTF8Encoding(false));
+            List<SkillRegistryEntry> reg = SkillSystem.Scan(root, null, tmpUserSkills, false);
+            int legacyActions = 0;
+            foreach (SkillRegistryEntry e in reg)
+            {
+                if (e.Id == "legacy-skill") legacyActions += SkillToolBridge.ParseActions(e).Count;
+            }
+            ok = legacyActions == 0;
+            if (!ok) failed++;
+            Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "无 actions 的老技能不投影（动作数=" + legacyActions + "）");
+        }
+        finally { try { System.IO.Directory.Delete(tmpUserSkills, true); } catch { } }
 
         Console.WriteLine(failed == 0 ? "ALL PASS" : (failed + " FAILED"));
         return failed == 0 ? 0 : 2;

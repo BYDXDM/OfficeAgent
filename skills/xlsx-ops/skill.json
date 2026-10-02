@@ -6,6 +6,8 @@
   "runtime": "python38",
   "entry": "main.py",
   "scenarios": "工作表,多表,公式,合并单元格,单元格格式,列宽,冻结",
+  "actions": "inspect|列出工作簿结构，含工作表名、行列数、表头、公式单元格、合并区域、列宽;add-sheet|用 CSV 文本新建一个工作表;set-cell|写入单元格的值;formula|写入公式;freeze|冻结窗格;autofit|按内容估算列宽并应用",
+  "actionParams": "inspect:inputs:file[]:required:要检查的 xlsx 绝对路径;add-sheet:inputs:file[]:required:xlsx 路径;add-sheet:name:string:required:新工作表名;add-sheet:csv:string:required:表格内容 CSV 文本;set-cell:inputs:file[]:required:xlsx 路径;set-cell:sheet:string:optional:工作表名;set-cell:cell:string:required:单元格地址如 B3;set-cell:value:string:required:写入的值;formula:inputs:file[]:required:xlsx 路径;formula:sheet:string:optional:工作表名;formula:cell:string:required:单元格地址;formula:formula:string:required:SUM 公式，如 A1到A9 求和;freeze:inputs:file[]:required:xlsx 路径;freeze:sheet:string:optional:工作表名;freeze:cell:string:required:冻结位置如 A2;autofit:inputs:file[]:required:xlsx 路径;autofit:sheet:string:optional:工作表名",
   "depsTools": "",
   "network": false,
   "officeCom": false,

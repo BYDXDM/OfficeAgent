@@ -47,6 +47,12 @@ namespace OfficeAgent.Host
         {
             Result r = new Result();
             string tools = AgentTools.SchemasJson(config != null && config.PluginPlan);
+            // 技能工具（规划层第一期）：把 skills 注册表投影成额外的 function-calling 工具，
+            // 让模型能直接调用会计/Excel/Word 技能，而不是只会用 CSV 文本糊表。
+            // 有动作才拼接：空串时保持原样，避免产生 "[...,]" 这种非法 JSON。
+            string skillTools = AgentTools.SkillSchemasJson(EnvDetect.FindRoot());
+            if (skillTools != null && skillTools.Length > 0 && tools != null && tools.Length > 0)
+                tools = tools.Substring(0, tools.Length - 1) + "," + skillTools + "]";
             List<string> products = new List<string>();
             ConvertEngine conv = new ConvertEngine();
             conv.SofficePath = ConvertEngine.FindSoffice(EnvDetect.FindRoot());
@@ -198,6 +204,9 @@ namespace OfficeAgent.Host
         static bool IsMutatingTool(string name)
         {
             if (name == null) return false;
+            // 技能工具一律视为写型：技能可能产出文件/写工作表，重放有副作用，
+            // 无法从工具名可靠区分读写（同一技能的不同 action 语义不同），故保守拦截。
+            if (name.StartsWith(SkillToolBridge.Prefix, StringComparison.Ordinal)) return true;
             // 与 AgentTools 的白名单一一对应；新增工具时同步这里，否则默认按"读型"放行（更安全）
             return name == "create_spreadsheet" || name == "create_presentation"
                 || name == "convert_document" || name == "download_file"

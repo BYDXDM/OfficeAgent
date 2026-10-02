@@ -6,6 +6,8 @@
   "runtime": "builtin",
   "entry": "recon",
   "scenarios": "表格核对,对账,勾稽,流水核对",
+  "actions": "recon|核对两份表（银行流水与日记账），输出匹配与差异明细",
+  "actionParams": "recon:inputs:file[]:required:两份待核对的 xlsx/csv 绝对路径",
   "depsTools": "libreoffice?",
   "network": false,
   "officeCom": false,

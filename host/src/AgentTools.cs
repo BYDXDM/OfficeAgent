@@ -81,6 +81,16 @@ namespace OfficeAgent.Host
             return s;
         }
 
+        // 技能工具 schema（规划层第一期）：把技能注册表投影成模型可见的工具。
+        // 返回**不含**外层 [] 的片段；无技能时返回空串（调用方不得多插逗号）。
+        // 单独成方法而不是并进 SchemasJson：SchemasJson 有多处调用者，
+        // 让"是否附带技能"成为显式选择，避免自检/降级路径意外拿到一堆技能工具。
+        public static string SkillSchemasJson(string root)
+        {
+            try { return SkillToolBridge.BuildSchemas(root); }
+            catch { return ""; }   // 投影失败绝不能连累基础工具可用性
+        }
+
         // 分发执行。返回结果文本；ok=false 表示工具执行失败（文本里带原因）。
         // products：非 null 时收集本回合产出的文件路径（会话附件卡片用）
         public static string Dispatch(string name, string argsJson, AppConfig cfg, ConvertEngine conv, List<string> products, out bool ok)
@@ -111,6 +121,19 @@ namespace OfficeAgent.Host
                         return r4; }
                     case "repair_environment": return RepairEnvironment();
                     default:
+                        // 技能工具（skill_<id>_<action>）：投影自技能注册表，见 SkillToolBridge。
+                        // 参数只进 request.json（文件），命令行保持编译期字面量。
+                        if (name != null && name.StartsWith(SkillToolBridge.Prefix, StringComparison.Ordinal))
+                        {
+                            string root = EnvDetect.FindRoot();
+                            SkillActionSpec sp = SkillToolBridge.Resolve(root, name);
+                            if (sp == null)
+                            {
+                                ok = false;
+                                return "未知技能工具: " + name + "。请只用当前声明的工具。";
+                            }
+                            return SkillToolBridge.Invoke(root, sp, a, products, out ok);
+                        }
                         ok = false;
                         return "未知工具: " + name;
                 }

@@ -6,6 +6,8 @@
   "runtime": "python38",
   "entry": "main.py",
   "scenarios": "word,文档,报告,说明书,合同,通知,docx",
+  "actions": "report|把结构化内容写成 docx 报告，支持标题、段落、项目符号、编号列表、表格、键值表、分页",
+  "actionParams": "report:out:string:required:输出 docx 绝对路径;report:title:string:optional:文档标题;report:blocks:string:optional:内容块 JSON 数组文本;report:text:string:optional:纯文本正文，按空行分段;report:csv:string:optional:CSV 文本，作为一张表插入",
   "depsTools": "",
   "network": false,
   "officeCom": false,

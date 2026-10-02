@@ -6,6 +6,8 @@
   "runtime": "python38",
   "entry": "main.py",
   "scenarios": "统计,行列,多少行",
+  "actions": "stat|统计表格的行列数与列概要",
+  "actionParams": "stat:inputs:file[]:required:要统计的 xlsx/csv 绝对路径",
   "depsTools": "",
   "network": false,
   "officeCom": false,

@@ -800,13 +800,24 @@ namespace OfficeAgent.Host
             string a = args[i];
             if (a == "--yes" || a == "--confirm") confirmed = true;
             else if (a == "--request" && i + 1 < args.Length) { requestExtra = args[i + 1]; i++; }
+            // --request-file：从文件读参数 JSON。
+            // 为什么需要它：命令行传复杂 JSON（含引号/中文/嵌套）时，shell 的引号转义极不可靠 ——
+            // 实测 PowerShell 会把 \" 吃掉导致 JSON 断裂。技能参数一旦有嵌套结构（如 blocks 数组），
+            // --request 基本不可用。文件传参不受 shell 影响，是唯一可靠的方式。
+            else if (a == "--request-file" && i + 1 < args.Length)
+            {
+                string rf = args[i + 1]; i++;
+                try { requestExtra = System.IO.File.ReadAllText(rf, Encoding.UTF8); }
+                catch (Exception ex) { Console.WriteLine("读取 --request-file 失败: " + ex.Message); return 3; }
+            }
             else if (skillId == null) skillId = a;
             else if (System.IO.File.Exists(a)) inputs.Add(System.IO.Path.GetFullPath(a));
         }
         if (skillId == null || inputs.Count == 0)
         {
-            Console.WriteLine("用法: OfficeAgent.exe /skillrun <skillId> <输入文件...> --yes [--request JSON]");
+            Console.WriteLine("用法: OfficeAgent.exe /skillrun <skillId> <输入文件...> --yes [--request JSON | --request-file <json文件>]");
             Console.WriteLine("      --yes = 显式确认执行（不带则只显示计划，不执行任何技能代码）");
+            Console.WriteLine("      参数含嵌套结构时请用 --request-file（命令行转义不可靠）");
             return 3;
         }
 
@@ -838,7 +849,19 @@ namespace OfficeAgent.Host
             req.Append("\"").Append(MiniJson.Esc(inputs[i])).Append("\"");
         }
         req.Append("]");
-        if (requestExtra != null && requestExtra.Length > 0) req.Append(",").Append(requestExtra.Trim('{', '}'));
+        if (requestExtra != null && requestExtra.Length > 0)
+        {
+            // 把附加参数并入 request 顶层。
+            // 注意不能简单 Trim('{','}')：多行缩进的 JSON（如 --request-file 读进来的）
+            // 末尾花括号独占一行，Trim 只去首尾字符会留下残缺的 "}\n"，导致解析报
+            // "Extra data"。这里改为：能找到最外层 {} 就去掉它们并 Trim 空白；
+            // 若内容不是对象形态（无大括号），则原样并入（兼容历史上直接传 "k":"v" 的用法）。
+            string extra = requestExtra.Trim();
+            int lb = extra.IndexOf('{');
+            int rb = extra.LastIndexOf('}');
+            if (lb >= 0 && rb > lb) extra = extra.Substring(lb + 1, rb - lb - 1).Trim();
+            if (extra.Length > 0) req.Append(",").Append(extra);
+        }
         req.Append("}");
 
         // 审计：确认 → 开始 → 结束（与 GUI 的 plan_created/confirmation/action_* 同口径）

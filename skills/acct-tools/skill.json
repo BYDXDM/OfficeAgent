@@ -1,0 +1,13 @@
+{
+  "id": "acct-tools",
+  "name": "会计工具箱",
+  "version": "1.0.0",
+  "host": "1.0.0",
+  "runtime": "python38",
+  "entry": "main.py",
+  "scenarios": "试算平衡,科目余额,账龄,应收,应付,折旧,会计,记账",
+  "depsTools": "",
+  "network": false,
+  "officeCom": false,
+  "signature": ""
+}

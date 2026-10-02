@@ -509,7 +509,11 @@ namespace OfficeAgent.Host
             }
             if (slides.Count == 0) return "没有可用的幻灯片内容";
             string root = EnvDetect.FindRoot();
-            string template = Path.Combine(Path.Combine(root, "skills"), Path.Combine("make-ppt", "template.pptx"));
+            // 模板目录：优先 templates\make-ppt\（新位置，与 skills\ 区分开——它只是模板，
+            // 不是可执行技能）；回退 skills\make-ppt\ 以兼容升级前的旧安装。
+            string template = Path.Combine(Path.Combine(root, "templates"), Path.Combine("make-ppt", "template.pptx"));
+            if (!File.Exists(template))
+                template = Path.Combine(Path.Combine(root, "skills"), Path.Combine("make-ppt", "template.pptx"));
             string saveErr = PptWriter.Save(template, p, slides);
             if (saveErr != null) return "生成失败: " + saveErr;
             ok = true;

@@ -1,0 +1,13 @@
+{
+  "id": "xlsx-ops",
+  "name": "Excel 高级操作",
+  "version": "1.0.0",
+  "host": "1.0.0",
+  "runtime": "python38",
+  "entry": "main.py",
+  "scenarios": "工作表,多表,公式,合并单元格,单元格格式,列宽,冻结",
+  "depsTools": "",
+  "network": false,
+  "officeCom": false,
+  "signature": ""
+}

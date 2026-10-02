@@ -221,6 +221,126 @@ namespace OfficeAgent.Host
             return d + extra;
         }
 
+        // ---------- 失败换路 ----------
+
+        // 找出与失敗动作"语义相近"的替代动作（规划层第二期 · 失败换路）。
+        // 相似度 = 两个技能 skill.json 里 scenarios 场景词的重叠个数。
+        //
+        // ★ 跨技能候选优先于同技能其他动作。
+        //   初版给同技能动作固定 100 分以"优先推荐"，实测是个缺陷：技能动辄 6~10 个动作，
+        //   一个 10 动作的技能会把所有名额用同技能的兄弟动作占满，而真正能解决问题的
+        //   跨技能替代（如 acct-tools/bank-recon 失败后改用 bank-recon/recon）永远排不进来。
+        //   同技能动作语义其实很近（都是同一领域），但**能力往往重叠**，换过去多半还是失败；
+        //   跨技能替代才是"换条路"。故跨技能按重叠分排前，同技能动作只作为兜底补足名额。
+        // 返回最多 limit 条，按得分降序；无候选时返回空表（调用方据此不改写错误文本）。
+        public static List<SkillActionSpec> Alternatives(string root, string skillId, string action, int limit)
+        {
+            List<SkillActionSpec> result = new List<SkillActionSpec>();
+            if (limit <= 0) return result;
+            List<SkillActionSpec> all = Collect(root);
+
+            string[] want = ScenarioWords(root, skillId);
+            List<string> crossScored = new List<string>();   // 跨技能候选（按重叠分）
+            List<string> sameScored = new List<string>();    // 同技能兄弟动作（兜底）
+            foreach (SkillActionSpec sp in all)
+            {
+                if (sp.SkillId == skillId && sp.Action == action) continue;   // 排除自身
+                if (sp.SkillId == skillId) { sameScored.Add(sp.Action); continue; }
+                int score = 0;
+                string[] have = ScenarioWords(root, sp.SkillId);
+                foreach (string w in want)
+                {
+                    if (w.Length == 0) continue;
+                    foreach (string h in have)
+                    {
+                        if (h.Length == 0) continue;
+                        if (string.Equals(w, h, StringComparison.OrdinalIgnoreCase)) { score++; break; }
+                    }
+                }
+                if (score <= 0) continue;
+                // 分数字段补零到 4 位，保证字典序 = 数值序
+                crossScored.Add(score.ToString("D4") + "\u0001" + sp.SkillId + "\u0001" + sp.Action);
+            }
+            crossScored.Sort();
+            crossScored.Reverse();
+
+            List<string> ordered = new List<string>();
+            ordered.AddRange(crossScored);
+            // 跨技能候选不足时才用同技能兄弟动作补足
+            foreach (string a in sameScored)
+            {
+                if (ordered.Count >= limit) break;
+                ordered.Add("0000\u0001" + skillId + "\u0001" + a);
+            }
+
+            foreach (string line in ordered)
+            {
+                if (result.Count >= limit) break;
+                string[] parts = line.Split('\u0001');
+                if (parts.Length < 3) continue;
+                foreach (SkillActionSpec sp in all)
+                {
+                    if (sp.SkillId == parts[1] && sp.Action == parts[2]) { result.Add(sp); break; }
+                }
+            }
+            return result;
+        }
+
+        // 场景词缓存（技能 id → scenarios 词数组）：换路是失败路径才走，但同一回合可能多次触发
+        static Dictionary<string, string[]> scenarioCache = null;
+        static string scenarioCacheRoot = null;
+
+        static string[] ScenarioWords(string root, string skillId)
+        {
+            if (scenarioCache == null || scenarioCacheRoot != root)
+            {
+                scenarioCache = new Dictionary<string, string[]>();
+                scenarioCacheRoot = root;
+                foreach (SkillRegistryEntry e in SkillSystem.CachedScan(root))
+                {
+                    List<string> words = new List<string>();
+                    if (e.Scenarios != null)
+                    {
+                        foreach (string w in e.Scenarios.Split(','))
+                        {
+                            string t = w.Trim();
+                            if (t.Length > 0) words.Add(t);
+                        }
+                    }
+                    scenarioCache[e.Id] = words.ToArray();
+                }
+            }
+            string[] r;
+            if (scenarioCache.TryGetValue(skillId, out r)) return r;
+            return new string[0];
+        }
+
+        // 把失败结果改写成"带替代建议"的文本，供回灌给模型。
+        // 只在确实找到候选时才追加建议——没有候选就原样返回，不给模型无效信息。
+        public static string WithAlternatives(string root, string skillId, string action, string failureText, int limit)
+        {
+            List<SkillActionSpec> alts = Alternatives(root, skillId, action, limit);
+            if (alts.Count == 0) return failureText;
+            StringBuilder sb = new StringBuilder();
+            sb.Append(failureText);
+            sb.Append("\n可以改用以下替代工具重试：");
+            for (int i = 0; i < alts.Count; i++)
+            {
+                SkillActionSpec sp = alts[i];
+                sb.Append("\n  - ").Append(ToolName(sp.SkillId, sp.Action));
+                if (sp.Desc.Length > 0) sb.Append("（").Append(sp.Desc).Append("）");
+            }
+            sb.Append("\n若替代方案也不适用，请直接说明失败原因，不要反复重试同一个工具。");
+            return sb.ToString();
+        }
+
+        // 清空换路缓存（skill.json 变更时与动作缓存一起失效）
+        public static void InvalidateAlternatives()
+        {
+            scenarioCache = null;
+            scenarioCacheRoot = null;
+        }
+
         // ---------- 反查与执行 ----------
 
         // 工具名 → 动作规格。找不到返回 null

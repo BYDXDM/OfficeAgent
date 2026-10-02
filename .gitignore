@@ -15,6 +15,10 @@ payload/**/*.py
 .mimosa/
 **/.mimosa/
 logs/
+# Python bytecode: skills run as staged scripts, so importing one (e.g. from a
+# test harness) would otherwise drop __pycache__ directories into the repo.
+__pycache__/
+*.pyc
 tests/e2e/mock-server.log
 tests/e2e/sample.csv
 tests/e2e/sample_conv.xlsx

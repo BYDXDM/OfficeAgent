@@ -41,6 +41,7 @@ namespace OfficeAgent.Host
             bool auditTest = false;
             bool detectTest = false;
             bool bridgeTest = false;
+            bool planTest = false;
             string[] skillRunArgs = null;
             string[] agentTestArgs = null;
             string[] reconArgs = null;
@@ -62,6 +63,7 @@ namespace OfficeAgent.Host
                 else if (a == "/audittest") auditTest = true;
                 else if (a == "/detecttest") detectTest = true;
                 else if (a == "/bridgetest") bridgeTest = true;
+                else if (a == "/plantest") planTest = true;
                 else if (a == "/skillrun")
                 {
                     List<string> rest = new List<string>();
@@ -97,7 +99,7 @@ namespace OfficeAgent.Host
 
             // CLI 无头链同样落审计（设计方案 §7.3：每个动作可审计；GUI 的 app_start 在 MainForm）
             if (selftest || guardTest || maskTest || intentTest || suggestTest || skillTest || caretTest
-                || auditTest || detectTest || bridgeTest
+                || auditTest || detectTest || bridgeTest || planTest
                 || gridTestInput != null
                 || skillRunArgs != null || agentTestArgs != null || reconArgs != null || mergeArgs != null
                 || invoiceArgs != null || convertInput != null || renderInput != null
@@ -184,6 +186,14 @@ namespace OfficeAgent.Host
                 try { AllocConsole(); } catch { }
                 try { Console.OutputEncoding = Encoding.UTF8; } catch { }
                 return RunBridgeTest();
+            }
+
+            if (planTest)
+            {
+                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
+                try { AllocConsole(); } catch { }
+                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                return RunPlanTest();
             }
 
             if (skillRunArgs != null)
@@ -1263,6 +1273,232 @@ namespace OfficeAgent.Host
         Console.WriteLine(failed == 0 ? "ALL PASS" : (failed + " FAILED"));
         return failed == 0 ? 0 : 2;
     }
+
+    // 规划层第二期自测：OfficeAgent.exe /plantest
+    // 覆盖加权预算、产物登记、失败换路（计划显式化是 prompt 文本，不在此断言）。
+    static int RunPlanTest()
+    {
+        int failed = 0;
+
+        // ---------- 加权预算 ----------
+        HopBudget.State b = new HopBudget.State();
+        double c1 = HopBudget.Cost("list_directory", b);
+        double c2 = HopBudget.Cost("read_text_file", b);
+        bool ok = c1 == 0.5 && c2 == 0.5 && b.ReadCalls == 2;
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "读型半价（前 2 次各 " + c1 + "/" + c2 + "）");
+
+        double c3 = HopBudget.Cost("task_plan", b);
+        ok = c3 == 0.0;
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "计划工具免费（" + c3 + "）");
+
+        double c4 = HopBudget.Cost("skill_acct_tools_bonus", b);
+        double c5 = HopBudget.Cost("convert_document", b);
+        ok = c4 == 1.0 && c5 == 1.0;
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "技能/写型全价（" + c4 + "/" + c5 + "）");
+
+        // 读型超出 ReadCap 后转全价（防止靠疯狂列目录规避预算）
+        HopBudget.State b2 = new HopBudget.State();
+        double last = 0;
+        for (int i = 0; i < HopBudget.ReadCap + 1; i++) last = HopBudget.Cost("list_directory", b2);
+        ok = last == 1.0 && b2.ReadCalls == HopBudget.ReadCap + 1;
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "读型超额度转全价（第 " + b2.ReadCalls +
+            " 次 = " + last + "）");
+
+        // 纯读型连续调用应在等效上限处触发收尾
+        HopBudget.State b3 = new HopBudget.State();
+        int calls = 0;
+        while (!HopBudget.ShouldWrapUp(b3) && calls < 1000)
+        {
+            b3.Spent += HopBudget.Cost("read_text_file", b3);
+            calls++;
+        }
+        ok = calls > HopBudget.ReadCap && calls < 1000 && b3.Spent >= HopBudget.MaxEquivalent;
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "预算耗尽触发收尾（读型 " + calls +
+            " 次消耗 " + b3.Spent.ToString("0.#") + "）");
+
+        // 加权后混合任务能容纳的真实跳数必须多于旧固定上限 12，否则这次改动没有意义
+        HopBudget.State b4 = new HopBudget.State();
+        int mixed = 0;
+        while (!HopBudget.ShouldWrapUp(b4) && mixed < 1000)
+        {
+            b4.Spent += HopBudget.Cost(mixed % 2 == 0 ? "list_directory" : "skill_acct_tools_vat", b4);
+            mixed++;
+        }
+        ok = mixed > 12;
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "混合任务容量优于旧上限 12（可容纳 " +
+            mixed + " 跳）");
+
+        // ---------- 产物登记 ----------
+        ArtifactRegistry.Reset();
+        string tmpDir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "oa_plantest");
+        try
+        {
+            if (System.IO.Directory.Exists(tmpDir)) System.IO.Directory.Delete(tmpDir, true);
+            System.IO.Directory.CreateDirectory(tmpDir);
+            string f1 = System.IO.Path.Combine(tmpDir, "a.xlsx");
+            string f2 = System.IO.Path.Combine(tmpDir, "b.pdf");
+            System.IO.File.WriteAllText(f1, "x", new UTF8Encoding(false));
+            System.IO.File.WriteAllText(f2, "y", new UTF8Encoding(false));
+
+            string a1 = ArtifactRegistry.Add(f1);
+            string a2 = ArtifactRegistry.Add(f2);
+            string again = ArtifactRegistry.Add(f1);      // 重复登记应返回原别名
+            ok = a1 == "产物1" && a2 == "产物2" && again == "产物1" && ArtifactRegistry.Items.Count == 2;
+            if (!ok) failed++;
+            Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "产物登记与去重（" + a1 + "/" + a2 +
+                "/repeat=" + again + " count=" + ArtifactRegistry.Items.Count + "）");
+
+            string ghost = ArtifactRegistry.Add(System.IO.Path.Combine(tmpDir, "nope.xlsx"));
+            ok = ghost == "" && ArtifactRegistry.Items.Count == 2;
+            if (!ok) failed++;
+            Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "不存在的文件不登记（返回 '" + ghost + "'）");
+
+            string desc = ArtifactRegistry.Describe();
+            ok = desc.IndexOf(f1) >= 0 && desc.IndexOf(f2) >= 0 && desc.IndexOf("产物1") >= 0
+                && ArtifactRegistry.AllExist();
+            if (!ok) failed++;
+            Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "产物清单文本");
+
+            string ghostDesc = ArtifactRegistry.Describe();
+            ArtifactRegistry.Reset();
+            ok = ArtifactRegistry.Items.Count == 0 && ArtifactRegistry.Describe() == "";
+            if (!ok) failed++;
+            Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "回合隔离（Reset 后为空）");
+        }
+        finally { try { System.IO.Directory.Delete(tmpDir, true); } catch { } }
+
+        // ---------- 失败换路 ----------
+        string root = OfficeAgent.Core.EnvDetect.FindRoot();
+        SkillToolBridge.InvalidateCache();
+        SkillToolBridge.InvalidateAlternatives();
+
+        List<SkillActionSpec> alts = SkillToolBridge.Alternatives(root, "acct-tools", "bank-recon", 3);
+        bool foundRecon = false;
+        foreach (SkillActionSpec sp in alts)
+        {
+            if (sp.SkillId == "bank-recon" && sp.Action == "recon") foundRecon = true;
+        }
+        ok = alts.Count > 0 && foundRecon;
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "跨技能换路（" + alts.Count +
+            " 个候选，含 bank-recon/recon=" + foundRecon + "）");
+
+        // 跨技能替代优先于同技能兄弟动作（回归：初版给同技能固定 100 分，
+        // 一个 10 动作的技能会把名额占满，真正有用的跨技能替代永远排不进来）
+        List<SkillActionSpec> sameSkill = SkillToolBridge.Alternatives(root, "acct-tools", "vat", 3);
+        ok = sameSkill.Count > 0 && sameSkill[0].SkillId == "bank-recon";
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "跨技能候选排在同技能之前（首个=" +
+            (sameSkill.Count > 0 ? sameSkill[0].SkillId + "/" + sameSkill[0].Action : "无") + "）");
+
+        // 名额有余时，同技能兄弟动作作为兜底补足
+        List<SkillActionSpec> deep = SkillToolBridge.Alternatives(root, "acct-tools", "vat", 4);
+        bool hasSame = false;
+        foreach (SkillActionSpec sp in deep) { if (sp.SkillId == "acct-tools") hasSame = true; }
+        ok = hasSame && deep.Count > 1;
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "同技能动作作兜底补足（候选 " + deep.Count + " 个）");
+
+        string rewritten = SkillToolBridge.WithAlternatives(root, "acct-tools", "bank-recon", "执行失败：缺少依赖", 2);
+        ok = rewritten.IndexOf("执行失败：缺少依赖") >= 0 && rewritten.IndexOf("skill_") >= 0
+            && rewritten.IndexOf("替代") >= 0;
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "失败文本携带替代建议");
+
+        string none = SkillToolBridge.WithAlternatives(root, "no-such-skill", "no-such-action", "失败", 2);
+        ok = none == "失败";
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "无候选时不改写（'" + none + "'）");
+
+        // ---------- acct-tools 列歧义回归（实测踩到的三个 bug） ----------
+        // 造一张同时含期初/本期/期末借贷六列的科目余额表：旧实现按"第一个包含命中"取列，
+        // 会读到期初列，导致金额与方向全错。
+        string tbDir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "oa_plantest_tb");
+        try
+        {
+            if (System.IO.Directory.Exists(tbDir)) System.IO.Directory.Delete(tbDir, true);
+            System.IO.Directory.CreateDirectory(tbDir);
+            string tbFile = System.IO.Path.Combine(tbDir, "科目余额表.csv");
+            // 期初 540000/540000，本期 275000/275000，期末 650000/650000 三处均平
+            string[] lines = new string[] {
+                "科目代码,科目名称,期初借方,期初贷方,本期借方,本期贷方,期末借方,期末贷方",
+                "1001,库存现金,35000,0,20000,0,55000,0",
+                "1002,银行存款,300000,0,150000,80000,370000,0",
+                "1122,应收账款,120000,0,60000,40000,140000,0",
+                "1405,库存商品,85000,0,25000,25000,85000,0",
+                "2202,应付账款,0,40000,0,70000,0,110000",
+                "2211,应付职工薪酬,0,30000,0,5000,0,35000",
+                "4001,实收资本,0,470000,0,0,0,470000",
+                "4103,本年利润,0,0,0,0,0,35000",
+                "6001,主营业务收入,0,0,0,200000,0,0",
+                "6401,主营业务成本,0,0,120000,0,0,0",
+                "6602,管理费用,0,0,45000,0,0,0",
+            };
+            System.IO.File.WriteAllText(tbFile, string.Join("\n", lines) + "\n", new UTF8Encoding(false));
+
+            // 试算平衡必须读【期末】列：650000/650000，而不是期初的 540000
+            bool tbOk = false;
+            string tbMsg = AgentTools.Dispatch("skill_acct_tools_trial_balance",
+                "{\"inputs\":\"" + tbFile.Replace("\\", "\\\\") + "\"}", null, new ConvertEngine(), null, out tbOk);
+            ok = tbOk && tbMsg.IndexOf("650000") >= 0 && tbMsg.IndexOf("540000") < 0;
+            if (!ok) failed++;
+            Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "试算平衡读期末列而非期初（" +
+                tbMsg.Split('\n')[0] + "）");
+
+            // 财务报表：必须能处理借贷分列表，且资产 = 负债+权益（三个 bug 的综合回归）。
+            // 注意：AgentTools.Dispatch 返回的是技能 message 文本（data 段不外露），
+            // 故这里断言 message 里的摘要与实际数字。技能自己的配平自检会写进 message。
+            bool fsOk = false;
+            string fsMsg = AgentTools.Dispatch("skill_acct_tools_statements",
+                "{\"inputs\":\"" + tbFile.Replace("\\", "\\\\") + "\"}", null, new ConvertEngine(), null, out fsOk);
+            bool selfClaimsBalanced = fsMsg.IndexOf("资产 = 负债+权益") >= 0;
+            bool admitsUnbalanced = fsMsg.IndexOf("不平") >= 0 && fsMsg.IndexOf("✗") >= 0;
+            ok = fsOk && selfClaimsBalanced && !admitsUnbalanced
+                && fsMsg.IndexOf("650000") >= 0 && fsMsg.IndexOf("200000") >= 0
+                && fsMsg.IndexOf("35000") >= 0;
+            if (!ok) failed++;
+            Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "财务报表借贷分列与配平（自检平衡=" +
+                selfClaimsBalanced + " 自报不平=" + admitsUnbalanced + "）");
+
+            // 技能返回的 data JSON 里 balanced 必须为 true（Dispatch 不外露 data，故直接调一次 SkillRunner）
+            SkillRunResult fsr = SkillRunner.Run(root, System.IO.Path.Combine(
+                System.IO.Path.Combine(root, "skills"), "acct-tools"),
+                "{\"task\":\"acct-tools\",\"action\":\"statements\",\"inputs\":[\"" +
+                MiniJson.Esc(tbFile) + "\"]}", 120);
+            string rawOut = fsr.DataJson == null ? "" : fsr.DataJson;
+            bool dataBalanced = rawOut.IndexOf("\"balanced\":true") >= 0
+                || rawOut.IndexOf("\"balanced\": true") >= 0;
+            ok = fsr.Ok && dataBalanced && rawOut.IndexOf("505000") >= 0;
+            if (!ok) failed++;
+            Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "data.balanced=true 且权益 505000（" +
+                (rawOut.Length > 160 ? rawOut.Substring(0, 160) : rawOut) + "）");
+
+            // ★ 关键回归：负债/权益不得为负（旧实现把贷方科目当借方，全变负数）
+            bool noNegative = rawOut.IndexOf("-110000") < 0 && rawOut.IndexOf("-35000") < 0
+                && rawOut.IndexOf("-470000") < 0 && fsMsg.IndexOf("-110000") < 0;
+            if (!noNegative) failed++;
+            Console.WriteLine((noNegative ? "[OK]  " : "[FAIL] ") + "负债权益符号为正（无负数漏出）");
+
+            // ★ 净利不得重复计入权益：表内已有「本年利润」35000 时不再叠加本期净利，
+            //   故权益合计 = 实收资本 470000 + 本年利润 35000 = 505000。
+            //   （若不修，会变成 470000+35000+35000 = 540000 而虚增、报表自报不平）
+            bool noDouble = rawOut.IndexOf("505000") >= 0 && rawOut.IndexOf("540000") < 0;
+            if (!noDouble) failed++;
+            Console.WriteLine((noDouble ? "[OK]  " : "[FAIL] ") + "净利不重复计入权益（权益合计 505000）");
+        }
+        finally { try { System.IO.Directory.Delete(tbDir, true); } catch { } }
+
+        Console.WriteLine(failed == 0 ? "ALL PASS" : (failed + " FAILED"));
+        return failed == 0 ? 0 : 2;
+    }
+
+    // 技能→工具投影自测（规划层第一期）：OfficeAgent.exe /bridgetest
     // 验证 skill.json 的 actions/actionParams 能被正确投影成 function-calling schema，
     // 并且模型给出的工具名能反查回技能、参数能正确落成 request.json。
     static int RunBridgeTest()

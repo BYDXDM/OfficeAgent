@@ -25,6 +25,13 @@ namespace OfficeAgent.Host
         const int MaxHops = 12;   // 常规工具轮次上限；到达后还有一次"收尾跳"强制汇总
                                   // (10→12：真实任务里"列目录→确认→转换→建表"常需 6~9 跳，
                                   //  留出余量避免第 10 跳就收尾。过量试探由重复调用检测兜底。)
+                                  // ★ 第二期起这不再是"主"判据：加权预算（HopBudget）会先于它触收尾。
+                                  //   保留它是**硬兜底**——万一预算计数出 bug（成本算成 0），
+                                  //   这里仍能保证循环终止。
+
+        // 真实跳数的硬上限：加权预算按等效值算，读型半价意味着实际跳数可能超过 MaxHops。
+        // 该值 = 等效上限 / 最小单位成本，向上取整后留余量，纯粹防死循环。
+        const int HardHopLimit = 48;
 
         // 工具结果回传截断上限：模型只看到前 N 字符，尾部提示可用工具读更多。
         // 目的：单次 read_text_file/list_directory 的大结果会把上下文吃满，
@@ -71,15 +78,22 @@ namespace OfficeAgent.Host
                 // 循环上限是 MaxHops+1：第 MaxHops+1 轮是收尾跳（强制模型汇总，不再执行工具）
                 // 重复调用台账：记录"工具名+参数"出现次数，用于打断无效试探循环
                 Dictionary<string, int> callCount = new Dictionary<string, int>();
-                for (int hop = 0; hop < MaxHops + 1; hop++)
+                // 回合级产物登记（第二期）：每次工具产出文件后登记，并在结果里附上清单，
+                // 让后续步骤能引用"产物N"而不是从上下文里抄路径。
+                ArtifactRegistry.Reset();
+                // 加权预算（第二期）：读型半价、技能/写型全价、task_plan 免费。
+                // 达到等效上限即进入收尾跳；HardHopLimit 是防死循环的硬兜底。
+                HopBudget.State budget = new HopBudget.State();
+                for (int hop = 0; hop < HardHopLimit; hop++)
                 {
-                    bool wrapUp = hop == MaxHops;
-                    if (wrapUp)
+                    bool wrapUp = HopBudget.ShouldWrapUp(budget) || hop >= MaxHops;
+                    if (wrapUp && hop > 0)
                     {
                         // 收尾跳：以用户身份要求汇总。tools 保持声明（剥掉会因消息里已有
                         // tool 结果被服务端拒绝），靠指令约束模型不再调工具。
                         request.Add(new LlmTurn("user",
-                            "工具调用轮次已达上限。请基于以上工具的执行结果，直接给出最终答复：" +
+                            "工具调用轮次已达上限（" + HopBudget.Describe(budget) + "）。" +
+                            "请基于以上工具的执行结果，直接给出最终答复：" +
                             "任务完成了什么、产物保存在哪里、还有哪些没完成及原因。不要调用任何工具。"));
                     }
                     r.Hops = hop + 1;
@@ -140,6 +154,9 @@ namespace OfficeAgent.Host
                         // 跳过不能算失败——否则日志渲染成 ✗、审计写 ok=False，语义就错了。
                         bool skipped = false;
                         string result;
+                        // 加权计费：读到工具名就记账（跳过/失败也计——它们同样消耗了一次模型轮次，
+                        // 而且失败的写型调用往往还要重试，把它计费能更早触收尾，避免反复空转）
+                        budget.Spent += HopBudget.Cost(call[1], budget);
                         if (call[1] == "task_plan")
                         {
                             // 计划栏插件：有 UI 回调走界面；无界面（CLI）记审计并给通用应答
@@ -174,6 +191,18 @@ namespace OfficeAgent.Host
                             else
                             {
                                 result = AgentTools.Dispatch(call[1], call[2], config, conv, products, out ok);
+                                // 失败换路（第二期）：技能调用失败时，按 scenarios 场景词重叠
+                                // 找出语义相近的替代工具一并回灌，给模型一次换路机会。
+                                // 只对技能做——内置通用工具的失败多半是路径/权限问题，换个工具没用。
+                                if (!ok && call[1] != null && call[1].StartsWith(SkillToolBridge.Prefix, StringComparison.Ordinal))
+                                {
+                                    SkillActionSpec failedSpec = SkillToolBridge.Resolve(EnvDetect.FindRoot(), call[1]);
+                                    if (failedSpec != null)
+                                    {
+                                        result = SkillToolBridge.WithAlternatives(
+                                            EnvDetect.FindRoot(), failedSpec.SkillId, failedSpec.Action, result, 2);
+                                    }
+                                }
                                 result = TruncToolResult(result);
                                 // 读型工具重放时明确告知：这次是重新读取，结果可能与上面不同
                                 if (seenTimes >= 1)
@@ -181,6 +210,19 @@ namespace OfficeAgent.Host
                                     result = "（注意：这是对同一目标的重新读取，内容可能与上面那次不同）\n" + result;
                                 }
                             }
+                        }
+                        // 产物登记：本跳若产出新文件（AgentTools 把路径追加进 products），
+                        // 登记成别名并把清单附在结果后面，供后续步骤引用。
+                        if (products.Count > 0)
+                        {
+                            string newest = products[products.Count - 1];
+                            string alias = ArtifactRegistry.Add(newest);
+                            if (alias.Length > 0)
+                            {
+                                result += "\n（本文件已登记为 " + alias + "）";
+                            }
+                            string listing = ArtifactRegistry.Describe();
+                            if (listing.Length > 0) result += "\n" + listing;
                         }
                         request.Add(new LlmTurn("tool@" + call[0], result));
                         if (log.Length > 0) log.Append("\n");

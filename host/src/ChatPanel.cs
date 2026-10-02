@@ -1514,6 +1514,43 @@ namespace OfficeAgent.Host
                 tc, TextFormatFlags.WordBreak | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
         }
 
+        // 技能提示段（规划层第一期/第二期）：把当前注册的技能概要写进系统提示。
+        // 为什么不在提示里逐条列出全部 19 个动作：那会让每次请求都背上冗长的固定文本，
+        // 而工具 schema 本身已经带了每个动作的完整描述（模型本来就看得到）。
+        // 这里只需要让模型知道「有技能这一类工具、什么时候该用」，具体选哪个由 schema 决定。
+        // 动态生成而非硬编码：用户装了新技能后提示自动跟上。
+        string SkillHint()
+        {
+            try
+            {
+                string root = OfficeAgent.Core.EnvDetect.FindRoot();
+                List<SkillActionSpec> all = SkillToolBridge.Collect(root);
+                if (all == null || all.Count == 0) return "";
+                // 按技能聚合，保持注册顺序
+                List<string> ids = new List<string>();
+                Dictionary<string, int> counts = new Dictionary<string, int>();
+                foreach (SkillActionSpec sp in all)
+                {
+                    if (!counts.ContainsKey(sp.SkillId)) { counts[sp.SkillId] = 0; ids.Add(sp.SkillId); }
+                    counts[sp.SkillId] = counts[sp.SkillId] + 1;
+                }
+                StringBuilder sb = new StringBuilder();
+                sb.Append("另外你还有一组专门的办公/会计技能工具（工具名以 skill_ 开头），共 ")
+                  .Append(ids.Count).Append(" 项技能、").Append(all.Count).Append(" 个动作：");
+                for (int i = 0; i < ids.Count; i++)
+                {
+                    if (i > 0) sb.Append("、");
+                    sb.Append(ids[i]).Append("(").Append(counts[ids[i]]).Append("个动作)");
+                }
+                sb.Append("。涉及会计计算（试算平衡、账龄、折旧、个税、增值税、报表、合并、凭证）、")
+                  .Append("Excel 高级操作（看结构、加表、写单元格、写公式、冻结、调列宽）、")
+                  .Append("生成 Word 报告时，**优先用这些技能工具**——它们比你自己拼 CSV 文本更准确、更专业。")
+                  .Append("技能名称与参数说明见工具定义，按需直接调用即可。");
+                return sb.ToString();
+            }
+            catch { return ""; }
+        }
+
         string BuildSystemPrompt()
         {
             // 记忆段放在最前（优先进入模型上下文；同时便于 E2E 在请求体前段断言）
@@ -1529,6 +1566,7 @@ namespace OfficeAgent.Host
             string basePrompt = "你是 OfficeAgent，一款运行在 Windows 7 上的办公 AI 助手（agent），面向会计与办公人员。" +
                 "你具备一组可以直接调用执行的工具：读取本地文本文件和 PDF、列出目录、联网下载文件、文档格式转换（pdf/csv/xlsx）、" +
                 "创建 Excel 表格、创建 PPT 演示文稿、弹出环境修复器安装系统组件、维护面向用户的任务计划清单。" +
+                SkillHint() +
                 "规则：凡是需要上述能力的请求，一律直接发起工具调用去完成；绝不输出代码示例、调用语法或操作步骤说明，" +
                 "也不让用户自己去处理。缺信息时先自己用工具查证（列目录/读文件），查不到再向用户追问，一次只问最关键的一项。" +
                 ws +
@@ -1540,6 +1578,14 @@ namespace OfficeAgent.Host
                 "④ 参数不确定时用一次工具查证后再动手，不要靠连续试错碰运气；" +
                 "⑤ 信息足够时立即给出最终答复，不要为了「再确认一下」多跑工具。" +
                 "三步以上的多步骤任务，先创建任务计划，随着执行逐项更新，全部完成后再标记完成。" +
+                // 多步串联（规划层第二期）：上一版只说了"要建计划"，没说"怎么把多步串起来"。
+                // 实测模型会把每步当成独立任务，做完一步就停下来问用户，而不是自己接着做下一步。
+                "多步骤任务要**连续执行到底**：不要每完成一步就停下来问我，应该根据上一步的结果直接进行下一步，" +
+                "直到整个任务完成或确实缺关键信息时才回复。" +
+                "上一步产出的文件路径会随工具结果返回（并标注为「产物N」），后续步骤直接使用该完整路径，" +
+                "不要凭猜测拼路径，也不要重新读取同一份文件来确认它是否生成。" +
+                "如果某个工具调用失败，先看错误信息里的提示：若有推荐的替代工具就换一个重试，" +
+                "若没有就直接说明失败原因，不要用完全相同的参数反复重试。" +
                 "系统还内置：文件预览（xlsx/csv/pdf）、批量转换队列、两表核对、报表汇总、发票提取、长期记忆（记住/记忆/忘记）。" +
                 "用简体中文回答；回答使用纯文本，不要用 markdown 语法（不要 ** 星号加粗、# 标题、表格线）；" +
                 "回答时明确说出产物保存在哪个路径，方便用户直接打开；" +

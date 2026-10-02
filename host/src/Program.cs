@@ -1238,11 +1238,31 @@ namespace OfficeAgent.Host
 
         Console.WriteLine("（产物保留在 " + genDir + " 供人工抽查，下次运行时清理）");
 
+        // 11. 思考段剥离（回归：glm-4.5-air 把思考写进 content，以 </think> 收尾后重写答复）
+        bool mtChanged;
+        string thinkIn = "草稿：张三应发 8,800 元……</think>\n正式答复：张三应发 8,500 元。";
+        string thinkOut = ModelText.Clean(thinkIn, out mtChanged);
+        bool thinkOk = mtChanged && thinkOut.IndexOf("</think>") < 0
+            && thinkOut.IndexOf("草稿") < 0 && thinkOut.IndexOf("8,500") >= 0
+            && thinkOut.StartsWith("正式答复");
+        // 取最后一个闭合标签：草稿1</think>改稿2</think>答案3 → 只留答案3
+        bool mt2; string multi = ModelText.Clean("draft1</think>draft2</think>final", out mt2);
+        thinkOk = thinkOk && mt2 && multi == "final";
+        // 无标签原样返回（绝大多数模型走这条，行为零变化）
+        bool mt3; string plain = ModelText.Clean("正常答复，没有标签。", out mt3);
+        thinkOk = thinkOk && !mt3 && plain == "正常答复，没有标签。";
+        // 只有开标签（被截断）→ 明确提示而不是把半截思考当答案
+        bool mt4; string trunc = ModelText.Clean("<think>还没想完", out mt4);
+        thinkOk = thinkOk && mt4 && trunc.IndexOf("截断") >= 0 && trunc.IndexOf("还没想完") < 0;
+        // 只有闭合标签、其后为空 → 提示未给出答复
+        bool mt5; string onlyClose = ModelText.Clean("思考</think>", out mt5);
+        thinkOk = thinkOk && mt5 && onlyClose.IndexOf("没有给出正式答复") >= 0;
+        if (!thinkOk) failed++;
+        Console.WriteLine((thinkOk ? "[OK]  " : "[FAIL] ") + "思考段剥离（5 个用例）");
+
         Console.WriteLine(failed == 0 ? "ALL PASS" : (failed + " FAILED"));
         return failed == 0 ? 0 : 2;
     }
-
-    // 技能→工具投影自测（规划层第一期）：OfficeAgent.exe /bridgetest
     // 验证 skill.json 的 actions/actionParams 能被正确投影成 function-calling schema，
     // 并且模型给出的工具名能反查回技能、参数能正确落成 request.json。
     static int RunBridgeTest()

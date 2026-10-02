@@ -19,6 +19,7 @@ namespace OfficeAgent.Host
             public string FirstError = "";   // 降级前的原始错误（诊断用）
             public List<string> Products = new List<string>();   // 本回合产出的文件（附件卡片）
             public int Hops;                 // 实际轮数
+            public bool ThinkingStripped;    // 最终答复里剥掉过模型的思考段（诊断用）
         }
 
         const int MaxHops = 12;   // 常规工具轮次上限；到达后还有一次"收尾跳"强制汇总
@@ -111,6 +112,11 @@ namespace OfficeAgent.Host
                             r.FinalText = (sbody != null && sbody.Length > 0) ? sbody : reply.Content;
                         }
                         else r.FinalText = reply.Content;
+                        // 剥掉模型写在 content 里的思考段（部分端点如 glm-4.5-air 会以
+                        // </think> 收尾并重写正式答复；原样展示会先给用户一段自相矛盾的草稿）。
+                        bool stripped;
+                        r.FinalText = ModelText.Clean(r.FinalText, out stripped);
+                        if (stripped) r.ThinkingStripped = true;
                         r.Products = products;
                         return r;
                     }

@@ -9,8 +9,24 @@ $script:fail = 0
 $script:skips = 0
 $lines = New-Object System.Collections.ArrayList
 
-function Note($ok, $step, $detail) {
-  # NB: compare as strings -- ($true -eq "SKIP") is TRUE in PowerShell because the
+# Write a file as BOM-less UTF-8, in a way that works on PowerShell 2.0 (Win7).
+#
+# Why not [System.Text.Encoding]::UTF8: that overload emits a UTF-8 BOM, and the
+# request.json we hand to the python sidecar is parsed with json.load(encoding='utf-8'),
+# which HARD-FAILS on a BOM ("Unexpected UTF-8 BOM ... decode using utf-8-sig").
+# Verified on the dev box: BOM -> JSONDecodeError, no BOM -> loads fine.
+#
+# Why not New-Object System.Text.UTF8Encoding($false): passing constructor arguments
+# that way relies on PS2.0's overload resolution. It is *probably* fine, but this
+# script must not gamble on the target OS, so we avoid constructor overloads entirely:
+# Encoding.UTF8.GetBytes() uses the BOM-less UTF8 encoder for byte[] output
+# (the BOM only comes from the *string* writers), then WriteAllBytes writes it raw.
+function WriteUtf8NoBom($path, $text) {
+  $bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
+  [System.IO.File]::WriteAllBytes($path, $bytes)
+}
+
+function Note($ok, $step, $detail) {  # NB: compare as strings -- ($true -eq "SKIP") is TRUE in PowerShell because the
   # RHS string converts to bool; that would mark every PASS as SKIP.
   $s = "$ok"
   if ($s -eq "SKIP") {
@@ -171,7 +187,7 @@ if ((Test-Path $py) -and (Test-Path $host2)) {
 
   # 7.5 row-stat end-to-end (stdlib only): proves stage -> sidecar -> stdout JSON chain
   $csvIn = Join-Path $env:TEMP "oa-rows.csv"
-  [System.IO.File]::WriteAllText($csvIn, "col,amt`r`n a,1`r`n b,2", (New-Object System.Text.UTF8Encoding($false)))
+  WriteUtf8NoBom $csvIn "col,amt`r`n a,1`r`n b,2"
   $rsOut = Join-Path $env:TEMP "oa-rowstat.txt"
   $rc = Exec $host2 ("/skillrun row-stat `"" + $csvIn + "`" --yes") $rsOut
   $rsTxt = ""
@@ -186,7 +202,7 @@ if ((Test-Path $py) -and (Test-Path $host2)) {
   if (-not (Test-Path $csvConv)) { $csvConv = (Join-Path $env:TEMP "oa-rows_conv.xlsx") }
   if (Test-Path $csvConv) {
     $reqFile = Join-Path $env:TEMP "oa-xreq.json"
-    [System.IO.File]::WriteAllText($reqFile, '{"action":"inspect"}', (New-Object System.Text.UTF8Encoding($false)))
+    WriteUtf8NoBom $reqFile '{"action":"inspect"}'
     $xsOut = Join-Path $env:TEMP "oa-xlsxops.txt"
     $rc = Exec $host2 ("/skillrun xlsx-ops `"" + $csvConv + "`" --yes --request-file `"" + $reqFile + "`"") $xsOut
     $xsTxt = ""
@@ -203,16 +219,16 @@ if ((Test-Path $py) -and (Test-Path $host2)) {
   if (Test-Path $docOut) { Remove-Item $docOut -Force }
   $dreq = Join-Path $env:TEMP "oa-dreq.json"
   $djson = '{"out":"' + ($docOut -replace "\\", "\\") + '","title":"smoke","blocks":[{"type":"para","text":"ok"}]}'
-  [System.IO.File]::WriteAllText($dreq, $djson, (New-Object System.Text.UTF8Encoding($false)))
+  WriteUtf8NoBom $dreq $djson
   $drOut = Join-Path $env:TEMP "oa-docxrep.txt"
   $rc = Exec $host2 ("/skillrun docx-report `"" + $csvIn + "`" --yes --request-file `"" + $dreq + "`"") $drOut
   Note (Test-Path $docOut) "7.7 docx-report generates .docx (python-docx)" ("exists=" + (Test-Path $docOut))
 
   # 7.8 acct-tools: trial-balance must detect an unbalanced set
   $tbIn = Join-Path $env:TEMP "oa-tb.csv"
-  [System.IO.File]::WriteAllText($tbIn, "subj,debit,credit`r`na,100,0`r`nb,0,80", (New-Object System.Text.UTF8Encoding($false)))
+  WriteUtf8NoBom $tbIn "subj,debit,credit`r`na,100,0`r`nb,0,80"
   $tbReq = Join-Path $env:TEMP "oa-tbreq.json"
-  [System.IO.File]::WriteAllText($tbReq, '{"action":"trial-balance"}', (New-Object System.Text.UTF8Encoding($false)))
+  WriteUtf8NoBom $tbReq '{"action":"trial-balance"}'
   $tbOut = Join-Path $env:TEMP "oa-tb.txt"
   $rc = Exec $host2 ("/skillrun acct-tools `"" + $tbIn + "`" --yes --request-file `"" + $tbReq + "`"") $tbOut
   $tbTxt = ""

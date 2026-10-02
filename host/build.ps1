@@ -70,6 +70,7 @@ $sources += (Join-Path $root "src\PdfTextReader.cs")
   $sources += (Join-Path $root "..\core\src\JobObject.cs")
   $sources += (Join-Path $root "..\core\src\JobProbeRunner.cs")
   $sources += (Join-Path $root "..\core\src\EnvSafe.cs")
+  $sources += (Join-Path $root "..\core\src\BootGate.cs")
   $sources += (Join-Path $root "..\core\src\MiniZip.cs")
 
 $cscargs = @()

@@ -34,6 +34,7 @@ $sources += (Join-Path $root "src\Unzip.cs")
 $sources += (Join-Path $root "..\core\src\Detect.cs")
 $sources += (Join-Path $root "..\core\src\ProcRunner.cs")
 $sources += (Join-Path $root "..\core\src\EnvSafe.cs")
+$sources += (Join-Path $root "..\core\src\BootGate.cs")
 
 $cscargs = @()
 $cscargs += "/nologo"

@@ -81,18 +81,24 @@ namespace OfficeAgent.Boot
             }
 
             // 组件齐全 → 直接启动主程序，不再弹自检窗口（用户要求：第一次正常启动后跳过自检）。
-            // 有缺失项或启动失败才回到自检界面；/ui 可强制显示。
+            // 有缺失项时，也**只在缺失项集合发生变化时**才弹修复窗口一次：
+            // 环境固有的、不影响使用的缺失项（如非 Win7 上的 Win7 补丁、需管理员的 VC++）
+            // 不该每次启动都拦住用户——这正是"修复程序一直来唤醒"的根源。
+            // 详见 core\src\BootGate.cs。/ui 可强制显示。
             if (!forceUi)
             {
-                bool missingAny = false;
-                foreach (DetectItem it in items) { if (it.State == DetectState.Missing) { missingAny = true; break; } }
-                if (!missingAny)
+                bool shouldPrompt = BootGate.ShouldPrompt(items);
+                if (!shouldPrompt)
                 {
-                    Log.Line("组件齐全，直接启动主程序（加 /ui 可显示自检窗口）");
-                    bool usedLite;
-                    string launchErr = BootLaunch.LaunchHost(Root, out usedLite);
-                    if (launchErr == null) return 0;
-                    Log.Line(launchErr + "，转入自检界面");
+                    Log.Line("无需修复提示（组件齐全，或缺失项此前已提醒过），直接启动主程序");
+                    bool usedLite0;
+                    string launchErr0 = BootLaunch.LaunchHost(Root, out usedLite0);
+                    if (launchErr0 == null) return 0;
+                    Log.Line(launchErr0 + "，转入自检界面");
+                }
+                else
+                {
+                    Log.Line("发现新的缺失组件，显示修复窗口一次：" + BootGate.MissingNames(items));
                 }
             }
 

@@ -15,7 +15,12 @@ namespace OfficeAgent.Host
             if (!File.Exists(adminExe)) return "未找到修复器: " + adminExe;
             try
             {
-                string args = "/root:\"" + root + "\"";
+                // 必须带 /ui：引导器新增了"缺失项只提醒一次"闸门（core\src\BootGate.cs），
+                // 不带 /ui 时若缺失集合与上次相同，引导器会判定"无需提示"→ 直接尝试启动主程序
+                // 然后退出，用户看到的现象是"弹了 UAC 但什么都没出现"，还可能多开一个 host 实例。
+                // /ui 强制显示自检窗口，这正是"用户显式要求修复"应得的语义。
+                // /adminfix 让窗口打开后自动开始补全（本进程已是提权变体）。
+                string args = "/ui /adminfix /root:\"" + root + "\"";
                 System.Diagnostics.Process.Start(adminExe, args);
                 return null;
             }

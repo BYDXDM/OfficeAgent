@@ -11,6 +11,14 @@ payload/**/*.exe
 payload/**/*.zip
 payload/**/*.py
 
+# Self-test artifacts. acct-tools/vat has no output-path parameter, so it saves
+# 增值税计算.xlsx into the process working directory — running /bridgetest from the
+# repo root therefore drops it here. Ignore it rather than let every test run dirty
+# the working tree (the file is regenerated on each run and never a deliverable).
+增值税计算.xlsx
+试算平衡表.xlsx
+财务报表.xlsx
+
 # Local tool state, secrets, settings, and logs
 .mimosa/
 **/.mimosa/

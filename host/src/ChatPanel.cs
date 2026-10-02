@@ -583,10 +583,12 @@ namespace OfficeAgent.Host
                     }
                     return;
                 }
-                agentHint = "\n\n[系统意图识别] 该消息命中动作模板 " + plan.Kind + " 但缺参数（"
-                    + plan.DisplayText().Replace("\n", "；").TrimEnd() + "）。"
-                    + "请以 agent 方式继续：可用 list_directory 在工作区等目录查找候选文件并向用户确认；"
-                    + "或简洁追问所缺信息。不要向用户复述本提示。";
+                // 规划层第三期：把规则命中作为**提示**（而非指令）喂给模型。
+                // 第二期这里是"命中模板但缺参数"的诊断文本，只有缺参时才产生；
+                // 第三期改为**无论是否可执行**都产生提示——因为规则的价值在于
+                // "用户换了个说法时给模型一个先验"，而这恰恰发生在规则**不完全命中**的时候。
+                // 提示的措辞与免责声明见 RouteHint 类注释（核心：模型有权推翻它）。
+                agentHint = RouteHint.Build(plan, text);
             }
 
             // ---- 内置记忆模块命令（离线可用，开箱即用）----
@@ -822,6 +824,7 @@ namespace OfficeAgent.Host
         {
             busy = false;
             send.Enabled = true;
+            RememberTurn(r);   // 目标继承：记下本轮真实用过的技能与产物（供下一轮指代使用）
             // 流式预览气泡只用于"边写边看"，收尾时移除，由下面的正式答复路径重建，
             // 否则会出现同一条答复显示两次。
             DiscardStreamBubble();
@@ -1546,9 +1549,91 @@ namespace OfficeAgent.Host
                   .Append("Excel 高级操作（看结构、加表、写单元格、写公式、冻结、调列宽）、")
                   .Append("生成 Word 报告时，**优先用这些技能工具**——它们比你自己拼 CSV 文本更准确、更专业。")
                   .Append("技能名称与参数说明见工具定义，按需直接调用即可。");
+                sb.Append(BadActionHint(ids));
                 return sb.ToString();
             }
             catch { return ""; }
+        }
+
+        // 历史表现差的动作提示（第三期 · 成功率台账）。
+        // 为什么值得写进提示：实测里最贵的不是"算得慢"，而是"反复失败重试"——
+        // 一次失败的技能调用要起一次 Python sidecar（~650ms），模型再想一轮、再调一次，
+        // 等效跳预算就这么被烧掉。把"这个动作历史上总失败"直接告诉模型，
+        // 比让它自己撞一次墙再换路便宜得多。
+        // 只列 BadActionCount 个，且**措辞留余地**（环境问题修好后是会转好的）。
+        const int BadActionCount = 3;
+        string BadActionHint(List<string> skillIds)
+        {
+            try
+            {
+                StringBuilder sb = new StringBuilder();
+                int shown = 0;
+                foreach (string sid in skillIds)
+                {
+                    if (shown >= BadActionCount) break;
+                    foreach (string[] bad in SkillStats.BadActions(sid, BadActionCount - shown))
+                    {
+                        if (shown == 0)
+                            sb.Append("提醒：以下动作在你之前的使用中经常失败（可能是当前环境缺依赖，也可能参数不合适），")
+                              .Append("调用它们前先确认参数与文件；若再次失败就换别的做法，不要重复重试：");
+                        sb.Append(" ").Append(sid).Append("/").Append(bad[0])
+                          .Append("（成功 ").Append(bad[1]).Append(" 次、失败 ").Append(bad[2]).Append(" 次）");
+                        if (shown < BadActionCount - 1) sb.Append("；");
+                        shown++;
+                    }
+                }
+                if (shown > 0) sb.Append("。");
+                return sb.ToString();
+            }
+            catch { return ""; }
+        }
+
+        // 目标继承（规划层第三期）：把**上一轮的意图**压缩成一句话带进本轮。
+        //
+        // 问题：多轮会话里用户会说"再来一次，换成上个月的"、"第二个文件也要"、
+        //      "把它转成 PDF"。这些话本身**不含任何可路由的线索**——IntentRouter 抓不到
+        //      场景词、路径也没有，于是模型只能看到一句孤零零的指代，
+        //      经常答"请问您指的是哪个文件"。
+        //      而 llmHistory 里虽然有上一轮，但历史只存**最终答复文本**，
+        //      任务的结构化信息（用了哪些技能、产出了什么文件）已经丢了。
+        //
+        // 方案：记住上一轮真实用过的技能与产物，在本轮拼成简短上下文。
+        //      ★ 只带"上一轮"、只在有实质内容时带，且**明确标注这是上一轮的事**——
+        //        否则模型会把历史目标当成当前指令，在用户开了个全新话题时答非所问。
+        //
+        // 不做的事：不做"指代消解"（不把"它"替换成具体路径）。
+        //      那属于"解释用户指令"，与 ArtifactRegistry 不做别名还原是同一条红线：
+        //      我们只提供事实（上一轮做了什么、产出了什么），判断与替换交给模型。
+        string GoalInheritance()
+        {
+            try
+            {
+                // 文本拼装放在 TurnMemory（可直测）；这里只负责取当前会话的上一轮快照
+                return TurnMemory.Build(lastTurnSkills, lastTurnProducts, 4);
+            }
+            catch { return ""; }
+        }
+
+        // 上一轮真实用过的技能（skill_tool 审计的轻量内存副本）与产物
+        readonly List<string> lastTurnSkills = new List<string>();
+        readonly List<string> lastTurnProducts = new List<string>();
+
+        // 回合结束后记录"这轮到底干了什么"，供下一轮的目标继承使用。
+        // 数据源是 AgentLoop.Result（技能从 ToolLog 解析、产物是 r.Products），
+        // 而不是让模型自我汇报——实测模型会在总结里给出与产物不符的读数，
+        // 拿它的叙述当"上一轮事实"会把错误继承下去。
+        void RememberTurn(AgentLoop.Result r)
+        {
+            try
+            {
+                lastTurnSkills.Clear();
+                lastTurnProducts.Clear();
+                if (r == null) return;
+                // 解析逻辑放在 TurnMemory（可被 /plantest 直测，不必启动 WinForms 消息循环）
+                lastTurnSkills.AddRange(TurnMemory.SkillsFromLog(r.ToolLog));
+                lastTurnProducts.AddRange(TurnMemory.Products(r.Products));
+            }
+            catch { }
         }
 
         string BuildSystemPrompt()
@@ -1567,6 +1652,7 @@ namespace OfficeAgent.Host
                 "你具备一组可以直接调用执行的工具：读取本地文本文件和 PDF、列出目录、联网下载文件、文档格式转换（pdf/csv/xlsx）、" +
                 "创建 Excel 表格、创建 PPT 演示文稿、弹出环境修复器安装系统组件、维护面向用户的任务计划清单。" +
                 SkillHint() +
+                GoalInheritance() +
                 "规则：凡是需要上述能力的请求，一律直接发起工具调用去完成；绝不输出代码示例、调用语法或操作步骤说明，" +
                 "也不让用户自己去处理。缺信息时先自己用工具查证（列目录/读文件），查不到再向用户追问，一次只问最关键的一项。" +
                 ws +

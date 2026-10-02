@@ -258,20 +258,41 @@ namespace OfficeAgent.Host
                     }
                 }
                 if (score <= 0) continue;
-                // 分数字段补零到 4 位，保证字典序 = 数值序
-                crossScored.Add(score.ToString("D4") + "\u0001" + sp.SkillId + "\u0001" + sp.Action);
+                // 第三期：同分（场景词重叠数相同）时用历史成功率做二级排序。
+                // 成功率未知（样本不足）记为 5（中位），既不被偏爱也不被惩罚——
+                // **没数据不等于差**，否则新装技能会永远排不上队。
+                double rate = SkillStats.Rate(sp.SkillId, sp.Action);
+                int rank = rate < 0 ? 5 : (int)Math.Round(rate * 9);
+                // 三段补零：分数(4) + 成功率档(1)，保证字典序 = 先按分数、再按成功率
+                crossScored.Add(score.ToString("D4") + rank.ToString("D1") + "\u0001" +
+                    sp.SkillId + "\u0001" + sp.Action);
             }
             crossScored.Sort();
             crossScored.Reverse();
 
             List<string> ordered = new List<string>();
             ordered.AddRange(crossScored);
-            // 跨技能候选不足时才用同技能兄弟动作补足
+
+            // 跨技能候选之后补上同技能兄弟动作。
+            //
+            // ★ 兄弟动作必须**先收集、再一起排序**，不能边收集边追加：
+            //   初版把 "0000"+成功率档 的键直接 Add 进 ordered 就算完，但 ordered 的
+            //   crossScored 段排过序、sameScored 段却是**注册顺序**原样拼接，
+            //   全程没有第二次 Sort——于是这里算出来的成功率档**根本没被用上**（死代码，
+            //   且比"没写"更糟：它看起来像实现了，实际毫无效果）。
+            //   自检"给兄弟动作记差评，顺序应变化"抓到了这一点：记完差评它纹丝不动。
+            //   现在两段用**同形键**（4 位分数 + 1 位档位）统一排序，语义才真正落地。
             foreach (string a in sameScored)
             {
-                if (ordered.Count >= limit) break;
-                ordered.Add("0000\u0001" + skillId + "\u0001" + a);
+                double r2 = SkillStats.Rate(skillId, a);
+                int rk = r2 < 0 ? 5 : (int)Math.Round(r2 * 9);
+                // 分数段固定 0000：同技能兄弟没有跨技能场景词重叠分，
+                // 故自然排在所有跨技能候选（分数 ≥ 0001）之后。
+                ordered.Add("0000" + rk.ToString("D1") + "\u0001" + skillId + "\u0001" + a);
             }
+            // 统一排序：先按分数段（跨技能优先），再按成功率档（同分内好的靠前）
+            ordered.Sort();
+            ordered.Reverse();
 
             foreach (string line in ordered)
             {
@@ -435,6 +456,12 @@ namespace OfficeAgent.Host
 
                 SkillRunResult r = SkillRunner.Run(root, sp.SkillDir, req.ToString(), 120);
                 ok = r.Ok;
+                // 成功率台账（第三期）：每次调用都记账，供排序与提示使用。
+                // 放在这里（而不是 AgentLoop）的原因：**只有这里能区分"技能真的跑了"与
+                // "被必填校验/重复调用检测挡下"**——后者没起 sidecar、没消耗真实成本，
+                // 计进成功率会把"模型参数写错"污染成"技能本身不可靠"。上文的必填缺失
+                // 是提前 return 的，因此天然不会走到这一行。
+                SkillStats.Record(sp.SkillId, sp.Action, r.Ok);
                 AuditLog.Record("skill_tool", sp.SkillId + "/" + sp.Action +
                     "; ok=" + (r.Ok ? "true" : "false") + "; ms=" + r.ElapsedMs);
 

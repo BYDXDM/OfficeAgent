@@ -1494,6 +1494,243 @@ namespace OfficeAgent.Host
         }
         finally { try { System.IO.Directory.Delete(tbDir, true); } catch { } }
 
+        // ---------- 第三期：路由提示 / 目标继承 / 成功率台账 ----------
+
+        // 1. 路由提示：命中技能时必须给出技能名与动作清单，且必须带"可以推翻"的免责声明
+        ActionPlan hp = new ActionPlan();
+        hp.Kind = ActionKind.Skill;
+        hp.SkillId = "acct-tools";
+        hp.Inputs.Add(System.IO.Path.Combine(tmpDir, "不存在.xlsx"));
+        hp.Missing = new string[] { "至少一个输入文件" };
+        string hint = RouteHint.Build(hp, "帮我把这个月的税算一下");
+        ok = hint.IndexOf("acct-tools") >= 0 && hint.IndexOf("vat") >= 0
+            && hint.IndexOf("以你自己的判断为准") >= 0;
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "路由提示含技能名/动作清单/免责声明（" +
+            hint.Replace("\n", " ").Trim() + "）");
+
+        // 2. 未命中时不得产生任何提示（不能平白往每次请求里塞固定文本）
+        ActionPlan missPlan = new ActionPlan();
+        missPlan.Kind = ActionKind.None;
+        string noHint = RouteHint.Build(missPlan, "你好");
+        ok = noHint.Length == 0;
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "未命中不产生提示（len=" + noHint.Length + "）");
+
+        // 3. 规则判断与模型判断冲突时，提示必须**不**是命令语气。
+        //    这是"提示"与"指令"的分界线：一旦措辞变成"你必须用 X"，规则误判就无从纠正。
+        bool notCommand = hint.IndexOf("必须") < 0 && hint.IndexOf("只能") < 0
+            && hint.IndexOf("可能判错") >= 0;
+        if (!notCommand) failed++;
+        Console.WriteLine((notCommand ? "[OK]  " : "[FAIL] ") + "提示是建议而非命令（误判可被模型推翻）");
+
+        // 4. 成功率台账：记录 → 查询 → 样本不足时不得用于排序
+        //    直接验证**扁平编码**能被 MiniJson 正确读回（嵌套写法会被静默读错，见类注释）
+        SkillStats.ResetForTest();
+        SkillStats.Record("acct-tools", "vat", true);
+        bool unknownYet = SkillStats.Rate("acct-tools", "vat") < 0;
+        if (!unknownYet) failed++;
+        Console.WriteLine((unknownYet ? "[OK]  " : "[FAIL] ") + "样本不足时成功率视为未知（不用 1 次就下结论）");
+
+        // 造"失败多于成功"：1 成功 2 失败 = 33%。
+        // ★ 这里刻意**不用 2/2（正好 50%）**：BadRate 是严格小于才点名，
+        //   50% 属"各占一半、还谈不上差"。初版自检正好踩在这个边界上而误判代码有 bug。
+        SkillStats.Record("acct-tools", "vat", false);
+        SkillStats.Record("acct-tools", "vat", false);
+        SkillStats.InvalidateCache();   // 强制重新读盘，验证落盘格式确实可解析
+        SkillStats.Entry ve = SkillStats.Get("acct-tools", "vat");
+        ok = ve != null && ve.Ok == 1 && ve.Fail == 2;
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "成功率台账落盘后可读回（ok=" +
+            (ve == null ? "null" : ve.Ok + " fail=" + ve.Fail) + "，期望 1/2）");
+
+        // 5. 差动作提示：成功率严格低于 50% 且样本足够才点名
+        List<string[]> bad = SkillStats.BadActions("acct-tools", 3);
+        ok = bad.Count == 1 && bad[0][0] == "vat";
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "低成功率动作被点名（" +
+            (bad.Count > 0 ? bad[0][0] + " " + bad[0][1] + "/" + bad[0][2] : "无") + "）");
+
+        // 5b. 边界：恰好 50% 不点名（钉住上面踩过的语义）
+        SkillStats.Record("acct-tools", "vat", true);   // 2 成功 2 失败 = 50%
+        List<string[]> half = SkillStats.BadActions("acct-tools", 3);
+        bool notNamedAtHalf = true;
+        foreach (string[] x in half) { if (x[0] == "vat") notNamedAtHalf = false; }
+        if (!notNamedAtHalf) failed++;
+        Console.WriteLine((notNamedAtHalf ? "[OK]  " : "[FAIL] ") + "恰好 50% 不点名（边界语义）");
+
+        // 6. 好动作不得被点名（避免"用得好也被提醒"的噪声）
+        SkillStats.Record("acct-tools", "statements", true);
+        SkillStats.Record("acct-tools", "statements", true);
+        List<string[]> bad2 = SkillStats.BadActions("acct-tools", 5);
+        bool onlyBad = true;
+        foreach (string[] x in bad2) { if (x[0] == "statements") onlyBad = false; }
+        if (!onlyBad) failed++;
+        Console.WriteLine((onlyBad ? "[OK]  " : "[FAIL] ") + "高成功率动作不被点名（共 " + bad2.Count + " 项）");
+
+        // 7. 换路候选仍可复现（成功率台账不得改变"谁有资格当候选"）
+        SkillStats.ResetForTest();
+        SkillStats.InvalidateCache();
+        List<SkillActionSpec> baseAlts = SkillToolBridge.Alternatives(root, "acct-tools", "bank-recon", 10);
+        int total = baseAlts.Count;
+        ok = total > 0 && baseAlts[0].SkillId == "bank-recon" && baseAlts[0].Action == "recon";
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "换路候选可复现（共 " + total +
+            " 项，首个=" + (total > 0 ? baseAlts[0].SkillId + "/" + baseAlts[0].Action : "") + "）");
+
+        // 7b. 成功率只作**同分**的二级排序，不得越权压过场景词重叠分。
+        //     ★ 这条是实测撞出来的：最初想验"给差评就降权"，直接给得分最高的
+        //       bank-recon/recon 记 3 次失败，结果它**纹丝不动**——因为 acct-tools 与
+        //       bank-recon 共享 4 个场景词（表格核对/对账/勾稽/流水核对），
+        //       而与其他技能共享 0 个，它是唯一的跨技能候选，根本没有"同分对手"可比。
+        //       即：**成功率排序只在该生效的地方生效**，不能改变候选的相对能力判断。
+        //     故这里改为直接断言排序语义本身：分高的必须压过分低的，成功率只在分相同时起作用。
+        //     用一个可复现的构造：同技能兄弟动作分都是 0，此时才轮到成功率说话。
+        SkillStats.ResetForTest();
+        SkillStats.Record("bank-recon", "recon", false);
+        SkillStats.Record("bank-recon", "recon", false);
+        SkillStats.Record("bank-recon", "recon", false);
+        SkillStats.InvalidateCache();
+        List<SkillActionSpec> afterAlts = SkillToolBridge.Alternatives(root, "acct-tools", "bank-recon", 10);
+        // 重叠分优先：即便如此，bank-recon/recon 仍然是唯一跨技能候选，位置不该被撼动
+        bool stillFirst = afterAlts.Count > 0
+            && afterAlts[0].SkillId == "bank-recon" && afterAlts[0].Action == "recon";
+        if (!stillFirst) failed++;
+        Console.WriteLine((stillFirst ? "[OK]  " : "[FAIL] ") +
+            "重叠分优先于成功率（差评不撼动高分候选，" + (afterAlts.Count > 0 ? afterAlts[0].SkillId : "空") + "）");
+
+        // 7c. 同分（重叠分都为 0）的**同技能兄弟动作**内部，成功率高的排前面。
+        //     ★ 必须挑"跨技能候选之后"的位置。上一步连着两次踩了同一个坑：
+        //       候选表里第 1 项始终是跨技能候选（bank-recon/recon，重叠分 4），
+        //       而成功率只作同分二级排序，**不可能**把它挤下去——给它记差评当然没反应。
+        //       真正由成功率决定次序的是它后面的同技能兄弟（分数前缀全为 0000）。
+        //     故这里在候选表里定位第一个「非 bank-recon」的项来降权。
+        SkillStats.ResetForTest();
+        SkillStats.InvalidateCache();
+        List<SkillActionSpec> sib = SkillToolBridge.Alternatives(root, "acct-tools", "vat", 10);
+        int sibIdx = -1;
+        for (int i = 0; i < sib.Count; i++)
+        {
+            if (sib[i].SkillId == "acct-tools") { sibIdx = i; break; }
+        }
+        if (sibIdx >= 0 && sib.Count - sibIdx > 1)
+        {
+            SkillActionSpec v = sib[sibIdx];
+            for (int i = 0; i < 3; i++) SkillStats.Record(v.SkillId, v.Action, false);
+            SkillStats.InvalidateCache();
+            List<SkillActionSpec> sib2 = SkillToolBridge.Alternatives(root, "acct-tools", "vat", 10);
+            // 降权后：该动作不应再是"同技能兄弟里的第一个"
+            int newFirstSib = -1;
+            for (int i = 0; i < sib2.Count; i++)
+            {
+                if (sib2[i].SkillId == "acct-tools") { newFirstSib = i; break; }
+            }
+            bool demoted = !(newFirstSib >= 0 && sib2[newFirstSib].Action == v.Action);
+            if (!demoted) failed++;
+            Console.WriteLine((demoted ? "[OK]  " : "[FAIL] ") + "同分兄弟动作按成功率降权（" +
+                v.Action + " → 同技能首个变为 " +
+                (newFirstSib >= 0 ? sib2[newFirstSib].Action : "无") + "）");
+        }
+        else
+        {
+            Console.WriteLine("[INFO] 无足够的同技能兄弟候选，跳过降权断言");
+        }
+
+        SkillStats.ResetForTest();
+        SkillStats.InvalidateCache();
+        double rUnknown = SkillStats.Rate("acct-tools", "vat");
+        ok = rUnknown < 0;
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "清空台账后成功率回到未知（不残留旧数据）");
+
+        SkillStats.ResetForTest();
+        SkillStats.InvalidateCache();
+
+        // ---------- 第三期：目标继承 ----------
+
+        // 8. 技能从工具日志里解析：状态符号（✓/✗/跳过）不得混进工具名
+        string logSample = "🔧 list_directory ✓\n🔧 skill_acct_tools_trial_balance ✓\n" +
+            "🔧 skill_acct_tools_statements ✗\n🔧 skill_acct_tools_statements ↷跳过\n" +
+            "🔧 read_text_file ✓";
+        List<string> sk = TurnMemory.SkillsFromLog(logSample);
+        ok = sk.Count == 2
+            && sk[0] == "skill_acct_tools_trial_balance"
+            && sk[1] == "skill_acct_tools_statements";
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "从工具日志解析技能（" +
+            string.Join(",", sk.ToArray()) + "，期望 2 项且不含状态符号）");
+
+        // 9. 非技能工具不入表（读文件只是手段，不是"在做什么"的信号）
+        bool noPlain = true;
+        foreach (string s in sk) { if (s == "read_text_file" || s == "list_directory") noPlain = false; }
+        if (!noPlain) failed++;
+        Console.WriteLine((noPlain ? "[OK]  " : "[FAIL] ") + "普通工具不入目标继承（只记技能）");
+
+        // 10. 产物去重 + 空值跳过
+        List<string> prodIn = new List<string>();
+        prodIn.Add("C:\\a.xlsx"); prodIn.Add(""); prodIn.Add("C:\\a.xlsx"); prodIn.Add(null);
+        prodIn.Add("C:\\b.pdf");
+        List<string> prod = TurnMemory.Products(prodIn);
+        ok = prod.Count == 2;
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "产物去重且跳过空值（" + prod.Count + " 项，期望 2）");
+
+        // 11. 目标继承文本：必须含"仅指代时参考"的限定，且不得是命令语气
+        string inherit = TurnMemory.Build(sk, prod, 4);
+        ok = inherit.IndexOf("skill_acct_tools_trial_balance") >= 0
+            && inherit.IndexOf("a.xlsx") >= 0
+            && inherit.IndexOf("指代上一轮") >= 0
+            && inherit.IndexOf("若用户开启了新话题") >= 0;
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "目标继承含技能/产物/限定语（len=" + inherit.Length + "）");
+
+        // 12. 无内容时不产生文本（否则每轮都塞固定文本，白烧 token）
+        string emptyInherit = TurnMemory.Build(new List<string>(), new List<string>(), 4);
+        ok = emptyInherit.Length == 0;
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "无上一轮内容时不产生继承段（len=" + emptyInherit.Length + "）");
+
+        // 12b. 递增不得覆盖别的进程写入（初版用进程内快照整表覆盖 → 会静默丢数据）。
+        //      构造：A 记账后**丢弃缓存**（模拟另一个进程刚写过盘），B 再记账时
+        //      必须重读盘、把 A 的那笔一并保留，而不是拿旧快照盖掉。
+        SkillStats.ResetForTest();
+        SkillStats.Record("acct-tools", "vat", true);
+        SkillStats.InvalidateCache();              // 丢弃缓存；盘上有 1 笔
+        SkillStats.Record("acct-tools", "aging", true);   // 再记另一动作
+        SkillStats.InvalidateCache();
+        SkillStats.Entry vatAfter = SkillStats.Get("acct-tools", "vat");
+        SkillStats.Entry agingAfter = SkillStats.Get("acct-tools", "aging");
+        ok = vatAfter != null && vatAfter.Ok == 1 && agingAfter != null && agingAfter.Ok == 1;
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "记账不覆盖既有记录（vat=" +
+            (vatAfter == null ? "null" : vatAfter.Ok.ToString()) + " aging=" +
+            (agingAfter == null ? "null" : agingAfter.Ok.ToString()) + "，期望各 1）");
+
+        // 12c. 落盘后不得残留临时文件（初版固定 .tmp 名，且 Delete+Move 有丢文件窗口）
+        bool noTmpLeft = true;
+        try
+        {
+            string dir = System.IO.Path.GetDirectoryName(SkillStats.FilePath());
+            foreach (string f2 in System.IO.Directory.GetFiles(dir, "skill-stats.json.*"))
+            {
+                if (f2.EndsWith(".tmp")) noTmpLeft = false;
+            }
+        }
+        catch { }
+        if (!noTmpLeft) failed++;
+        Console.WriteLine((noTmpLeft ? "[OK]  " : "[FAIL] ") + "落盘后无残留临时文件");
+        SkillStats.ResetForTest();
+        SkillStats.InvalidateCache();
+
+        // 13. 产物超量时只列 maxProducts 个，其余报数量（防提示膨胀）
+        List<string> many = new List<string>();
+        for (int i = 0; i < 7; i++) many.Add("C:\\f" + i + ".xlsx");
+        string manyText = TurnMemory.Build(null, many, 4);
+        ok = manyText.IndexOf("f3.xlsx") >= 0 && manyText.IndexOf("f4.xlsx") < 0
+            && manyText.IndexOf("还有 3 个") >= 0;
+        if (!ok) failed++;
+        Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "产物超量只列前 4 个并报余量");
+
         Console.WriteLine(failed == 0 ? "ALL PASS" : (failed + " FAILED"));
         return failed == 0 ? 0 : 2;
     }

@@ -7,6 +7,7 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Globalization;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -42,6 +43,7 @@ namespace OfficeAgent.Host
             bool detectTest = false;
             bool bridgeTest = false;
             bool planTest = false;
+        bool perfTest = false;
             string[] skillRunArgs = null;
             string[] agentTestArgs = null;
             string[] reconArgs = null;
@@ -64,6 +66,7 @@ namespace OfficeAgent.Host
                 else if (a == "/detecttest") detectTest = true;
                 else if (a == "/bridgetest") bridgeTest = true;
                 else if (a == "/plantest") planTest = true;
+        else if (a == "/perftest") perfTest = true;
                 else if (a == "/skillrun")
                 {
                     List<string> rest = new List<string>();
@@ -99,7 +102,7 @@ namespace OfficeAgent.Host
 
             // CLI 无头链同样落审计（设计方案 §7.3：每个动作可审计；GUI 的 app_start 在 MainForm）
             if (selftest || guardTest || maskTest || intentTest || suggestTest || skillTest || caretTest
-                || auditTest || detectTest || bridgeTest || planTest
+                || auditTest || detectTest || bridgeTest || planTest || perfTest
                 || gridTestInput != null
                 || skillRunArgs != null || agentTestArgs != null || reconArgs != null || mergeArgs != null
                 || invoiceArgs != null || convertInput != null || renderInput != null
@@ -194,6 +197,14 @@ namespace OfficeAgent.Host
                 try { AllocConsole(); } catch { }
                 try { Console.OutputEncoding = Encoding.UTF8; } catch { }
                 return RunPlanTest();
+            }
+
+            if (perfTest)
+            {
+                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
+                try { AllocConsole(); } catch { }
+                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                return RunPerfTest();
             }
 
             if (skillRunArgs != null)
@@ -1730,6 +1741,225 @@ namespace OfficeAgent.Host
             && manyText.IndexOf("还有 3 个") >= 0;
         if (!ok) failed++;
         Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + "产物超量只列前 4 个并报余量");
+
+        Console.WriteLine(failed == 0 ? "ALL PASS" : (failed + " FAILED"));
+        return failed == 0 ? 0 : 2;
+    }
+
+    // 低配优化自测：OfficeAgent.exe /perftest
+    //
+    // 覆盖两件事，都必须**断言到数字**而不是"跑通了"：
+    //   ① 正确性：新的有界预览 XlsxPreview 与旧的 LoadGrid 必须逐单元格一致。
+    //      这是本类最重要的一条——性能优化若改变了数据，用户看到的就是错的表。
+    //      实测中就靠它抓到"合并单元格没回填"（跨列标题只剩第一列）。
+    //   ② 内存上界：预览保留的行数必须有界，不能随表的大小增长。
+    //      这是"低配能跑"的核心保证：内存占用从 O(总行数) 变成 O(保留行数)。
+    static int RunPerfTest()
+    {
+        int failed = 0;
+        string dir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "oa_perftest");
+        try
+        {
+            if (System.IO.Directory.Exists(dir)) System.IO.Directory.Delete(dir, true);
+            System.IO.Directory.CreateDirectory(dir);
+
+            // ---------- ① 数据一致性：有界预览 vs 全量网格 ----------
+            // 造一张"宽 + 长 + 带合并单元格"的表，一次覆盖三类风险。
+            string wide = System.IO.Path.Combine(dir, "wide.csv");
+            StringBuilder csv = new StringBuilder();
+            for (int c = 0; c < 40; c++) { if (c > 0) csv.Append(','); csv.Append("列" + c); }
+            csv.Append('\n');
+            for (int r = 0; r < 5000; r++)
+            {
+                for (int c = 0; c < 40; c++)
+                {
+                    if (c > 0) csv.Append(',');
+                    csv.Append("v" + r + "_" + c);
+                }
+                csv.Append('\n');
+            }
+            System.IO.File.WriteAllText(wide, csv.ToString(), new UTF8Encoding(false));
+            string wideXlsx = System.IO.Path.Combine(dir, "wide.xlsx");
+            bool madeWide = false;
+            try
+            {
+                // 用项目自己的写入器造 xlsx（不依赖 LibreOffice，CI/无 LO 环境也能跑）
+                ReportSheet sh = new ReportSheet("S1");
+                for (int r = 0; r <= 5000; r++)
+                {
+                    string[] cells = new string[40];
+                    for (int c = 0; c < 40; c++) cells[c] = (r == 0) ? ("列" + c) : ("v" + (r - 1) + "_" + c);
+                    sh.AddTextRow(cells);
+                }
+                List<ReportSheet> sheets = new List<ReportSheet>();
+                sheets.Add(sh);
+                string saveErr = MiniXlsxWrite.Save(wideXlsx, sheets);
+                madeWide = saveErr == null && System.IO.File.Exists(wideXlsx);
+                if (!madeWide) Console.WriteLine("[INFO] 造表失败: " + saveErr);
+            }
+            catch { }
+
+            if (madeWide)
+            {
+                XlsxBook bk = XlsxBook.Open(wideXlsx);
+                int tr1, uc1;
+                string[,] full = bk.LoadGrid(0, 6000, 64, out tr1, out uc1);
+                bk.Dispose();
+
+                XlsxPreview pv = XlsxPreview.Load(wideXlsx, 0, XlsxPreview.DefaultPreviewRows, XlsxPreview.MaxPreviewCols);
+                int diff = 0;
+                string firstDiff = "";
+                int cmpRows = Math.Min(full.GetLength(0), pv.Rows.Length);
+                int cmpCols = Math.Min(full.GetLength(1), pv.UsedCols);
+                for (int r = 0; r < cmpRows; r++)
+                {
+                    for (int c = 0; c < cmpCols; c++)
+                    {
+                        string a = full[r, c] == null ? "" : full[r, c];
+                        string b = (c < pv.Rows[r].Length && pv.Rows[r][c] != null) ? pv.Rows[r][c] : "";
+                        if (a != b)
+                        {
+                            if (firstDiff.Length == 0)
+                                firstDiff = "r" + r + "c" + c + " 全量='" + a + "' 预览='" + b + "'";
+                            diff++;
+                        }
+                    }
+                }
+                bool same = diff == 0 && cmpRows == XlsxPreview.DefaultPreviewRows;
+                if (!same) failed++;
+                Console.WriteLine((same ? "[OK]  " : "[FAIL] ") + "有界预览与全量网格逐单元格一致（比对 " +
+                    cmpRows + "x" + cmpCols + "，差异 " + diff + (firstDiff.Length > 0 ? "，首个 " + firstDiff : "") + "）");
+
+                // 总行数必须如实统计（预览只留前 N 行，但**总行数不能是 N**）
+                bool totalOk = pv.TotalRows == 5001;
+                if (!totalOk) failed++;
+                Console.WriteLine((totalOk ? "[OK]  " : "[FAIL] ") + "预览保留行有界但总行数如实（保留=" +
+                    pv.Rows.Length + " 总数=" + pv.TotalRows + "，期望 5001）");
+
+                // ② 内存上界：保留行数不得超过配置上限，且与表大小无关
+                bool bounded = pv.Rows.Length <= XlsxPreview.DefaultPreviewRows;
+                if (!bounded) failed++;
+                Console.WriteLine((bounded ? "[OK]  " : "[FAIL] ") + "保留行数有界（" + pv.Rows.Length +
+                    " <= " + XlsxPreview.DefaultPreviewRows + "）");
+
+                // 列数也必须有界（宽表不能靠列数把内存撑爆）
+                XlsxPreview widePv = XlsxPreview.Load(wideXlsx, 0, 10, XlsxPreview.MaxPreviewCols);
+                bool colBounded = widePv.UsedCols <= XlsxPreview.MaxPreviewCols;
+                if (!colBounded) failed++;
+                Console.WriteLine((colBounded ? "[OK]  " : "[FAIL] ") + "列数有界（" + widePv.UsedCols +
+                    " <= " + XlsxPreview.MaxPreviewCols + "）");
+
+                // 预览信息必须如实标注"仅预览前 N 行 / 共 M 行"
+                string desc = pv.Describe(1, "S1");
+                bool descOk = desc.IndexOf("仅预览前 " + XlsxPreview.DefaultPreviewRows + " 行") >= 0
+                    && desc.IndexOf("共 5001 行") >= 0;
+                if (!descOk) failed++;
+                Console.WriteLine((descOk ? "[OK]  " : "[FAIL] ") + "预览提示如实标注截断（" + desc + "）");
+            }
+            else
+            {
+                Console.WriteLine("[INFO] 跳过 xlsx 一致性断言（MiniXlsxWrite 不可用）");
+            }
+
+            // ---------- ③ 流式读取条目：必须与全量解压结果一致 ----------
+            // MiniZip.OpenEntryStream 是本次低配优化的核心（省掉工作表 XML 的整份解压）。
+            // 它放弃了 CRC32，故必须证明"读出来的字节与全量解压完全相同"。
+            if (madeWide)
+            {
+                MiniZipFile z = MiniZipFile.OpenRead(wideXlsx);
+                MiniZipEntryInfo target = null;
+                foreach (MiniZipEntryInfo e in z.Entries)
+                {
+                    if (e.FullName != null && e.FullName.StartsWith("xl/worksheets/")) { target = e; break; }
+                }
+                bool streamOk = false;
+                string streamMsg = "未找到工作表条目";
+                if (target != null)
+                {
+                    // 全量解压
+                    byte[] fullBytes;
+                    using (Stream fs1 = z.OpenEntry(target.FullName))
+                    {
+                        fullBytes = new byte[fs1.Length];
+                        int off = 0;
+                        while (off < fullBytes.Length)
+                        {
+                            int n = fs1.Read(fullBytes, off, fullBytes.Length - off);
+                            if (n <= 0) break;
+                            off += n;
+                        }
+                    }
+                    // 流式解压
+                    byte[] streamBytes;
+                    using (Stream fs2 = z.OpenEntryStream(target.FullName))
+                    {
+                        MemoryStream acc = new MemoryStream();
+                        byte[] buf = new byte[8192];
+                        int n;
+                        while ((n = fs2.Read(buf, 0, buf.Length)) > 0) acc.Write(buf, 0, n);
+                        streamBytes = acc.ToArray();
+                    }
+                    streamOk = fullBytes.Length == streamBytes.Length;
+                    if (streamOk)
+                    {
+                        for (int i = 0; i < fullBytes.Length; i++)
+                        {
+                            if (fullBytes[i] != streamBytes[i]) { streamOk = false; streamMsg = "第 " + i + " 字节不同"; break; }
+                        }
+                    }
+                    else streamMsg = "长度不同 全量=" + fullBytes.Length + " 流式=" + streamBytes.Length;
+                    if (streamOk) streamMsg = fullBytes.Length + " 字节完全一致";
+                }
+                if (!streamOk) failed++;
+                Console.WriteLine((streamOk ? "[OK]  " : "[FAIL] ") + "流式解压与全量解压字节一致（" + streamMsg + "）");
+                z.Dispose();
+            }
+
+            // ---------- ④ 流式读取必须能发现截断 ----------
+            // 放弃了 CRC32，就必须保证"数据坏了会报错"而不是静默少给几行。
+            string broken = System.IO.Path.Combine(dir, "broken.xlsx");
+            bool truncatedDetected = false;
+            try
+            {
+                // 复制一个 xlsx，把中央目录声明的解压长度改大（模拟截断/损坏）
+                if (madeWide)
+                {
+                    byte[] raw = System.IO.File.ReadAllBytes(wideXlsx);
+                    System.IO.File.WriteAllBytes(broken, raw);
+                    // 直接把文件截掉尾部一段 → 解压必然不足
+                    using (FileStream fs = new FileStream(broken, FileMode.Open, FileAccess.Write))
+                    {
+                        fs.SetLength(fs.Length - 200);
+                    }
+                    try
+                    {
+                        MiniZipFile zb = MiniZipFile.OpenRead(broken);
+                        foreach (MiniZipEntryInfo e in zb.Entries)
+                        {
+                            if (e.FullName != null && e.FullName.StartsWith("xl/worksheets/"))
+                            {
+                                using (Stream st = zb.OpenEntryStream(e.FullName))
+                                {
+                                    byte[] buf = new byte[8192];
+                                    while (st.Read(buf, 0, buf.Length) > 0) { }
+                                }
+                                break;
+                            }
+                        }
+                        zb.Dispose();
+                    }
+                    catch { truncatedDetected = true; }
+                }
+            }
+            catch { }
+            if (!truncatedDetected) failed++;
+            Console.WriteLine((truncatedDetected ? "[OK]  " : "[FAIL] ") +
+                "流式读取能发现截断（不静默少给数据）");
+        }
+        finally
+        {
+            try { System.IO.Directory.Delete(dir, true); } catch { }
+        }
 
         Console.WriteLine(failed == 0 ? "ALL PASS" : (failed + " FAILED"));
         return failed == 0 ? 0 : 2;

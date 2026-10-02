@@ -59,6 +59,9 @@ build\host\OfficeAgent.exe /suggesttest        # 列映射建议
 build\host\OfficeAgent.exe /skilltest          # 技能体系
 build\host\OfficeAgent.exe /carettest          # 输入框光标定位回归
 build\host\OfficeAgent.exe /gridtest <xlsx>    # 表格读取（表头/行序）回归
+build\host\OfficeAgent.exe /bridgetest         # 技能→工具投影（规划层一期）
+build\host\OfficeAgent.exe /plantest          # 编排：预算/产物/换路/三期
+build\host\OfficeAgent.exe /perftest          # 低配优化：预览有界性 + 流式解压一致性
 build\host\OfficeAgent.exe /agenttest "读一下 D:\a.txt"     # 真模型 agent 循环
 
 # 场景 CLI

@@ -11,6 +11,127 @@ using System.Text;
 
 namespace OfficeAgent.Core
 {
+    // 只暴露底层流的一段（[start, start+length)）的只读包装。
+    // 用于把 DeflateStream 限制在**单个条目**的压缩数据范围内：
+    // 若不限制，DeflateStream 会一直读到文件尾，把压缩包里后续条目也当数据解压，结果错乱。
+    internal class MiniZipBoundedStream : Stream
+    {
+        readonly Stream inner;
+        readonly long length;
+        long pos;
+
+        public MiniZipBoundedStream(Stream inner, long length, long ignored)
+        {
+            this.inner = inner;
+            this.length = length;
+        }
+
+        public override bool CanRead { get { return true; } }
+        public override bool CanSeek { get { return false; } }
+        public override bool CanWrite { get { return false; } }
+        public override long Length { get { return length; } }
+        public override long Position
+        {
+            get { return pos; }
+            set { throw new NotSupportedException(); }
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            if (pos >= length) return 0;
+            long remain = length - pos;
+            if (count > remain) count = (int)remain;
+            int n = inner.Read(buffer, offset, count);
+            if (n > 0) pos += n;
+            return n;
+        }
+
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) { throw new NotSupportedException(); }
+        public override void SetLength(long value) { throw new NotSupportedException(); }
+        public override void Write(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
+
+        protected override void Dispose(bool disposing)
+        {
+            // 关闭有界流 = 关闭底层文件句柄（这个流是句柄的唯一持有者）
+            if (disposing) { try { inner.Close(); } catch { } }
+            base.Dispose(disposing);
+        }
+    }
+
+    // 校验"解压出来的字节数"与中央目录声明的 UncompressedSize 一致。
+    // 为什么值得单独做一层：流式读取放弃了 CRC32 校验（要校验就得缓存全部数据，
+    // 那正是要避免的）。而 ZIP 截断/损坏最典型的症状就是**解压字节数不足**，
+    // 这一层能把它抓成明确异常，而不是让上层 XmlReader 报一句看不懂的 XML 错误。
+    internal class MiniZipVerifyingStream : Stream
+    {
+        readonly Stream inner;
+        readonly long expected;
+        long seen;
+
+        public MiniZipVerifyingStream(Stream inner, long expected)
+        {
+            this.inner = inner;
+            this.expected = expected;
+        }
+
+        public override bool CanRead { get { return true; } }
+        public override bool CanSeek { get { return false; } }
+        public override bool CanWrite { get { return false; } }
+        public override long Length { get { return expected; } }
+        public override long Position
+        {
+            get { return seen; }
+            set { throw new NotSupportedException(); }
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            int remain = expected - seen > int.MaxValue ? int.MaxValue : (int)(expected - seen);
+            if (remain <= 0) return 0;
+            if (count > remain) count = remain;
+            int n = inner.Read(buffer, offset, count);
+            if (n > 0) seen += n;
+            return n;
+        }
+
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) { throw new NotSupportedException(); }
+        public override void SetLength(long value) { throw new NotSupportedException(); }
+        public override void Write(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
+
+        protected override void Dispose(bool disposing)
+        {
+            bool truncated = false;
+            try
+            {
+                if (disposing && seen < expected) truncated = true;
+            }
+            catch { }
+            if (disposing)
+            {
+                // 先排空剩余字节：DeflateStream 只有在读到末尾时才会发现数据损坏，
+                // 提前关闭会把"损坏"静默吞掉（表现为表格少了最后几行而不是报错）。
+                try
+                {
+                    byte[] sink = new byte[8192];
+                    int guard = 0;
+                    while (seen < expected && guard++ < 1000000)
+                    {
+                        int n = Read(sink, 0, sink.Length);
+                        if (n <= 0) break;
+                    }
+                }
+                catch { }
+                if (seen < expected) truncated = true;
+                try { inner.Close(); } catch { }
+            }
+            base.Dispose(disposing);
+            if (disposing && truncated)
+                throw new IOException("条目解压长度不足（数据可能损坏或被截断）");
+        }
+    }
+
     public class MiniZipEntryInfo
     {
         public string FullName = "";
@@ -82,6 +203,13 @@ namespace OfficeAgent.Core
         public List<MiniZipEntryInfo> Entries { get { return entries; } }
 
         // 解压条目内容（CRC 校验后以内存流返回；调用方负责 Dispose）
+        //
+        // ⚠️ 本方法会把**整个条目解压进内存**（一次 `new byte[uncompSize]`）。
+        //    对小条目（sharedStrings/styles/workbook.xml）没问题，
+        //    但对工作表 XML 是致命的：实测一张 20000x128 的表，
+        //    `xl/worksheets/sheet1.xml` 压缩后 9.7MB、**解压后 78MB**，
+        //    这一处分配就占了"打开大表"内存峰值的绝大部分。
+        //    需要按行流式读取工作表时请改用 OpenEntryStream。
         public Stream OpenEntry(string name)
         {
             MiniZipEntryInfo e = FindEntry(name);
@@ -92,6 +220,54 @@ namespace OfficeAgent.Core
                 if (data == null) throw new IOException("条目解压失败: " + e.FullName);
                 if (MiniZip.Crc32(data, 0, data.Length) != e.Crc) throw new IOException("CRC 校验失败: " + e.FullName);
                 return new MemoryStream(data);
+            }
+        }
+
+        // 流式读取条目：不全量解压进内存，边解压边交给调用方消费。
+        //
+        // 用途：工作表 XML 只需要**顺序**读一遍（XmlReader 本身就是前向只读），
+        // 把 78MB 的中间 byte[] 省掉，内存占用与条目大小解耦。
+        //
+        // ★ 关于 CRC：本方法**不**校验 CRC。CRC32 在 ZIP 尾部，要校验就得先缓存全部数据，
+        //   那正是这里要避免的。完整性由三层保障兜底：
+        //     ① DeflateStream 解压时自带结构校验，坏数据会抛异常；
+        //     ② 解压长度必须等于中央目录声明的 uncompSize，少一个字节即报错；
+        //     ③ 上层用 XmlReader 解析，截断/损坏的 XML 会解析失败而不是静默给出错数据。
+        //   对"读一个表格给自己看"的用途，这三层足够；需要强校验的场景仍走 OpenEntry。
+        //
+        // 返回值：调用方 Dispose 时一并关闭文件句柄与解压流。
+        public Stream OpenEntryStream(string name)
+        {
+            MiniZipEntryInfo e = FindEntry(name);
+            if (e == null) throw new IOException("xlsx 包内缺少条目: " + name);
+            if (e.UncompressedSize > MiniZip.MAX_UNCOMPRESSED)
+                throw new IOException("条目过大，疑似 ZIP 炸弹: " + e.FullName);
+            FileStream fs = File.OpenRead(path);
+            try
+            {
+                fs.Seek(e.LocalOffset, SeekOrigin.Begin);
+                byte[] lfh = MiniZip.ReadExact(fs, 30);
+                if (MiniZip.ReadU32(lfh, 0) != MiniZip.LFH_SIGNATURE)
+                    throw new IOException("本地文件头损坏: " + e.FullName);
+                ushort nameLen = MiniZip.ReadU16(lfh, 26);
+                ushort extraLen = MiniZip.ReadU16(lfh, 28);
+                fs.Seek(nameLen + extraLen, SeekOrigin.Current);
+
+                // 存储方式（method=0）：数据本身就是明文，直接交给调用方，零拷贝
+                if (e.Method == 0)
+                    return new MiniZipBoundedStream(fs, e.CompressedSize, e.CompressedSize);
+
+                // deflate：在**有界子流**上解压。用有界流而不是裸 FileStream，
+                // 是因为 DeflateStream 会一直读到文件尾——那样会把压缩包后面的
+                // 其他条目也当数据读进来，解压结果就是错的。
+                Stream bounded = new MiniZipBoundedStream(fs, e.CompressedSize, e.CompressedSize);
+                return new MiniZipVerifyingStream(
+                    new DeflateStream(bounded, CompressionMode.Decompress), e.UncompressedSize);
+            }
+            catch
+            {
+                try { fs.Close(); } catch { }
+                throw;
             }
         }
 

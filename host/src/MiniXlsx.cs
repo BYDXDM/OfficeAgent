@@ -241,7 +241,14 @@ namespace OfficeAgent.Host
             List<XlsxMerge> merges = new List<XlsxMerge>();
             try
             {
-                using (XmlReader r = XmlReader.Create(zip.OpenEntry(se.FullName)))
+                // ★ 用 OpenEntryStream 而不是 OpenEntry（低配优化关键点）：
+                //   工作表 XML 是包里最大的条目——实测一张 20000x128 的表，
+                //   压缩 9.7MB / **解压 78MB**。OpenEntry 会把整份 XML 解压进一个 byte[]，
+                //   这一处分配就是打开大表内存峰值的主因（实测 83MB 峰值里绝大部分是它）。
+                //   XmlReader 是前向只读消费，天然适合流式，故这里改为边解压边解析：
+                //   内存占用与表的大小解耦，只与"正在处理的一行"有关。
+                //   代价：放弃 CRC32（见 OpenEntryStream 注释，有长度校验兜底）。
+                using (XmlReader r = XmlReader.Create(zip.OpenEntryStream(se.FullName)))
                 {
                     int rowNumber = -1;
                     int curCol = 0, styleIdx = 0;

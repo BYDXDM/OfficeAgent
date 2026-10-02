@@ -138,6 +138,93 @@ if (Test-Path $cfg) {
   Note "SKIP" "6.1 config.json" "no wizard run yet (GUI first-run creates it)"
 }
 
+# 7. python38 sidecar skills (added in 0.6.3): verify runtime + offline deps + each skill runs.
+#    These are the skills that need store\wheels; on Win7 the embedded python may be x86,
+#    so this section also proves the wheel set matches the actual interpreter bitness.
+$py = Join-Path $Root "runtime\py38\python.exe"
+if ((Test-Path $py) -and (Test-Path $host2)) {
+  # 7.1 interpreter runs and reports bitness (proves VC++ runtime is present)
+  $pyOut = Join-Path $env:TEMP "oa-pyver.txt"
+  $rc = Exec $py "-c ""import sys,platform;open(r'$pyOut','w').write(sys.version.split()[0]+' '+platform.machine())""" ""
+  $pyTxt = ""
+  if (Test-Path $pyOut) { $pyTxt = [System.IO.File]::ReadAllText($pyOut) }
+  Note ($rc -eq 0 -and $pyTxt.Length -gt 0) "7.1 python38 sidecar runs" ("exit=" + $rc + " ver=" + $pyTxt)
+
+  # 7.2 the offline deps the new skills need are importable
+  $depOut = Join-Path $env:TEMP "oa-deps.txt"
+  $depCode = "import openpyxl,docx,pptx,pypdf,pdfplumber,PIL,xlsxwriter;open(r'$depOut','w').write('ok')"
+  $rc = Exec $py ("-c """ + $depCode + """") ""
+  $depTxt = ""
+  if (Test-Path $depOut) { $depTxt = [System.IO.File]::ReadAllText($depOut) }
+  Note ($depTxt -eq "ok") "7.2 offline deps importable" ("(openpyxl/docx/pptx/pypdf/pdfplumber/PIL/xlsxwriter)")
+
+  # 7.3 skills are registered
+  $regOut = Join-Path $env:TEMP "oa-skillreg.txt"
+  $rc = Exec $host2 "/skilltest" $regOut
+  $regTxt = ""
+  if (Test-Path $regOut) { $regTxt = [System.IO.File]::ReadAllText($regOut) }
+  Note ($rc -eq 0) "7.3 /skilltest (registry)" ("exit=" + $rc)
+  $hasXlsx = $regTxt -like "*xlsx-ops*"
+  $hasDocx = $regTxt -like "*docx-report*"
+  $hasAcct = $regTxt -like "*acct-tools*"
+  Note ($hasXlsx -and $hasDocx -and $hasAcct) "7.4 new skills registered" ("xlsx-ops=" + $hasXlsx + " docx-report=" + $hasDocx + " acct-tools=" + $hasAcct)
+
+  # 7.5 row-stat end-to-end (stdlib only): proves stage -> sidecar -> stdout JSON chain
+  $csvIn = Join-Path $env:TEMP "oa-rows.csv"
+  [System.IO.File]::WriteAllText($csvIn, "col,amt`r`n a,1`r`n b,2", (New-Object System.Text.UTF8Encoding($false)))
+  $rsOut = Join-Path $env:TEMP "oa-rowstat.txt"
+  $rc = Exec $host2 ("/skillrun row-stat `"" + $csvIn + "`" --yes") $rsOut
+  $rsTxt = ""
+  if (Test-Path $rsOut) { $rsTxt = [System.IO.File]::ReadAllText($rsOut) }
+  Note ($rc -eq 0 -and $rsTxt -like "*stat*") "7.5 row-stat end-to-end" ("exit=" + $rc)
+
+  # 7.6 xlsx-ops end-to-end: exercises openpyxl (the wheel that must match interpreter bitness)
+  $xlsxIn = Join-Path $env:TEMP "oa-xs.xlsx"
+  if (Test-Path $xlsxIn) { Remove-Item $xlsxIn -Force }
+  $rc = Exec $host2 ("/convert `"" + $csvIn + "`" xlsx") ""
+  $csvConv = $csvIn -replace "\.csv$", "_conv.xlsx"
+  if (-not (Test-Path $csvConv)) { $csvConv = (Join-Path $env:TEMP "oa-rows_conv.xlsx") }
+  if (Test-Path $csvConv) {
+    $reqFile = Join-Path $env:TEMP "oa-xreq.json"
+    [System.IO.File]::WriteAllText($reqFile, '{"action":"inspect"}', (New-Object System.Text.UTF8Encoding($false)))
+    $xsOut = Join-Path $env:TEMP "oa-xlsxops.txt"
+    $rc = Exec $host2 ("/skillrun xlsx-ops `"" + $csvConv + "`" --yes --request-file `"" + $reqFile + "`"") $xsOut
+    $xsTxt = ""
+    if (Test-Path $xsOut) { $xsTxt = [System.IO.File]::ReadAllText($xsOut) }
+    # Match on the JSON field name ("sheets") rather than the localized UI label:
+    # this script must stay pure ASCII for PowerShell 2.0 on Win7.
+    Note ($xsTxt -like "*sheets*") "7.6 xlsx-ops inspect (openpyxl)" ("exit=" + $rc)
+  } else {
+    Note "SKIP" "7.6 xlsx-ops inspect" "csv->xlsx convert did not produce a file"
+  }
+
+  # 7.7 docx-report end-to-end: exercises python-docx (newly added dependency)
+  $docOut = Join-Path $env:TEMP "oa-report.docx"
+  if (Test-Path $docOut) { Remove-Item $docOut -Force }
+  $dreq = Join-Path $env:TEMP "oa-dreq.json"
+  $djson = '{"out":"' + ($docOut -replace "\\", "\\") + '","title":"smoke","blocks":[{"type":"para","text":"ok"}]}'
+  [System.IO.File]::WriteAllText($dreq, $djson, (New-Object System.Text.UTF8Encoding($false)))
+  $drOut = Join-Path $env:TEMP "oa-docxrep.txt"
+  $rc = Exec $host2 ("/skillrun docx-report `"" + $csvIn + "`" --yes --request-file `"" + $dreq + "`"") $drOut
+  Note (Test-Path $docOut) "7.7 docx-report generates .docx (python-docx)" ("exists=" + (Test-Path $docOut))
+
+  # 7.8 acct-tools: trial-balance must detect an unbalanced set
+  $tbIn = Join-Path $env:TEMP "oa-tb.csv"
+  [System.IO.File]::WriteAllText($tbIn, "subj,debit,credit`r`na,100,0`r`nb,0,80", (New-Object System.Text.UTF8Encoding($false)))
+  $tbReq = Join-Path $env:TEMP "oa-tbreq.json"
+  [System.IO.File]::WriteAllText($tbReq, '{"action":"trial-balance"}', (New-Object System.Text.UTF8Encoding($false)))
+  $tbOut = Join-Path $env:TEMP "oa-tb.txt"
+  $rc = Exec $host2 ("/skillrun acct-tools `"" + $tbIn + "`" --yes --request-file `"" + $tbReq + "`"") $tbOut
+  $tbTxt = ""
+  if (Test-Path $tbOut) { $tbTxt = [System.IO.File]::ReadAllText($tbOut) }
+  # 100 vs 80 -> unbalanced by 20; the skill must report the difference (not silently pass).
+  # Match on the numeric delta only -- keep this file pure ASCII.
+  $detected = ($tbTxt -like "*20.00*") -or ($tbTxt -like "*unbalanced*")
+  Note $detected "7.8 acct-tools detects unbalanced ledger" ("")
+} else {
+  Note "SKIP" "7.x python skills" "runtime\py38 or host exe missing"
+}
+
 # summary
 $summary = "RESULT pass=" + $script:pass + " fail=" + $script:fail + " skip=" + $script:skips
 Write-Host $summary

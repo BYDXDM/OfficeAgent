@@ -169,16 +169,34 @@ namespace OfficeAgent.Core
                 DetectItem kb838 = new DetectItem();
                 kb838.Id = "kb2670838"; kb838.Name = "平台更新 KB2670838（.NET 4.8 前置）";
                 kb838.Order = 6; kb838.NeedAdmin = true;
-                bool has838 = HasHotfix("KB2670838");
+                HotfixState st838 = QueryHotfix("KB2670838");
+                bool has838 = (st838 == HotfixState.Present);
                 if (!has838)
                 {
                     // KB2670838 在两个视图都会装 d3dcompiler_47；按位宽取原生 System32 检查最可靠
                     string d47 = Path.Combine(DirOfBitness(true), "d3dcompiler_47.dll");
                     has838 = FileVersionAtLeast(d47, "6.2.9200.16492");
                 }
-                kb838.State = has838 ? DetectState.Ok : DetectState.Missing;
-                kb838.FixKey = has838 ? null : "install_kb2670838";
-                kb838.Detail = has838 ? "已安装" : "DirectWrite/D3DCompiler_47，.NET 4.8 在 Win7 SP1 的硬前置";
+                if (has838)
+                {
+                    kb838.State = DetectState.Ok;
+                    kb838.FixKey = null;
+                    kb838.Detail = "已安装";
+                }
+                else if (st838 == HotfixState.Unavailable && !File.Exists(Path.Combine(DirOfBitness(true), "d3dcompiler_47.dll")))
+                {
+                    // WMI 不可用且文件也不在：两条路都没结论 → 未知，不当作缺失
+                    //（避免 WMI 抖动把这一项推进"已提示缺失"集合，导致反复弹窗）
+                    kb838.State = DetectState.Unknown;
+                    kb838.FixKey = null;
+                    kb838.Detail = "无法确认（WMI 查询失败且未找到 d3dcompiler_47.dll）";
+                }
+                else
+                {
+                    kb838.State = DetectState.Missing;
+                    kb838.FixKey = "install_kb2670838";
+                    kb838.Detail = "DirectWrite/D3DCompiler_47，.NET 4.8 在 Win7 SP1 的硬前置";
+                }
                 list.Add(kb838);
             }
 
@@ -256,8 +274,18 @@ namespace OfficeAgent.Core
                 {
                     py.State = DetectState.Ok; py.Detail = ver;
                 }
+                else if (code == ProcRunner.ExitTimeout)
+                {
+                    // 超时不等于"坏了"：低配机/杀软扫描时 python 起得慢很常见。
+                    // 判 Missing 会把它写进"已提示缺失"集合，下次探针正常又变成 Ok，
+                    // 集合来回变化 → 反复弹修复窗口。判 Unknown 更诚实，也不参与闸门。
+                    py.State = DetectState.Unknown; py.FixKey = null;
+                    py.Detail = "存在但探针超时（15s 未返回），可能机器负载高；可重试检测";
+                }
                 else
                 {
+                    // 非零退出（如缺 VC++ 运行库导致加载失败，exit=126）：这是**真**问题，
+                    // 重解压确实能修（内置 vcruntime），保留 Missing。
                     py.State = DetectState.Missing; py.FixKey = "unpack_py38";
                     py.Detail = "存在但探针失败（exit=" + code + "），重解压可修复";
                 }
@@ -334,6 +362,12 @@ namespace OfficeAgent.Core
             list.Add(tls);
 
             // 磁盘空间
+            // 迟滞（hysteresis）：可用空间是**实时值**，若阈值恰好卡在 2GB，
+            // 磁盘紧张时会在 Ok/Missing 之间来回跳 —— 每次跳都改变"缺失项集合"，
+            // 于是修复窗口被反复唤醒（用户抱怨的"老是被打断"）。
+            // 因此：低于 2GB 才判缺失；已判缺失后要回到 2.5GB 以上才恢复 Ok。
+            // 已判缺失的状态借助进程内静态变量记住（同一次运行内有效；
+            // 跨进程时用 BootGate 的集合语义也不会重复弹）。
             DetectItem disk = new DetectItem();
             disk.Id = "disk"; disk.Name = "安装盘剩余空间"; disk.Order = 17;
             try
@@ -341,8 +375,27 @@ namespace OfficeAgent.Core
                 string driveRoot = Path.GetPathRoot(Path.GetFullPath(root));
                 DriveInfo d = new DriveInfo(driveRoot);
                 long free = d.IsReady ? d.AvailableFreeSpace : 0;
-                if (free >= 2L * 1024 * 1024 * 1024) { disk.State = DetectState.Ok; disk.Detail = (free / 1024 / 1024) + " MB 可用"; }
-                else { disk.State = DetectState.Missing; disk.Detail = "不足 2GB，无法安装完整组件"; }
+                // 低水位 2GiB；高水位 2.5GiB。
+                // 注意必须先乘后除：写成 5L / 2 * 1024 * 1024 * 1024 会因**整数除法**
+                // 先算成 2，高水位退化为 2GiB 与低水位相等 → 迟滞完全失效。
+                const long GiB = 1024L * 1024 * 1024;
+                const long LowWater = 2L * GiB;        // 低于此值 → 缺失
+                const long HighWater = 5L * GiB / 2;   // 已缺失时需恢复到此处才转 Ok（2.5GiB）
+                long threshold = diskWasLow ? HighWater : LowWater;
+                if (free >= threshold)
+                {
+                    diskWasLow = false;
+                    disk.State = DetectState.Ok;
+                    disk.Detail = (free / 1024 / 1024) + " MB 可用";
+                }
+                else
+                {
+                    diskWasLow = true;
+                    disk.State = DetectState.Missing;
+                    // 用 MB 显示而非 GB：threshold 可能是 2.5GiB，按 GB 整除会截断成 "2GB"，
+                    // 与真实阈值不符（审计发现的次要问题）。
+                    disk.Detail = "可用空间不足 " + (threshold / 1024 / 1024) + " MB，无法安装完整组件";
+                }
             }
             catch (Exception ex) { disk.State = DetectState.Unknown; disk.Detail = ex.Message; }
             list.Add(disk);
@@ -370,19 +423,51 @@ namespace OfficeAgent.Core
         {
             DetectItem it = new DetectItem();
             it.Id = id; it.Name = name; it.Order = order; it.NeedAdmin = true;
-            bool has = HasHotfix(id.ToUpperInvariant());
-            it.State = has ? DetectState.Ok : DetectState.Missing;
-            it.FixKey = has ? null : fixKey;
-            it.Detail = has ? "已安装" : "离线包 payload\\kb（wusa 静默安装）";
+            HotfixState st = QueryHotfix(id.ToUpperInvariant());
+            if (st == HotfixState.Present)
+            {
+                it.State = DetectState.Ok;
+                it.FixKey = null;
+                it.Detail = "已安装";
+            }
+            else if (st == HotfixState.Absent)
+            {
+                it.State = DetectState.Missing;
+                it.FixKey = fixKey;
+                it.Detail = "离线包 payload\\kb（wusa 静默安装）";
+            }
+            else
+            {
+                // 查询不可用（WMI 超时/服务未起）：**不能判 Missing**。
+                // 判 Missing 的后果很严重：它会被写进"已提示缺失项"指纹，
+                // 下次 WMI 正常时集合变化 → 又弹修复窗口，用户被反复打断
+                //（低配 Win7 上 WMI 首次查询超时是常态）。判 Unknown 则不参与闸门。
+                it.State = DetectState.Unknown;
+                it.FixKey = null;
+                it.Detail = "无法确认（WMI 查询失败；稍后重试或手动确认）";
+            }
             list.Add(it);
         }
 
         // ---------- 原子检测方法 ----------
 
+        // 热修检测的三态结果。区分"确实没装"与"查不出来"是关键：
+        // 前者该提示安装，后者只应显示为未知，绝不能当作缺失去驱动修复提示。
+        public enum HotfixState { Present, Absent, Unavailable }
+
         static List<string> hotfixCache = null;
+
+        // 磁盘检测的迟滞状态：记住"上次是否判为空间不足"，避免在阈值上下抖动
+        static bool diskWasLow = false;
 
         // 一次 WMI 查询枚举全部热修并缓存（低配机优化：避免每个 KB 各跑一遍 WMI，4 次→1 次）
         public static bool HasHotfix(string kbId)
+        {
+            return QueryHotfix(kbId) == HotfixState.Present;
+        }
+
+        // 三态查询：Present=已安装；Absent=确认未安装；Unavailable=查不出来（不缓存，可重试）
+        public static HotfixState QueryHotfix(string kbId)
         {
             if (hotfixCache == null)
             {
@@ -405,13 +490,13 @@ namespace OfficeAgent.Core
                     }
                     hotfixCache = ids;
                 }
-                catch { return false; }   // 查询失败不缓存，下次可重试
+                catch { return HotfixState.Unavailable; }   // 查询失败不缓存，下次可重试
             }
             foreach (string s in hotfixCache)
             {
-                if (string.Equals(s, kbId, StringComparison.OrdinalIgnoreCase)) return true;
+                if (string.Equals(s, kbId, StringComparison.OrdinalIgnoreCase)) return HotfixState.Present;
             }
-            return false;
+            return HotfixState.Absent;
         }
 
         static int Net48Release()

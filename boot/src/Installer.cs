@@ -36,8 +36,13 @@ namespace OfficeAgent.Boot
                         return InstallMsu(root, "payload/kb/windows6.1-kb3020369-x64.msu",
                             "e9fbb6b43c6fb9c1dcc8864bb7a35f29e4002830f3acbb93e0e717ae653fe76a");
                     case "install_kb3140245":
-                        // KB3140245 的硬前置是 KB3020369（缺它 wusa 报 0x80242017）——此处自愈兜底
-                        if (!EnvDetect.HasHotfix("KB3020369") && EnvDetect.Is64OS())
+                        // KB3140245 的硬前置是 KB3020369（缺它 wusa 报 0x80242017）——此处自愈兜底。
+                        // 只在**确认已装**时跳过；Absent（确实没装）与 Unavailable（WMI 查不出来）
+                        // 都进入安装分支：重装已存在的 KB 是幂等安全的（wusa 返回 2359302 视为成功，
+                        // 见 InterpretInstallExit），而漏装前置会真失败。所以这里保守装一下是对的。
+                        // 注意不要写成 !HasHotfix(...)：新语义下 false 同时代表"没装"和"查不出来"，
+                        // 虽然在本处结论相同，但显式三态更不容易被后人改错。
+                        if (EnvDetect.QueryHotfix("KB3020369") != EnvDetect.HotfixState.Present && EnvDetect.Is64OS())
                         {
                             string ssuErr = InstallMsu(root, "payload/kb/windows6.1-kb3020369-x64.msu",
                                 "e9fbb6b43c6fb9c1dcc8864bb7a35f29e4002830f3acbb93e0e717ae653fe76a");

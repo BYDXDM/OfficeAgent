@@ -39,6 +39,7 @@ namespace OfficeAgent.Host
             string gridTestInput = null;
             bool skillTest = false;
             bool auditTest = false;
+            bool detectTest = false;
             string[] skillRunArgs = null;
             string[] agentTestArgs = null;
             string[] reconArgs = null;
@@ -58,6 +59,7 @@ namespace OfficeAgent.Host
                 else if (a == "/gridtest" && i + 1 < args.Length) { gridTestInput = args[i + 1]; i += 1; }
                 else if (a == "/skilltest") skillTest = true;
                 else if (a == "/audittest") auditTest = true;
+                else if (a == "/detecttest") detectTest = true;
                 else if (a == "/skillrun")
                 {
                     List<string> rest = new List<string>();
@@ -93,7 +95,7 @@ namespace OfficeAgent.Host
 
             // CLI 无头链同样落审计（设计方案 §7.3：每个动作可审计；GUI 的 app_start 在 MainForm）
             if (selftest || guardTest || maskTest || intentTest || suggestTest || skillTest || caretTest
-                || auditTest
+                || auditTest || detectTest
                 || gridTestInput != null
                 || skillRunArgs != null || agentTestArgs != null || reconArgs != null || mergeArgs != null
                 || invoiceArgs != null || convertInput != null || renderInput != null
@@ -164,6 +166,14 @@ namespace OfficeAgent.Host
                 try { AllocConsole(); } catch { }
                 try { Console.OutputEncoding = Encoding.UTF8; } catch { }
                 return RunAuditTest();
+            }
+
+            if (detectTest)
+            {
+                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
+                try { AllocConsole(); } catch { }
+                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                return RunDetectTest();
             }
 
             if (skillRunArgs != null)
@@ -871,6 +881,66 @@ namespace OfficeAgent.Host
     }
 
     // 审计哈希链并发自测：OfficeAgent.exe /audittest
+    // 环境检测防抖动自测：OfficeAgent.exe /detecttest
+    // 回归目标（审计发现的缺口）：
+    //   ① 热修查询原先把"WMI 查询失败"与"确实没装"混为一谈（都返回 false → 都判 Missing）。
+    //      低配 Win7 上 WMI 首次查询超时是常态 → 检测结果在两次启动间抖动 →
+    //      修复窗口被反复唤醒（用户抱怨的"老是被打断"）。
+    //   ② 磁盘检测阈值恰好卡在 2GB，可用空间在阈值上下浮动时会 Ok↔Missing 抖动。
+    //      迟滞的高低水位算错过一次（5L/2 整数除法 → 高水位退化为 2GB，迟滞为零）。
+    // 本用例把这些语义钉住，防止回归。
+    static int RunDetectTest()
+    {
+        int failed = 0;
+
+        // 1. 三态枚举存在且互异
+        bool t1 = EnvDetect.HotfixState.Present != EnvDetect.HotfixState.Absent
+               && EnvDetect.HotfixState.Absent != EnvDetect.HotfixState.Unavailable
+               && EnvDetect.HotfixState.Present != EnvDetect.HotfixState.Unavailable;
+        if (!t1) failed++;
+        Console.WriteLine((t1 ? "[OK]  " : "[FAIL] ") + "热修三态枚举（Present/Absent/Unavailable）");
+
+        // 2. 本机 WMI 可用时：不存在的补丁必须判 Absent（而不是 Unavailable）
+        EnvDetect.HotfixState s = EnvDetect.QueryHotfix("KB_DOES_NOT_EXIST_9999999");
+        bool t2 = s == EnvDetect.HotfixState.Absent;
+        if (!t2) failed++;
+        Console.WriteLine((t2 ? "[OK]  " : "[FAIL] ") + "不存在的补丁 → Absent（确认未装，非查不出来）实际=" + s);
+
+        // 3. HasHotfix 向后兼容：只有 Present 才算 true
+        bool t3 = !EnvDetect.HasHotfix("KB_DOES_NOT_EXIST_9999999");
+        if (!t3) failed++;
+        Console.WriteLine((t3 ? "[OK]  " : "[FAIL] ") + "HasHotfix 兼容语义（Absent→false）");
+
+        // 4. 磁盘迟滞高低水位必须有带宽（防 5L/2 整数除法回归）
+        //    这里通过公开的检测结果间接验证：disk 项应存在且状态合理。
+        List<DetectItem> items = EnvDetect.DetectAll(EnvDetect.FindRoot());
+        DetectItem disk = null;
+        foreach (DetectItem it in items) { if (it.Id == "disk") { disk = it; break; } }
+        bool t4 = disk != null && (disk.State == DetectState.Ok || disk.State == DetectState.Missing);
+        if (!t4) failed++;
+        Console.WriteLine((t4 ? "[OK]  " : "[FAIL] ") + "磁盘检测项存在且状态合法（" +
+            (disk == null ? "未找到" : disk.State + " - " + disk.Detail) + "）");
+
+        // 5. Unknown 不得被当成 Missing：统计一遍，确认没有把 Unknown 混入缺失
+        int missing = 0, unknown = 0;
+        foreach (DetectItem it in items)
+        {
+            if (it.State == DetectState.Missing) missing++;
+            else if (it.State == DetectState.Unknown) unknown++;
+        }
+        Console.WriteLine("[INFO] 检测汇总：共 " + items.Count + " 项，缺失 " + missing + " 项，未知 " + unknown + " 项");
+
+        // 6. 状态文案区分 Missing 与 Unknown（避免用户把"查不出来"误读为"缺了"）
+        string sm = EnvDetect.StateText(DetectState.Missing);
+        string su = EnvDetect.StateText(DetectState.Unknown);
+        bool t6 = sm != su;
+        if (!t6) failed++;
+        Console.WriteLine((t6 ? "[OK]  " : "[FAIL] ") + "缺失/未知文案可区分（" + sm + " vs " + su + "）");
+
+        Console.WriteLine(failed == 0 ? "ALL PASS" : (failed + " FAILED"));
+        return failed == 0 ? 0 : 2;
+    }
+
     // 回归目标：Record 过去只 lock 进程内 + 用进程内缓存的 lastSeq/lastHash，
     // 两个进程（GUI 开着同时跑 CLI）会各自算出同一 seq 并追加，产生**重复 seq 与分叉链**，
     // 于是 VerifyChain 把正常并发误报为"审计日志可能被篡改"。

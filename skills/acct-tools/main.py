@@ -132,18 +132,43 @@ def to_num(v):
 
 
 def find_col(header, names):
-    """按同义词找列下标；未命中返回 -1。"""
+    """按同义词找列下标；未命中返回 -1。
+
+    ★ 匹配优先级（回归修复）：科目余额表常同时含「期初借方/期初贷方/本期借方/本期贷方/
+      期末借方/期末贷方」六列，全部含「借方」或「贷方」字样。旧实现"退一步用包含匹配，
+      返回第一个命中列"，于是 c_debit 命中「期初借方」、c_credit 命中「期初贷方」——
+      技能悄悄读了期初列而不是用户以为的本期/期末列，符号与金额全错。
+    现在的顺序：
+      1) 完全相等（忽略大小写与首尾空白）—— 最可靠
+      2) 包含匹配，但**按 names 的书写顺序**优先：调用方把最想要的写法放前面，
+         如 ["本期借方","借方"] 会先找「本期借方」，找不到才退化到含「借方」的列
+      3) 包含匹配时优先**更短的表头**：在多个候选里，"借方"（2字）比"期初借方"（4字）
+         更可能是通用列；但这条只在同名前缀下生效，故放在第 2 条之后作为并列打破规则
+    """
+    def norm(s):
+        return (s or "").strip().lower()
+
+    # 1) 完全相等
     for i, h in enumerate(header):
-        hs = (h or "").strip().lower()
+        hs = norm(h)
         for n in names:
-            if hs == n.lower():
+            if hs == norm(n):
                 return i
-    # 退一步：包含匹配
-    for i, h in enumerate(header):
-        hs = (h or "").strip().lower()
-        for n in names:
-            if n.lower() in hs:
-                return i
+
+    # 2) 按 names 顺序做包含匹配（先试最具体的写法）
+    for n in names:
+        nl = norm(n)
+        if not nl:
+            continue
+        best = -1
+        for i, h in enumerate(header):
+            hs = norm(h)
+            if nl in hs:
+                # 同一次 names 尝试内出现多个候选：取表头更短的（更通用）
+                if best < 0 or len(hs) < len(norm(header[best])):
+                    best = i
+        if best >= 0:
+            return best
     return -1
 
 
@@ -165,9 +190,13 @@ def parse_date(v):
 # ---------------- 试算平衡 ----------------
 
 def do_trial_balance(header, rows, params):
-    c_subj = find_col(header, ["科目", "科目名称", "account", "subject", "会计科目"])
-    c_debit = find_col(header, ["借方", "借方金额", "debit", "借"])
-    c_credit = find_col(header, ["贷方", "贷方金额", "credit", "贷"])
+    c_subj = find_col(header, ["科目名称", "会计科目", "科目", "account", "subject"])
+    # 列优先级（回归修复）：科目余额表常同时含期初/本期/期末三组借贷列。
+    # 试算平衡的业务含义是"核对期末余额"，故优先取期末，其次取不带期间前缀的通用列，
+    # 最后才退化到期初/本期。旧实现按"第一个包含命中"取列，会静默读到期初列，
+    # 导致金额与方向全错（实测：成本/费用科目被算成负的借方合计、方向判成"贷"）。
+    c_debit = find_col(header, ["期末借方", "期末余额借方", "借方余额", "借方", "借方金额", "debit", "借"])
+    c_credit = find_col(header, ["期末贷方", "期末余额贷方", "贷方余额", "贷方", "贷方金额", "credit", "贷"])
     if c_subj < 0:
         return None, "未找到「科目」列（可用表头：科目/科目名称/account/subject）"
     if c_debit < 0 and c_credit < 0:
@@ -485,8 +514,18 @@ def do_statements(params):
     paid_in = -get(["实收资本", "股本"])
     surplus = -get(["盈余公积"])
     retained = -get(["本年利润", "未分配利润", "利润分配"])
-    # 未分配利润是贷方余额；本期净利若未结转，也计入权益
-    total_equity = paid_in + surplus + retained + net_profit
+    # ★ 本期净利只在**尚未结转**时计入权益（回归修复）。
+    #   期末余额表若已含「本年利润」科目（本期净利已结转过去），再叠加 net_profit 就是
+    #   重复计入 —— 实测：本年利润 35000 已入表，又加了一次净利 35000，导致
+    #   负债+权益虚增 35000，资产负债表自报"不平（差 -35000）"，而数据本身是平的。
+    #   判据：表里根本没出现利润类科目（retained == 0 且没有该科目的行）才补加。
+    has_retained_subject = False
+    for it in items:
+        nm = str(it.get("科目") or it.get("name") or "").strip()
+        if nm in ("本年利润", "未分配利润", "利润分配"):
+            has_retained_subject = True
+            break
+    total_equity = paid_in + surplus + retained + (0.0 if has_retained_subject else net_profit)
 
     balance_rows = [
         ["资产", ""],
@@ -1292,27 +1331,74 @@ def main():
         if action in ("statements", "报表", "fs"):
             items = params.get("items")
             if not items and inputs:
-                # 没有直接给 items：从输入表读「科目/余额」列
+                # 没有直接给 items：从输入表构造。
+                # 支持两种真实表形态（回归修复）：
+                #   A) 单一「余额」列 + 可选「方向」列
+                #   B) 借贷分列（期末借方/期末贷方，或通用 借方/贷方）
+                # 旧实现只认 A，且在没有「方向」列时**默认全部按借方**——真实余额表多为
+                # 借贷分列，模型只好自己拼一张"标准表"，结果负债/权益科目全被当成借方，
+                # 资产负债表出现负的负债合计（实测：资产 650000 vs 负债+权益 -650000，
+                # 差 1300000，模型据此报告"报表不平衡"）。
                 header, rows = read_table(inputs[0], params.get("sheet"), params.get("headerRow") or 1)
-                c_subj = find_col(header, ["科目", "科目名称", "subject", "account"])
+                c_subj = find_col(header, ["科目名称", "会计科目", "科目", "subject", "account"])
+                # 科目代码列（可选）：用于识别损益类科目（6 开头），决定取期末余额还是本期发生额。
+                # 「科目代码」必须排在「科目」之前试——否则包含匹配会命中的是"科目代码"之外的列。
+                c_code = find_col(header, ["科目代码", "科目编码", "代码", "code"])
                 c_amt = find_col(header, ["余额", "金额", "amount", "balance"])
                 c_dir = find_col(header, ["方向", "借贷", "dir"])
-                if c_subj < 0 or c_amt < 0:
-                    print(json.dumps({"ok": False, "message": "需要「科目」与「余额」列（或直接传 items）",
+                # 借贷分列：优先期末，退化到通用借贷列
+                c_dr = find_col(header, ["期末借方", "借方余额", "借方", "debit"])
+                c_cr = find_col(header, ["期末贷方", "贷方余额", "贷方", "credit"])
+                # 本期发生额列：损益类科目期末余额为 0（已结转），利润表必须取本期发生额，
+                # 否则利润表全是 0（实测：模型据此报告"利润表计算准确"但数字全空）。
+                c_cur_dr = find_col(header, ["本期借方", "本期发生额借方", "发生额借方"])
+                c_cur_cr = find_col(header, ["本期贷方", "本期发生额贷方", "发生额贷方"])
+                split_mode = (c_amt < 0) and (c_dr >= 0 or c_cr >= 0)
+                if c_subj < 0 or (c_amt < 0 and not split_mode):
+                    print(json.dumps({"ok": False, "message": "需要「科目」加「余额」列，或「科目」加借贷分列（借方/贷方）",
                                       "data": {"header": header}}, ensure_ascii=False))
                     return 1
                 items = []
                 for r in rows:
                     subj = str(r[c_subj]).strip() if c_subj < len(r) and r[c_subj] is not None else ""
-                    if not subj:
+                    # 跳过表头重复行与常见合计行（否则会被当科目计入，虚增金额）
+                    if not subj or subj in ("科目", "科目名称", "合计", "总计", "小计"):
                         continue
-                    amt = to_num(r[c_amt]) if c_amt < len(r) else None
-                    if amt is None:
-                        continue
-                    d = "借"
-                    if c_dir >= 0 and c_dir < len(r) and r[c_dir]:
-                        d = str(r[c_dir]).strip()
-                    items.append({"科目": subj, "金额": amt, "方向": d})
+                    # 科目代码列（若存在）用于判断损益类；没有代码时按名称判断
+                    code = ""
+                    if c_code >= 0 and c_code < len(r) and r[c_code] is not None:
+                        code = str(r[c_code]).strip()
+                    is_pl = code.startswith("6") or any(
+                        k in subj for k in ("收入", "成本", "费用", "税金及附加", "所得税"))
+                    if split_mode:
+                        if is_pl and (c_cur_dr >= 0 or c_cur_cr >= 0):
+                            # 损益类取本期发生额
+                            dv = to_num(r[c_cur_dr]) if (c_cur_dr >= 0 and c_cur_dr < len(r)) else None
+                            cv = to_num(r[c_cur_cr]) if (c_cur_cr >= 0 and c_cur_cr < len(r)) else None
+                        else:
+                            dv = to_num(r[c_dr]) if (c_dr >= 0 and c_dr < len(r)) else None
+                            cv = to_num(r[c_cr]) if (c_cr >= 0 and c_cr < len(r)) else None
+                        dv = dv or 0.0
+                        cv = cv or 0.0
+                        if dv == 0.0 and cv == 0.0:
+                            continue
+                        # 净额口径：借正贷负
+                        amt = dv - cv
+                        if amt == 0.0:
+                            continue
+                        items.append({"科目": subj, "金额": abs(amt), "方向": "借" if amt > 0 else "贷"})
+                    else:
+                        amt = to_num(r[c_amt]) if c_amt < len(r) else None
+                        if amt is None:
+                            continue
+                        d = ""
+                        if c_dir >= 0 and c_dir < len(r) and r[c_dir]:
+                            d = str(r[c_dir]).strip()
+                        if not d:
+                            # 没有方向列：按金额符号推断（负数为贷方），而不是一律当借方
+                            d = "借" if amt >= 0 else "贷"
+                            amt = abs(amt)
+                        items.append({"科目": subj, "金额": amt, "方向": d})
                 params["items"] = items
             data, err = do_statements(params)
             if err:

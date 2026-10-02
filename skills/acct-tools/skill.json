@@ -5,7 +5,7 @@
   "host": "1.0.0",
   "runtime": "python38",
   "entry": "main.py",
-  "scenarios": "试算平衡,科目余额,账龄,折旧,会计,记账,增值税,凭证,报表,合并,银行余额调节,年终奖",
+  "scenarios": "试算平衡,科目余额,账龄,折旧,会计,记账,增值税,凭证,报表,合并,银行余额调节,年终奖,对账,勾稽,流水核对,表格核对",
   "actions": "trial-balance|从科目余额表生成试算平衡表并校验借贷是否相等;bonus|年终奖个税测算，按除以12定档，不并入综合所得;payroll|工资表个税与社保测算;bank-recon|银行余额调节表;consolidation|合并报表与内部交易抵消;journal|记账凭证汇总;vat|增值税测算，一般计税与简易计税;statements|资产负债表与利润表;depreciation|固定资产折旧测算，直线法;aging|应收账款账龄分析",
   "actionParams": "trial-balance:inputs:file[]:required:科目余额表 xlsx/csv 绝对路径;bonus:bonus:number:required:年终奖金额;payroll:inputs:file[]:required:工资表 xlsx/csv;bank-recon:inputs:file[]:required:银行流水与日记账;consolidation:inputs:file[]:required:各公司报表;journal:inputs:file[]:required:分录数据;vat:sales:number:required:销售额;vat:purchases:number:required:采购额;statements:inputs:file[]:required:科目余额表;depreciation:cost:number:required:原值;depreciation:salvage:number:optional:残值;depreciation:years:number:required:年限;aging:inputs:file[]:required:应收账款明细",
   "depsTools": "",

@@ -38,6 +38,7 @@ namespace OfficeAgent.Host
             bool suggestTest = false;
             bool caretTest = false;
             bool toolidTest = false;
+            bool formulaTest = false;
             string gridTestInput = null;
             bool skillTest = false;
             bool auditTest = false;
@@ -62,6 +63,7 @@ namespace OfficeAgent.Host
                 else if (a == "/suggesttest") suggestTest = true;
                 else if (a == "/carettest") caretTest = true;
                 else if (a == "/toolidtest") toolidTest = true;
+                else if (a == "/formulatest") formulaTest = true;
                 else if (a == "/gridtest" && i + 1 < args.Length) { gridTestInput = args[i + 1]; i += 1; }
                 else if (a == "/skilltest") skillTest = true;
                 else if (a == "/audittest") auditTest = true;
@@ -104,7 +106,7 @@ namespace OfficeAgent.Host
 
             // CLI 无头链同样落审计（设计方案 §7.3：每个动作可审计；GUI 的 app_start 在 MainForm）
             if (selftest || guardTest || maskTest || intentTest || suggestTest || skillTest || caretTest
-                || auditTest || detectTest || bridgeTest || planTest || perfTest || toolidTest
+                || auditTest || detectTest || bridgeTest || planTest || perfTest || toolidTest || formulaTest
                 || gridTestInput != null
                 || skillRunArgs != null || agentTestArgs != null || reconArgs != null || mergeArgs != null
                 || invoiceArgs != null || convertInput != null || renderInput != null
@@ -167,6 +169,14 @@ namespace OfficeAgent.Host
                 try { AllocConsole(); } catch { }
                 try { Console.OutputEncoding = Encoding.UTF8; } catch { }
                 return RunToolIdTest();
+            }
+
+            if (formulaTest)
+            {
+                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
+                try { AllocConsole(); } catch { }
+                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                return RunFormulaTest();
             }
 
             if (skillTest)
@@ -437,6 +447,151 @@ namespace OfficeAgent.Host
 
             Console.WriteLine(failed == 0 ? "toolidtest ALL PASS" : ("toolidtest FAILED=" + failed));
             return failed == 0 ? 0 : 2;
+        }
+
+        // /formulatest —— create_formula_workbook + excel_formula_reference 无头回归（不连网、不开 Excel）。
+        // 验证：① JsonVal 嵌套解析；② 三模板生成的 xlsx 公式落位（zip 内 XML 直读）；
+        //       ③ workbook.xml 带 calcPr fullCalcOnLoad（无缓存值公式打开即重算的前提）；
+        //       ④ 自由模式 formulaCols/summary 的 SUMIF 跨表引用；⑤ 公式库查询与 schema JSON 合法性。
+        static int RunFormulaTest()
+        {
+            int failed = 0;
+            Action<string, bool> check = delegate(string name, bool cond)
+            {
+                Console.WriteLine((cond ? "  ok    " : "  FAIL  ") + name);
+                if (!cond) failed++;
+            };
+            string dir = Path.Combine(Path.GetTempPath(), "oa_formulatest");
+            try { Directory.CreateDirectory(dir); } catch { }
+            if (!Directory.Exists(dir)) { Console.WriteLine("  FAIL  无法创建临时目录 " + dir); return 2; }
+
+            // ① JsonVal：嵌套 + 转义 + 数字/布尔
+            try
+            {
+                Dictionary<string, object> o = JsonVal.ParseObject(
+                    "{\"name\":\"表A\",\"n\":2.5,\"ok\":true,\"rows\":[[\"a\",\"x=\\\"y\\\"\"],[]]}");
+                check("JsonVal 嵌套解析", o["name"] as string == "表A" &&
+                    (double)o["n"] == 2.5 && (bool)o["ok"] == true &&
+                    (JsonVal.List(o, "rows") as List<object>).Count == 2);
+            }
+            catch (Exception ex) { check("JsonVal 嵌套解析（异常: " + ex.Message + "）", false); }
+
+            // ② 工资表模板
+            string payroll = Path.Combine(dir, "工资表-2026年1月.xlsx");
+            bool ok1;
+            string r1 = FormulaWorkbook.Create("{\"path\":\"" + payroll.Replace("\\", "\\\\") +
+                "\",\"template\":\"payroll\",\"rows\":\"张三,财务,8000,1000,500\\n李四,销售,6000,800,0\\n王五,库房,5000,0,300\"}", out ok1);
+            check("工资表生成成功", ok1 && File.Exists(payroll));
+            if (ok1)
+            {
+                string wb = ReadZipEntry(payroll, "xl/workbook.xml");
+                check("workbook.xml 含 calcPr fullCalcOnLoad", wb != null && wb.Contains("fullCalcOnLoad"));
+                string s2 = ReadZipEntry(payroll, "xl/worksheets/sheet2.xml");
+                check("工资表公式：社保引用参数!B5", s2 != null && s2.Contains("*参数!B5"));
+                check("工资表公式：个税月度税率 IF 链", s2 != null && (s2.Contains("J2&lt;=12000") || s2.Contains("J3&lt;=12000")));
+                check("工资表公式：应纳税所得额 MAX 守卫", s2 != null && s2.Contains("MAX(0,G2-参数!B7"));
+                check("工资表合计行 SUM", s2 != null && s2.Contains("SUM(D2:D"));
+                check("工资表空白行 IF 守卫（不显示 0）", s2 != null && s2.Contains("IF(B54="));
+            }
+
+            // ③ 增值税台账
+            string vat = Path.Combine(dir, "增值税台账.xlsx");
+            bool ok2;
+            string r2 = FormulaWorkbook.Create("{\"path\":\"" + vat.Replace("\\", "\\\\") +
+                "\",\"template\":\"vat\",\"rows\":\"2026-01-05,销售甲产品,销项,113000,0.13\\n2026-01-08,采购原材料,进项,56500,0.13\"}", out ok2);
+            check("增值税台账生成成功", ok2 && File.Exists(vat));
+            if (ok2)
+            {
+                string s2 = ReadZipEntry(vat, "xl/worksheets/sheet2.xml");
+                check("增值税汇总 SUMIF 跨表引用", s2 != null && s2.Contains("SUMIF(台账!C2:C") && s2.Contains("台账!F2:F"));
+                check("增值税应纳税额=销项-进项", s2 != null && s2.Contains("ROUND(B3-B5,2)"));
+                string s1 = ReadZipEntry(vat, "xl/worksheets/sheet1.xml");
+                check("台账税额=金额×税率", s1 != null && s1.Contains("ROUND(D2*E2,2)"));
+            }
+
+            // ④ 流水账
+            string ledger = Path.Combine(dir, "流水账.xlsx");
+            bool ok3;
+            string r3 = FormulaWorkbook.Create("{\"path\":\"" + ledger.Replace("\\", "\\\\") +
+                "\",\"template\":\"ledger\",\"params\":\"openingBalance=1000\",\"rows\":\"2026-01-01,收房租,房租收入,3000,0\\n2026-01-03,买菜,餐饮,0,120\"}", out ok3);
+            check("流水账生成成功", ok3 && File.Exists(ledger));
+            if (ok3)
+            {
+                string s2 = ReadZipEntry(ledger, "xl/worksheets/sheet2.xml");
+                check("流水余额=期初+扩张区间SUM", s2 != null && s2.Contains("参数!B2+SUM($D$2:D2)") && s2.Contains("SUM($E$2:E"));
+                string s3 = ReadZipEntry(ledger, "xl/worksheets/sheet3.xml");
+                check("流水分类 SUMIF", s3 != null && s3.Contains("SUMIF(流水!C2:C"));
+                check("流水期末结余公式", s3 != null && s3.Contains("ROUND(B2-B3+参数!B2,2)"));
+            }
+
+            // ⑤ 自由模式：formulaCols + summary
+            string free = Path.Combine(dir, "自由表.xlsx");
+            bool ok4;
+            string spec = "{\"path\":\"" + free.Replace("\\", "\\\\") +
+                "\",\"sheets\":[{\"name\":\"明细\",\"header\":[\"类别\",\"数量\",\"单价\",\"金额\"]," +
+                "\"rows\":[[\"办公用品\",10,25],[\"交通费\",3,50]]," +
+                "\"formulaCols\":[{\"col\":\"D\",\"formula\":\"=B{r}*C{r}\"}],\"blankRows\":10,\"totalRow\":true,\"widths\":[12,8,8,12]}]," +
+                "\"summary\":\"{\\\"source\\\":\\\"明细\\\",\\\"groupCol\\\":\\\"A\\\",\\\"labelHeader\\\":\\\"类别\\\",\\\"sumCols\\\":[{\\\"col\\\":\\\"D\\\",\\\"header\\\":\\\"金额\\\"}]}\"}";
+            string r4 = FormulaWorkbook.Create(spec, out ok4);
+            check("自由模式生成成功", ok4 && File.Exists(free));
+            if (ok4)
+            {
+                string s1 = ReadZipEntry(free, "xl/worksheets/sheet1.xml");
+                check("自由公式列 {r} 展开为行号", s1 != null && s1.Contains("B2*C2") && s1.Contains("B12*C12"));
+                string s2 = ReadZipEntry(free, "xl/worksheets/sheet2.xml");
+                check("自由汇总 SUMIF('明细'!) 引用", s2 != null && s2.Contains("SUMIF('明细'!A2:A14,A2,'明细'!D2:D14)"));
+            }
+
+            // ⑥ 参数不合法的友好报错
+            bool okBad;
+            string bad = FormulaWorkbook.Create("{\"path\":\"" + Path.Combine(dir, "bad.xlsx").Replace("\\", "\\\\") +
+                "\",\"template\":\"unknown\"}", out okBad);
+            check("未知模板给友好报错", !okBad && bad.Contains("未知模板"));
+
+            // ⑦ 公式库
+            bool okc1, okc2, okc3, okc4;
+            string cat = FormulaReference.Lookup(null, null, null, out okc1);
+            check("公式库分类概览", okc1 && cat.Contains("财务会计") && cat.Contains("共 "));
+            string hit = FormulaReference.Lookup(null, null, "VLOOKUP", out okc2);
+            check("公式库按名查 VLOOKUP", okc2 && hit.Contains("VLOOKUP") && hit.Contains("查找区域"));
+            string taxHit = FormulaReference.Lookup("个税", null, null, out okc3);
+            check("公式库关键词查个税", okc3 && taxHit.Contains("速算"));
+            string miss = FormulaReference.Lookup("不存在的公式xyz", null, null, out okc4);
+            check("公式库未命中不算失败", okc4 && miss.Contains("未找到"));
+
+            // ⑧ SchemasJson 含新工具且整体是合法 JSON
+            try
+            {
+                object parsed = JsonVal.Parse(AgentTools.SchemasJson(true));
+                List<object> arr = parsed as List<object>;
+                bool hasFw = false, hasRef = false;
+                foreach (object it in arr)
+                {
+                    Dictionary<string, object> d = it as Dictionary<string, object>;
+                    if (d == null) continue;
+                    Dictionary<string, object> f = JsonVal.Obj(d, "function");
+                    string fn = f == null ? "" : JsonVal.Str(f, "name");
+                    if (fn == "create_formula_workbook") hasFw = true;
+                    if (fn == "excel_formula_reference") hasRef = true;
+                }
+                check("SchemasJson 是合法 JSON 且含两个新工具", arr != null && arr.Count >= 8 && hasFw && hasRef);
+            }
+            catch (Exception ex) { check("SchemasJson JSON 合法性（异常: " + ex.Message + "）", false); }
+
+            Console.WriteLine(failed == 0 ? "formulatest ALL PASS" : ("formulatest FAILED=" + failed));
+            return failed == 0 ? 0 : 2;
+        }
+
+        // 读 zip 内条目文本（自测专用；失败返回 null）
+        static string ReadZipEntry(string xlsxPath, string entryName)
+        {
+            try
+            {
+                using (MiniZipFile zf = MiniZipFile.OpenRead(xlsxPath))
+                using (StreamReader sr = new StreamReader(zf.OpenEntry(entryName), Encoding.UTF8))
+                    return sr.ReadToEnd();
+            }
+            catch { return null; }
         }
 
         static int RunCaretTest()

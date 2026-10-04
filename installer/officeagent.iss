@@ -6,7 +6,7 @@
 ; File must be saved as UTF-8 with BOM (Inno requirement for non-ASCII).
 
 #define AppName "OfficeAgent"
-#define AppVersion "0.7.2"
+#define AppVersion "0.8.0"
 #define AppPublisher "OfficeAgent Project"
 
 [Setup]
@@ -40,6 +40,9 @@ Source: "..\build\host\pdfium.dll"; DestDir: "{app}\host"; Flags: ignoreversion
 Source: "..\store\components.ini"; DestDir: "{app}\store"; Flags: ignoreversion
 Source: "..\store\wheels-requirements.txt"; DestDir: "{app}\store"; Flags: ignoreversion
 Source: "..\skills\*"; DestDir: "{app}\skills"; Flags: ignoreversion recursesubdirs createallsubdirs
+; 内置资源模板（make-ppt 的 PPT 模板 / excel-formulas.json 公式大全）。
+; 0.7.x 漏打包 templates 导致全新安装的 create_presentation 找不到模板——两个 SKU 都必须带。
+Source: "..\templates\*"; DestDir: "{app}\templates"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\tests\fixtures\recon\flow.csv"; DestDir: "{app}\tests"; Flags: ignoreversion
 Source: "..\tests\fixtures\recon\ledger.csv"; DestDir: "{app}\tests"; Flags: ignoreversion
 #if SKU == "complete"

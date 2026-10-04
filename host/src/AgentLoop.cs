@@ -257,7 +257,7 @@ namespace OfficeAgent.Host
             if (name.StartsWith(SkillToolBridge.Prefix, StringComparison.Ordinal)) return true;
             // 与 AgentTools 的白名单一一对应；新增工具时同步这里，否则默认按"读型"放行（更安全）
             return name == "create_spreadsheet" || name == "create_presentation"
-                || name == "convert_document" || name == "download_file"
+                || name == "create_formula_workbook" || name == "convert_document" || name == "download_file"
                 || name == "repair_environment";
         }
 

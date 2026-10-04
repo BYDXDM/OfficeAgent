@@ -542,13 +542,16 @@ namespace OfficeAgent.Core
                 "</Relationships>";
         }
 
-        // workbook.xml：sheetsXml 为各 <sheet .../> 的拼接
+        // workbook.xml：sheetsXml 为各 <sheet .../> 的拼接。
+        // calcPr fullCalcOnLoad：公式单元格不写缓存值（ReportCell.F），
+        // 没有这个标记 Excel/WPS 打开时可能显示空白而不是重算——带公式模板的关键开关。
         public static string WorkbookXml(string sheetsXml)
         {
             return XmlHead +
                 "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" " +
                 "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">" +
-                "<sheets>" + sheetsXml + "</sheets></workbook>";
+                "<sheets>" + sheetsXml + "</sheets>" +
+                "<calcPr calcId=\"0\" fullCalcOnLoad=\"1\"/></workbook>";
         }
 
         // workbook.xml.rels：relsXml 为各 <Relationship .../> 的拼接

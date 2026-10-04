@@ -1,8 +1,10 @@
 // SetupDialog —— 首次启动/设置向导：填 API 地址与密钥 → 自动获取模型列表 → 测试连通
 // 密钥经 DPAPI 加密保存（AppConfig）；出网经 HostGuard 守卫。
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.IO;
 using System.Threading;
 using System.Windows.Forms;
 
@@ -12,6 +14,7 @@ namespace OfficeAgent.Host
     {
         TextBox txtUrl, txtKey, txtWorkspace;
         ComboBox cmbModel;
+        ComboBox cmbWsDrive;   // 工作区所在磁盘（与目录框同一行）
         // 密钥框占位符：已存密钥时显示，表示"不修改"。用户一旦输入真实内容即视为要替换。
         const string KeyPlaceholder = "●●●●●●●●（已保存，留空则沿用；要更换请直接输入新密钥）";
         bool hasStoredKey = false;
@@ -123,20 +126,40 @@ namespace OfficeAgent.Host
             Controls.Add(chkWeb);
 
             // 工作区目录：全局默认值；侧边栏可为不同项目分别建工作区（各挂一个文件夹）
-            AddLabel("默认工作区目录（新建表格/PPT/下载默认保存在这里；不同项目可在侧边栏右键分别建工作区）", 382);
+            AddLabel("默认工作区目录（建议选非系统盘，如 D 盘——可减少「写入 C 盘」的安全确认；不同项目可在侧边栏右键分别建工作区）", 382);
+            // ★ 磁盘下拉与目录框放在**同一行**：纵向布局不变 → 不影响 e2e.ps1 的坐标点击
+            cmbWsDrive = new ComboBox();
+            cmbWsDrive.DropDownStyle = ComboBoxStyle.DropDownList;
+            cmbWsDrive.Location = new Point(28, 402);
+            cmbWsDrive.Size = new Size(114, 26);
+            Controls.Add(cmbWsDrive);
+            List<string> wsRoots = WorkspacePicker.FillDrives(cmbWsDrive);
+
             txtWorkspace = new TextBox();
-            txtWorkspace.Location = new Point(28, 402);
-            txtWorkspace.Size = new Size(444, 26);
+            txtWorkspace.Location = new Point(148, 402);
+            txtWorkspace.Size = new Size(324, 26);
             try { txtWorkspace.Text = cfg.EffectiveWorkspace(); } catch { txtWorkspace.Text = ""; }
             Controls.Add(txtWorkspace);
+            int wsIdx = WorkspacePicker.IndexOfDrive(wsRoots, txtWorkspace.Text);
+            if (wsIdx >= 0 && wsIdx < cmbWsDrive.Items.Count) cmbWsDrive.SelectedIndex = wsIdx;
+            // 注意：SelectedIndexChanged 必须在初始 SelectedIndex 设置**之后**挂——
+            // 否则初始化时会触发一次"自动改写目录"。
+            cmbWsDrive.SelectedIndexChanged += delegate
+            {
+                if (cmbWsDrive.SelectedIndex < 0 || cmbWsDrive.SelectedIndex >= wsRoots.Count) return;
+                string root = wsRoots[cmbWsDrive.SelectedIndex];
+                string cur = txtWorkspace.Text == null ? "" : txtWorkspace.Text.Trim();
+                string curRoot = "";
+                try { curRoot = Path.GetPathRoot(cur); } catch { }
+                bool same = curRoot != null && curRoot.Length > 0 &&
+                    string.Equals(curRoot.TrimEnd('\\'), root.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
+                if (!same) txtWorkspace.Text = Path.Combine(root, WorkspacePicker.DefaultSubDir);
+            };
+
             Button btnBrowseWs = AddBtn("浏览…", 478, 401, 54, delegate
             {
-                using (FolderBrowserDialog fb = new FolderBrowserDialog())
-                {
-                    fb.Description = "选择工作区目录";
-                    try { fb.SelectedPath = txtWorkspace.Text; } catch { }
-                    if (fb.ShowDialog(this) == DialogResult.OK) txtWorkspace.Text = fb.SelectedPath;
-                }
+                string picked = WorkspacePicker.Pick(this, txtWorkspace.Text, "选择默认工作区位置");
+                if (picked != null) txtWorkspace.Text = picked;
             });
 
             btnSkip = AddBtn(firstRun ? "暂不配置，离线使用" : "取消", 28, 440, 170, delegate { Close(); });

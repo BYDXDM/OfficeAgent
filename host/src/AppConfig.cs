@@ -39,6 +39,11 @@ namespace OfficeAgent.Host
         public bool StreamFinal = true;
         public string WorkspaceDir = "";   // 默认工作区目录：空=文档\OfficeAgentFiles（侧边栏可为项目单独设工作区）
         public string ActiveWorkspaceId = "";   // 当前激活的工作区 id（对应 workspaces.json）
+        // 安全兜底（v0.8.2）：写/删「系统盘文件」或删除「表格文件」前必须用户确认。
+        // SafetyGuard = 总开关（默认开）；SafetyAllowPaths = 用户点"始终允许此目录"后
+        // 累积的目录前缀（分号分隔），命中即不再询问（可在设置页清除）。
+        public bool SafetyGuard = true;
+        public string SafetyAllowPaths = "";
 
         // 实际生效的工作区目录（空配置回退到默认并确保存在）
         public string EffectiveWorkspace()
@@ -179,6 +184,8 @@ namespace OfficeAgent.Host
                 sb.Append("  \"streamFinal\": ").Append(StreamFinal ? "true" : "false").Append(",\n");
                 sb.Append("  \"workspaceDir\": \"").Append(Js(WorkspaceDir)).Append("\",\n");
                 sb.Append("  \"activeWorkspaceId\": \"").Append(Js(ActiveWorkspaceId)).Append("\",\n");
+                sb.Append("  \"safetyGuard\": ").Append(SafetyGuard ? "true" : "false").Append(",\n");
+                sb.Append("  \"safetyAllowPaths\": \"").Append(Js(SafetyAllowPaths)).Append("\",\n");
                 // 按服务分开存的密钥（扁平字段 key:<host>，base64 DPAPI 密文）
                 for (int i = 0; i < ProviderKeys.Count; i++)
                 {
@@ -218,6 +225,9 @@ namespace OfficeAgent.Host
                 if (c.WorkspaceDir == null) c.WorkspaceDir = "";
                 c.ActiveWorkspaceId = JsGet(json, "activeWorkspaceId");
                 if (c.ActiveWorkspaceId == null) c.ActiveWorkspaceId = "";
+                c.SafetyGuard = GetBool(json, "safetyGuard", true);
+                c.SafetyAllowPaths = JsGet(json, "safetyAllowPaths");
+                if (c.SafetyAllowPaths == null) c.SafetyAllowPaths = "";
                 string b64 = JsGet(json, "keyBlob");
                 if (b64 != null && b64.Length > 0)
                 {

@@ -18,6 +18,10 @@ namespace OfficeAgent.Host
         // 工作区目录（MainForm/ChatPanel 在加载/修改配置时同步到这里）。
         // 建表/建 PPT 给相对路径时落在这里；下载文件也存这里。
         public static string WorkspaceRoot = "";
+        // 当前配置（Dispatch 入口赋值）：安全兜底需要读 cfg.SafetyGuard / SafetyAllowPaths。
+        // 直接调用工具函数（如自测里的 FormulaWorkbook.Create）时为 null——
+        // SafetyGuard 对 null 配置按"总开关默认开"处理，行为一致。
+        public static AppConfig Current = null;
         // 最近一次成功产出的文件路径（附件卡片用）
         public static string LastProduct = "";
 
@@ -77,7 +81,8 @@ namespace OfficeAgent.Host
                 "{\"type\":\"function\",\"function\":{\"name\":\"create_presentation\",\"description\":\"创建全新的 PPT 演示文稿（.pptx）。用 outline 参数提供每页内容：页与页之间用 ;; 分隔，每页格式为 标题|要点1;要点2;要点3。path 给文件名（相对路径）时会保存到工作区目录。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"输出的 .pptx 路径（文件名则存到工作区）\"},\"outline\":{\"type\":\"string\",\"description\":\"每页内容：标题|要点1;要点2 ;; 下一页标题|要点\"}},\"required\":[\"path\",\"outline\"]}}}," +
                 "{\"type\":\"function\",\"function\":{\"name\":\"create_formula_workbook\",\"description\":\"生成带公式的 Excel 工作簿（.xlsx），用户填数即自动计算。优先用模板：template=payroll 工资表标准套账（社保/公积金/个税全公式，数据行CSV列序:姓名,部门,基本工资,岗位津贴,加班费）；template=vat 增值税台账（CSV列序:日期,摘要,类型(只填销项/进项),金额(不含税),税率）；template=ledger 流水账（CSV列序:日期,摘要,类别,收入,支出）。模板自带汇总页，改明细汇总自动变；可选 params 覆盖参数（工资表 pensionRate/medicalRate/unemploymentRate/housingFundRate/taxThreshold/blankRows，流水账 openingBalance），如 pensionRate=0.08;housingFundRate=0.12。自由定制用 sheets+summary（规格见参数说明）。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"输出的 .xlsx 路径（文件名则存到工作区）\"},\"template\":{\"type\":\"string\",\"description\":\"payroll|vat|ledger 三选一\"},\"rows\":{\"type\":\"string\",\"description\":\"模板数据行 CSV 文本（列序见模板说明；首行是列名时会被自动忽略）\"},\"params\":{\"type\":\"string\",\"description\":\"可选：参数覆盖 key=value;分号分隔\"},\"sheets\":{\"type\":\"string\",\"description\":\"自由模式（与 template 二选一）：sheets 数组 JSON 文本，每项 {name:表名, header:[列1,列2], rows:[[a,1],[b,2]], formulaCols:[{col:F, formula:=D{r}-E{r}}], blankRows:50, totalRow:true, widths:[10,20]}；{r} 代表当前行号，公式以 = 开头\"},\"summary\":{\"type\":\"string\",\"description\":\"可选（配合 sheets）：汇总页配置 JSON 文本 {source:明细表名, groupCol:C, labelHeader:类别, sumCols:[{col:D, header:收入},{col:E, header:支出}]}——按分组列 SUMIF 自动生成汇总，改明细汇总自动变\"}},\"required\":[\"path\"]}}}," +
                 "{\"type\":\"function\",\"function\":{\"name\":\"excel_formula_reference\",\"description\":\"查询内置 Excel 公式大全（语法+中文说明+示例，离线）。用户问 Excel 公式怎么写、怎么算个税/折旧/条件求和时，先调用本工具查标准语法再回答，不要凭记忆给出可能出错的公式。不带参数时返回全部分类概览。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"keyword\":{\"type\":\"string\",\"description\":\"关键词（模糊匹配名称/语法/说明，如：折旧、查找、求和、个税、账龄）\"},\"category\":{\"type\":\"string\",\"description\":\"精确分类：数学与三角/统计/逻辑/文本/日期与时间/查找与引用/财务会计/其他实用\"},\"name\":{\"type\":\"string\",\"description\":\"公式名（如 VLOOKUP、SUMIF）\"}}}}}," +
-                "{\"type\":\"function\",\"function\":{\"name\":\"repair_environment\",\"description\":\"启动环境修复器（弹 UAC 提权），检测并离线安装缺失的系统组件（KB/.NET/VC++/Python/LibreOffice）。用户需在 UAC 与引导器窗口中确认。\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}" +
+                "{\"type\":\"function\",\"function\":{\"name\":\"repair_environment\",\"description\":\"启动环境修复器（弹 UAC 提权），检测并离线安装缺失的系统组件（KB/.NET/VC++/Python/LibreOffice）。用户需在 UAC 与引导器窗口中确认。\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}," +
+                "{\"type\":\"function\",\"function\":{\"name\":\"delete_file\",\"description\":\"删除一个文件（仅文件，不能删目录）。删除表格类文件（xlsx/xls/csv 等）或位于系统盘的文件时，会先弹出确认框要求用户显式同意；用户拒绝则不删除。删除前请先确认路径正确，不要凭猜测删除。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"要删除的文件的绝对路径\"}},\"required\":[\"path\"]}}}" +
                 "]";
             if (includePlan) s = s.Substring(0, s.Length - 1) + "," + TaskPlanSchema + "]";
             return s;
@@ -100,6 +105,7 @@ namespace OfficeAgent.Host
             ok = true;
             try
             {
+                Current = cfg;   // 安全兜底判定需要配置（总开关/白名单）
                 Dictionary<string, string> a = ParseArgs(argsJson);
                 switch (name)
                 {
@@ -129,6 +135,7 @@ namespace OfficeAgent.Host
                     case "excel_formula_reference":
                         return FormulaReference.Lookup(GetStr(a, "keyword"), GetStr(a, "category"), GetStr(a, "name"), out ok);
                     case "repair_environment": return RepairEnvironment();
+                    case "delete_file": return DeleteFile(GetStr(a, "path"), out ok);
                     default:
                         // 技能工具（skill_<id>_<action>）：投影自技能注册表，见 SkillToolBridge。
                         // 参数只进 request.json（文件），命令行保持编译期字面量。
@@ -327,6 +334,9 @@ namespace OfficeAgent.Host
             string dst = Path.Combine(dir, name);
             if (File.Exists(dst)) dst = Path.Combine(dir,
                 Path.GetFileNameWithoutExtension(name) + "_" + DateTime.Now.ToString("HHmmss") + Path.GetExtension(name));
+            // 安全兜底：下载落盘同样是"写"，写系统盘需确认
+            string dlSafety;
+            if (!SafetyConfirm.Ensure(SafetyOp.Write, dst, cfg, out dlSafety)) return dlSafety;
 
             try
             {
@@ -432,6 +442,9 @@ namespace OfficeAgent.Host
             else if (t == "xlsx") ct = ConvTarget.Xlsx;
             else return "不支持的目标格式: " + t + "（仅 pdf/csv/xlsx）";
             if (conv == null) return "转换引擎未就绪（内部状态异常）。请让用户改用「批量转换」页手动转换，或调用 repair_environment 修复环境后重试。";
+            // 安全兜底：转换产物落在源文件同目录（OutputPathOf），写系统盘需先确认
+            string cvSafety;
+            if (!SafetyConfirm.Ensure(SafetyOp.Write, conv.OutputPathOf(input, ct), Current, out cvSafety)) return cvSafety;
             string outPath;
             string err = conv.Convert(input, ct, out outPath);
             if (err != null) return ExplainConvertError(input, t, err);
@@ -477,6 +490,10 @@ namespace OfficeAgent.Host
             try { p = Path.GetFullPath(p); }
             catch (Exception ex) { err = "输出路径非法: " + ex.Message; return null; }
             if (!p.EndsWith(ext, StringComparison.OrdinalIgnoreCase)) { err = "输出路径必须是 " + ext + " 文件"; return null; }
+            // 安全兜底：写系统盘 / 系统关键目录需用户确认；临时目录与自管目录自动放行。
+            // 放在建目录之前——被拒绝时不留任何痕迹。
+            string safetyErr;
+            if (!SafetyConfirm.Ensure(SafetyOp.Write, p, Current, out safetyErr)) { err = safetyErr; return null; }
             try { string parent = Path.GetDirectoryName(p); if (parent != null && parent.Length > 0) Directory.CreateDirectory(parent); } catch { }
             // 同名文件已存在：自动改名（不改名会静默毁掉用户旧产物）；
             // 不问用户，因为询问要阻塞 agent 的后台线程——详见 AvoidOverwrite 上方注释。
@@ -552,6 +569,50 @@ namespace OfficeAgent.Host
             LastProduct = p;
             AuditLog.Record("file_write", "agent_make_ppt " + p);
             return "已生成 PPT（" + slides.Count + " 页）: " + p;
+        }
+
+        // ---------- delete_file ----------
+        // 删除单个文件（绝不删目录）。安全兜底：表格文件、系统盘文件、系统关键目录
+        // 均经 SafetyConfirm 判定（确认/拒绝）。删除动作**不可逆**，故：
+        //   * 删前把文件大小与修改时间记入审计，便于事后追溯
+        //   * 用户拒绝时返回明确文案，并叮嘱模型不要擅自重试
+        static string DeleteFile(string path, out bool ok)
+        {
+            ok = false;
+            if (path == null || path.Trim().Length == 0) return "缺少 path 参数";
+            string p = path.Trim();
+            if (!Path.IsPathRooted(p)) return "请给出要删除文件的绝对路径（不猜路径）";
+            foreach (string seg in p.Replace('/', '\\').Split('\\'))
+            {
+                if (seg == "..") return "路径不允许包含 ..";
+            }
+            try { p = Path.GetFullPath(p); }
+            catch (Exception ex) { return "路径非法: " + ex.Message; }
+
+            // 只删文件，不删目录（目录删除一律拒绝——破坏面太大）
+            if (Directory.Exists(p)) return "目标是文件夹，delete_file 只能删除文件，不删除目录。";
+            if (!File.Exists(p)) return "文件不存在: " + p;
+
+            long size = -1;
+            string mtime = "";
+            try { FileInfo fi = new FileInfo(p); size = fi.Length; mtime = fi.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss"); } catch { }
+
+            string safetyErr;
+            if (!SafetyConfirm.Ensure(SafetyOp.Delete, p, Current, out safetyErr)) return safetyErr;
+
+            try
+            {
+                File.Delete(p);
+            }
+            catch (Exception ex)
+            {
+                return "删除失败: " + ex.Message + "（若文件正被 Excel/WPS 打开，请先关闭再试）";
+            }
+            ok = true;
+            AuditLog.Record("file_delete", "agent_delete " + p + " (" + size + " bytes, mtime=" + mtime + ")");
+            // 若删的是本回合产物，清掉"最近产物"指针，避免附件卡片指向已删文件
+            try { if (string.Equals(LastProduct, p, StringComparison.OrdinalIgnoreCase)) LastProduct = ""; } catch { }
+            return "已删除文件: " + p + "（原 " + size + " 字节）";
         }
 
         // ---------- repair_environment ----------

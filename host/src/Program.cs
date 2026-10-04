@@ -1,4 +1,4 @@
-// OfficeAgent 主程序入口（.NET Framework 4.8 / Win7 SP1+）
+﻿// OfficeAgent 主程序入口（.NET Framework 4.8 / Win7 SP1+）
 // 参数：/selftest  控制台输出环境检测后退出（M0 冒烟用）
 //       /convert <in> <pdf|csv|xlsx>            无头转换（三级总线）
 //       /renderpdf <in.pdf> <out.png>           无头渲染（pdfium）
@@ -38,6 +38,7 @@ namespace OfficeAgent.Host
             bool suggestTest = false;
             bool caretTest = false;
             bool toolidTest = false;
+            bool safetyTest = false;
             bool formulaTest = false;
             string gridTestInput = null;
             bool skillTest = false;
@@ -63,6 +64,7 @@ namespace OfficeAgent.Host
                 else if (a == "/suggesttest") suggestTest = true;
                 else if (a == "/carettest") caretTest = true;
                 else if (a == "/toolidtest") toolidTest = true;
+                else if (a == "/safetytest") safetyTest = true;
                 else if (a == "/formulatest") formulaTest = true;
                 else if (a == "/gridtest" && i + 1 < args.Length) { gridTestInput = args[i + 1]; i += 1; }
                 else if (a == "/skilltest") skillTest = true;
@@ -107,12 +109,23 @@ namespace OfficeAgent.Host
             // CLI 无头链同样落审计（设计方案 §7.3：每个动作可审计；GUI 的 app_start 在 MainForm）
             if (selftest || guardTest || maskTest || intentTest || suggestTest || skillTest || caretTest
                 || auditTest || detectTest || bridgeTest || planTest || perfTest || toolidTest || formulaTest
+                || safetyTest
                 || gridTestInput != null
                 || skillRunArgs != null || agentTestArgs != null || reconArgs != null || mergeArgs != null
                 || invoiceArgs != null || convertInput != null || renderInput != null
                 || pdfTextInput != null)
             {
                 AuditLog.Record("app_start", "cli");
+            }
+
+            // 自测/诊断入口跳过安全兜底：它们本就写临时目录，且必须能无人值守跑完。
+            // 注意**不覆盖** /recon、/merge、/invoices、/convert 等"真实 CLI 功能"——
+            // 那些不走 AgentTools，本就不受影响；而 /agenttest 之类的 agent 直跑仍走
+            // 同一判定逻辑，这里显式放行以免无人值守时被"确认"卡住。
+            if (selftest || skillTest || planTest || bridgeTest || formulaTest || perfTest
+                || agentTestArgs != null)
+            {
+                SafetyConfirm.AllowAllForTest = true;
             }
 
             if (guardTest)
@@ -169,6 +182,14 @@ namespace OfficeAgent.Host
                 try { AllocConsole(); } catch { }
                 try { Console.OutputEncoding = Encoding.UTF8; } catch { }
                 return RunToolIdTest();
+            }
+
+            if (safetyTest)
+            {
+                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
+                try { AllocConsole(); } catch { }
+                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                return RunSafetyTest();
             }
 
             if (formulaTest)
@@ -621,9 +642,166 @@ namespace OfficeAgent.Host
             return failed == 0 ? 0 : 2;
         }
 
-        // 读 zip 内条目文本（自测专用；失败返回 null）
-        static string ReadZipEntry(string xlsxPath, string entryName)
+        // .NET 3.5 的 Path.Combine 只有 2 参重载（3/4 参是 .NET 4.0+），本自测需多段拼接。
+        static string PJoin(params string[] parts)
         {
+            string acc = parts.Length > 0 ? parts[0] : "";
+            for (int i = 1; i < parts.Length; i++) acc = Path.Combine(acc, parts[i]);
+            return acc;
+        }
+
+        // 安全兜底自测：判定层分支 + 确认桥交互 + delete_file 工具。
+        // 注意：本测试**不**置 AllowAllForTest——要验证的正是"无人值守时必须拒绝"。
+        // 但"始终允许"分支会写 config.json，故用 PersistAllowList=false 只改内存。
+        static int RunSafetyTest()
+        {
+            int failed = 0;
+            Action<string, bool> check = delegate(string name, bool cond)
+            {
+                Console.WriteLine((cond ? "  ok    " : "  FAIL  ") + name);
+                if (!cond) failed++;
+            };
+            SafetyConfirm.Ask = null;
+            SafetyConfirm.AllowAllForTest = false;
+            SafetyConfirm.PersistAllowList = false;
+
+            AppConfig cfg = new AppConfig();   // SafetyGuard 默认 true
+            string sysRoot = Path.GetPathRoot(Environment.SystemDirectory);
+            string tempDir = Path.GetTempPath();
+            string selfDir = PJoin(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "OfficeAgent");
+            string winDir = Environment.GetEnvironmentVariable("SystemRoot");
+            string pfDir = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+
+            // 找一个非系统盘（没有则跳过相关断言）
+            string otherDrive = null;
+            try
+            {
+                foreach (DriveInfo d in DriveInfo.GetDrives())
+                {
+                    if (d.DriveType != DriveType.Fixed) continue;
+                    string r = d.RootDirectory.FullName;
+                    if (string.Equals(r.TrimEnd('\\'), sysRoot.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)) continue;
+                    otherDrive = r; break;
+                }
+            }
+            catch { }
+
+            // ---- 判定层 ----
+            check("读系统盘文件 → Allow",
+                SafetyGuard.Classify(SafetyOp.Read, PJoin(sysRoot, "Users", "x", "a.xlsx"), cfg).Verdict == SafetyVerdict.Allow);
+            check("写系统临时目录 → Allow（排除）",
+                SafetyGuard.Classify(SafetyOp.Write, PJoin(tempDir, "oa_x", "t.xlsx"), cfg).Verdict == SafetyVerdict.Allow);
+            check("写 OfficeAgent 自管目录 → Allow（排除）",
+                SafetyGuard.Classify(SafetyOp.Write, PJoin(selfDir, "preview", "p.pdf"), cfg).Verdict == SafetyVerdict.Allow);
+
+            SafetyCheck c4 = SafetyGuard.Classify(SafetyOp.Write, PJoin(sysRoot, "OfficeAgentFiles", "a.xlsx"), cfg);
+            check("写系统盘 → Confirm（规则=涉及C盘文件）",
+                c4.Verdict == SafetyVerdict.Confirm && c4.Rule == "涉及C盘文件");
+
+            string tablePath = otherDrive != null ? PJoin(otherDrive, "tmp", "a.xlsx")
+                                                  : PJoin(sysRoot, "Users", "x", "a.xlsx");
+            SafetyCheck c5 = SafetyGuard.Classify(SafetyOp.Delete, tablePath, cfg);
+            check("删除表格 → Confirm（理由含「表格」）",
+                c5.Verdict == SafetyVerdict.Confirm && c5.Reason.IndexOf("表格") >= 0);
+            if (otherDrive != null)
+                check("删除非表格（非系统盘）→ Allow",
+                    SafetyGuard.Classify(SafetyOp.Delete, PJoin(otherDrive, "tmp", "a.log"), cfg).Verdict == SafetyVerdict.Allow);
+
+            check("写 Windows 目录 → Deny",
+                SafetyGuard.Classify(SafetyOp.Write, PJoin(winDir, "x.dll"), cfg).Verdict == SafetyVerdict.Deny);
+            check("写 Program Files → Deny",
+                SafetyGuard.Classify(SafetyOp.Write, PJoin(pfDir, "x", "y.exe"), cfg).Verdict == SafetyVerdict.Deny);
+            check("删 Windows 目录内表格 → Deny（不可放行）",
+                SafetyGuard.Classify(SafetyOp.Delete, PJoin(winDir, "Temp", "a.xlsx"), cfg).Verdict == SafetyVerdict.Deny);
+            check("前缀边界：C:\\Windows 不误伤 C:\\WindowsApps",
+                !SafetyGuard.IsForbidden(PJoin(winDir + "Apps", "x.txt")));
+
+            AppConfig cfgAllow = new AppConfig();
+            cfgAllow.SafetyAllowPaths = PJoin(sysRoot, "Users", "x", "AllowMe");
+            check("白名单目录写 → Allow",
+                SafetyGuard.Classify(SafetyOp.Write, PJoin(cfgAllow.SafetyAllowPaths, "a.xlsx"), cfgAllow).Verdict == SafetyVerdict.Allow);
+
+            AppConfig cfgOff = new AppConfig(); cfgOff.SafetyGuard = false;
+            check("总开关关闭 → 系统盘写 Allow",
+                SafetyGuard.Classify(SafetyOp.Write, PJoin(sysRoot, "a.xlsx"), cfgOff).Verdict == SafetyVerdict.Allow);
+
+            check("表格扩展名识别（大小写/多格式）",
+                SafetyGuard.IsTableFile("a.XLSX") && SafetyGuard.IsTableFile("b.csv")
+                && SafetyGuard.IsTableFile("c.Xls") && !SafetyGuard.IsTableFile("d.txt"));
+
+            // ---- 确认桥交互 ----
+            string e1;
+            bool ok1 = SafetyConfirm.Ensure(SafetyOp.Write, PJoin(sysRoot, "OfficeAgentFiles", "a.xlsx"), cfg, out e1);
+            check("无界面(Ask=null) 写系统盘 → 拒绝（CLI 安全默认）", !ok1 && e1 != null && e1.IndexOf("非交互") >= 0);
+
+            SafetyConfirm.Ask = delegate(string r, string d, string dir) { return 0; };
+            string e2;
+            bool ok2 = SafetyConfirm.Ensure(SafetyOp.Write, PJoin(sysRoot, "OfficeAgentFiles", "a.xlsx"), cfg, out e2);
+            check("用户取消 → 拒绝", !ok2 && e2 != null && e2.IndexOf("取消") >= 0);
+
+            SafetyConfirm.Ask = delegate(string r, string d, string dir) { return 1; };
+            string e3;
+            bool ok3 = SafetyConfirm.Ensure(SafetyOp.Write, PJoin(sysRoot, "OfficeAgentFiles", "a.xlsx"), cfg, out e3);
+            check("用户允许一次 → 放行", ok3);
+
+            AppConfig cfg4 = new AppConfig();
+            string alwaysDir = PJoin(sysRoot, "Users", "x", "AlwaysDir");
+            SafetyConfirm.Ask = delegate(string r, string d, string dir) { return 2; };
+            string e4;
+            bool ok4 = SafetyConfirm.Ensure(SafetyOp.Write, PJoin(alwaysDir, "a.xlsx"), cfg4, out e4);
+            check("始终允许 → 放行且白名单已记录",
+                ok4 && cfg4.SafetyAllowPaths != null && cfg4.SafetyAllowPaths.IndexOf("AlwaysDir") >= 0);
+            SafetyConfirm.Ask = null;
+            string e5;
+            bool ok5 = SafetyConfirm.Ensure(SafetyOp.Write, PJoin(alwaysDir, "b.xlsx"), cfg4, out e5);
+            check("白名单命中 → 无界面也放行", ok5);
+
+            AppConfig cfg5 = new AppConfig();
+            SafetyConfirm.Ask = delegate(string r, string d, string dir) { return 2; };
+            string e6;
+            bool ok6 = SafetyConfirm.Ensure(SafetyOp.Write, PJoin(sysRoot, "rootfile.xlsx"), cfg5, out e6);
+            check("盘根不提供「始终允许」（r=2 退化为不放行）", !ok6);
+            SafetyConfirm.Ask = null;
+
+            // ---- delete_file 工具 ----
+            SafetyConfirm.AllowAllForTest = true;   // 只测删除机制本身，绕过弹窗
+            bool dok;
+            string d1 = AgentTools.Dispatch("delete_file", "{\"path\":\"" + tempDir.Replace("\\", "\\\\") + "\"}", cfg, null, null, out dok);
+            check("delete_file 拒绝目录", !dok && d1.IndexOf("文件夹") >= 0);
+            string d2 = AgentTools.Dispatch("delete_file",
+                "{\"path\":\"" + PJoin(tempDir, "no_such_xyz.xlsx").Replace("\\", "\\\\") + "\"}", cfg, null, null, out dok);
+            check("delete_file 拒绝不存在的文件", !dok && d2.IndexOf("不存在") >= 0);
+            string d3 = AgentTools.Dispatch("delete_file", "{\"path\":\"relative\\a.xlsx\"}", cfg, null, null, out dok);
+            check("delete_file 拒绝相对路径", !dok && d3.IndexOf("绝对路径") >= 0);
+            string victim = PJoin(tempDir, "oa_safetytest_victim.xlsx");
+            try { File.WriteAllText(victim, "x"); } catch { }
+            string d4 = AgentTools.Dispatch("delete_file", "{\"path\":\"" + victim.Replace("\\", "\\\\") + "\"}", cfg, null, null, out dok);
+            check("delete_file 正常删除文件", dok && !File.Exists(victim));
+            SafetyConfirm.AllowAllForTest = false;
+
+            // ---- schema 完整性 ----
+            try
+            {
+                object parsed = JsonVal.Parse(AgentTools.SchemasJson(true));
+                List<object> arr = parsed as List<object>;
+                bool hasDel = false;
+                foreach (object it in arr)
+                {
+                    Dictionary<string, object> d = it as Dictionary<string, object>;
+                    if (d == null) continue;
+                    Dictionary<string, object> f = JsonVal.Obj(d, "function");
+                    if (f != null && JsonVal.Str(f, "name") == "delete_file") hasDel = true;
+                }
+                check("SchemasJson 含 delete_file 且整体合法 JSON", arr != null && hasDel);
+            }
+            catch (Exception ex) { check("SchemasJson 合法性（异常: " + ex.Message + "）", false); }
+
+            Console.WriteLine(failed == 0 ? "safetytest ALL PASS" : ("safetytest FAILED=" + failed));
+            return failed == 0 ? 0 : 2;
+        }
+
+        // 读 zip 内条目文本（自测专用；失败返回 null）
+        static string ReadZipEntry(string xlsxPath, string entryName)        {
             try
             {
                 using (MiniZipFile zf = MiniZipFile.OpenRead(xlsxPath))

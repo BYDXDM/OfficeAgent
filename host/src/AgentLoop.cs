@@ -258,7 +258,7 @@ namespace OfficeAgent.Host
             // 与 AgentTools 的白名单一一对应；新增工具时同步这里，否则默认按"读型"放行（更安全）
             return name == "create_spreadsheet" || name == "create_presentation"
                 || name == "create_formula_workbook" || name == "convert_document" || name == "download_file"
-                || name == "repair_environment";
+                || name == "delete_file" || name == "repair_environment";
         }
 
         // 工具结果截断：超长结果只回传前 MaxToolResultChars 字符。

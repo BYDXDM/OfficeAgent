@@ -368,35 +368,27 @@ namespace OfficeAgent.Host
             catch { }
         }
 
-        // 新建工作区：选一个文件夹，名字取文件夹名
+        // 新建工作区：选一个文件夹（带磁盘维度），名字取文件夹名
         void NewWorkspace()
         {
-            using (FolderBrowserDialog fb = new FolderBrowserDialog())
-            {
-                fb.Description = "选择新工作区的文件夹：这个项目下的表格/PPT/下载文件都会保存在这里。";
-                try { fb.SelectedPath = WorkspaceStore.ActiveDir(config); } catch { }
-                if (fb.ShowDialog(this) != DialogResult.OK) return;
-                string name = System.IO.Path.GetFileName(fb.SelectedPath);
-                if (name == null || name.Trim().Length == 0) name = "新建工作区";
-                WorkspaceInfo w = WorkspaceStore.Add(name, fb.SelectedPath);
-                AuditLog.Record("file_write", "工作区创建 " + w.Name + " → " + w.Dir);
-                SetActiveWorkspace(w);
-            }
+            string picked = WorkspacePicker.Pick(this, WorkspaceStore.ActiveDir(config), "选择新工作区的文件夹");
+            if (picked == null) return;
+            string name = System.IO.Path.GetFileName(picked);
+            if (name == null || name.Trim().Length == 0) name = "新建工作区";
+            WorkspaceInfo w = WorkspaceStore.Add(name, picked);
+            AuditLog.Record("file_write", "工作区创建 " + w.Name + " → " + w.Dir);
+            SetActiveWorkspace(w);
         }
 
         void ChangeWorkspaceFolder(WorkspaceInfo w)
         {
             if (w == null) return;
-            using (FolderBrowserDialog fb = new FolderBrowserDialog())
-            {
-                fb.Description = "更改工作区「" + w.Name + "」的文件夹位置";
-                try { fb.SelectedPath = w.Dir; } catch { }
-                if (fb.ShowDialog(this) != DialogResult.OK) return;
-                WorkspaceStore.UpdateDir(w.Id, fb.SelectedPath);
-                AuditLog.Record("file_write", "工作区改址 " + w.Name + " → " + fb.SelectedPath);
-                if (WorkspaceStore.Active(config).Id == w.Id) chat.ApplyConfig(config);
-                RefreshSessions();
-            }
+            string picked = WorkspacePicker.Pick(this, w.Dir, "更改工作区「" + w.Name + "」的位置");
+            if (picked == null) return;
+            WorkspaceStore.UpdateDir(w.Id, picked);
+            AuditLog.Record("file_write", "工作区改址 " + w.Name + " → " + picked);
+            if (WorkspaceStore.Active(config).Id == w.Id) chat.ApplyConfig(config);
+            RefreshSessions();
         }
 
         void DeleteWorkspace(WorkspaceInfo w)
@@ -627,7 +619,37 @@ namespace OfficeAgent.Host
                 catch { }
             };
             p.Controls.Add(chat);
+            // 安全兜底确认桥（v0.8.2）：agent 后台线程判定"需确认"时回调到这里。
+            // ★ 与上面 OnOverwriteAvoided 的**非阻塞**通知不同，这里必须**阻塞式**封送到 UI 线程：
+            //   语义就是"不确认不执行"，所以后台线程要一直等到用户作答（ManualResetEvent）。
+            //   绝不能在后台线程直接 ShowDialog（会自建消息泵、挂住 worker）。
+            SafetyConfirm.Ask = delegate(string rule, string detail, string allowDir)
+            {
+                return ConfirmOnUi(rule, detail, allowDir);
+            };
             return p;
+        }
+
+        // 把安全确认弹窗封送到 UI 线程并阻塞等待结果（0=取消 1=允许一次 2=始终允许此目录）
+        int ConfirmOnUi(string rule, string detail, string allowDir)
+        {
+            if (IsDisposed || Disposing) return 0;
+            if (!InvokeRequired) return ConfirmDialog.Show(this, rule, detail, allowDir);
+            int r = 0;
+            using (System.Threading.ManualResetEvent done = new System.Threading.ManualResetEvent(false))
+            {
+                try
+                {
+                    Invoke((MethodInvoker)delegate
+                    {
+                        try { r = ConfirmDialog.Show(this, rule, detail, allowDir); }
+                        finally { try { done.Set(); } catch { } }
+                    });
+                }
+                catch { try { done.Set(); } catch { } }
+                done.WaitOne();
+            }
+            return r;
         }
 
         Panel BuildNewTaskPage()
@@ -1238,19 +1260,14 @@ namespace OfficeAgent.Host
         // 工作区目录：agent 建表/建 PPT 的相对路径、下载文件、@引用 的默认落盘位置
         void ChangeWorkspace()
         {
-            using (FolderBrowserDialog dlg = new FolderBrowserDialog())
-            {
-                dlg.Description = "选择工作区目录：建表/建 PPT 给文件名时保存到这里，下载文件也存这里，输入 @ 可引用其中的文件。";
-                try { dlg.SelectedPath = config.EffectiveWorkspace(); } catch { }
-                if (dlg.ShowDialog(this) == DialogResult.OK)
-                {
-                    config.WorkspaceDir = dlg.SelectedPath;
-                    config.Save();
-                    try { AgentTools.WorkspaceRoot = config.EffectiveWorkspace(); } catch { }
-                    RefreshWorkspaceLabel();
-                    AuditLog.Record("config_change", "工作区目录=" + dlg.SelectedPath);
-                }
-            }
+            string picked = WorkspacePicker.Pick(this, config.EffectiveWorkspace(),
+                "选择工作区位置（建表/建PPT/下载的默认落盘位置，@ 可引用其中文件）");
+            if (picked == null) return;
+            config.WorkspaceDir = picked;
+            config.Save();
+            try { AgentTools.WorkspaceRoot = config.EffectiveWorkspace(); } catch { }
+            RefreshWorkspaceLabel();
+            AuditLog.Record("config_change", "工作区目录=" + picked);
         }
 
         void RefreshWorkspaceLabel()

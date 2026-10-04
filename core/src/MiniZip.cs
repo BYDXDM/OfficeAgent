@@ -151,10 +151,17 @@ namespace OfficeAgent.Core
 
         MiniZipFile(string zipPath) { path = zipPath; }
 
+        // 只读打开但允许其他进程同时读写（FileShare.ReadWrite）：
+        // 预览/扫描期间用户随时可能用 Excel 打开同一文件——独占读会让 Excel 弹"文件正在使用"。
+        static FileStream OpenShared(string path)
+        {
+            return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        }
+
         public static MiniZipFile OpenRead(string zipPath)
         {
             MiniZipFile z = new MiniZipFile(zipPath);
-            using (FileStream fs = File.OpenRead(zipPath))
+            using (FileStream fs = OpenShared(zipPath))
             {
                 byte[] eocd = MiniZip.FindEocd(fs);
                 if (eocd == null) throw new IOException("无效的 ZIP（未找到中央目录结尾记录）: " + zipPath);
@@ -214,7 +221,7 @@ namespace OfficeAgent.Core
         {
             MiniZipEntryInfo e = FindEntry(name);
             if (e == null) throw new IOException("xlsx 包内缺少条目: " + name);
-            using (FileStream fs = File.OpenRead(path))
+            using (FileStream fs = OpenShared(path))
             {
                 byte[] data = MiniZip.ReadEntryData(fs, e.LocalOffset, e.Method, e.CompressedSize, e.UncompressedSize, e.FullName);
                 if (data == null) throw new IOException("条目解压失败: " + e.FullName);
@@ -242,7 +249,7 @@ namespace OfficeAgent.Core
             if (e == null) throw new IOException("xlsx 包内缺少条目: " + name);
             if (e.UncompressedSize > MiniZip.MAX_UNCOMPRESSED)
                 throw new IOException("条目过大，疑似 ZIP 炸弹: " + e.FullName);
-            FileStream fs = File.OpenRead(path);
+            FileStream fs = OpenShared(path);
             try
             {
                 fs.Seek(e.LocalOffset, SeekOrigin.Begin);
@@ -545,11 +552,18 @@ namespace OfficeAgent.Core
         // workbook.xml：sheetsXml 为各 <sheet .../> 的拼接。
         // calcPr fullCalcOnLoad：公式单元格不写缓存值（ReportCell.F），
         // 没有这个标记 Excel/WPS 打开时可能显示空白而不是重算——带公式模板的关键开关。
+        // activeTab：打开文件时选中的 sheet（0=第一张）；缺省 0 与旧行为一致。
         public static string WorkbookXml(string sheetsXml)
+        {
+            return WorkbookXml(sheetsXml, 0);
+        }
+
+        public static string WorkbookXml(string sheetsXml, int activeTab)
         {
             return XmlHead +
                 "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" " +
                 "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">" +
+                "<bookViews><workbookView activeTab=\"" + activeTab + "\"/></bookViews>" +
                 "<sheets>" + sheetsXml + "</sheets>" +
                 "<calcPr calcId=\"0\" fullCalcOnLoad=\"1\"/></workbook>";
         }
@@ -587,7 +601,10 @@ namespace OfficeAgent.Core
             return ContentTypes(sheetCount, false);
         }
 
-        // 多 sheet 的 workbook.xml.rels（RelId 从 1 起，按 sheet 顺序）
+        // 多 sheet 的 workbook.xml.rels（RelId 从 1 起，按 sheet 顺序）。
+        // ★ 必须带 styles.xml 的关系：MiniXlsxWrite 会写 xl/styles.xml 且 Content_Types 有声明，
+        //   漏了关系链时部件成为"孤儿"——LibreOffice/openpyxl 容忍，Excel 打开会弹
+        //   "发现部分内容有问题…是否尝试恢复"（2026-10-04 用户实机 Excel 抓出）。
         public static string SheetsRels(int sheetCount)
         {
             StringBuilder sb = new StringBuilder();
@@ -597,6 +614,8 @@ namespace OfficeAgent.Core
                   .Append("\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet")
                   .Append(i).Append(".xml\"/>");
             }
+            sb.Append("<Relationship Id=\"rId").Append(sheetCount + 1)
+              .Append("\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>");
             return WorkbookRels(sb.ToString());
         }
     }

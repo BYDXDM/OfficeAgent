@@ -41,3 +41,6 @@ audit.jsonl
 
 # Unrelated third-party local data that landed in this folder (not part of OfficeAgent)
 Data/
+
+# LibreOffice 实算复验的临时产物（tools/verify-recalc.py 生成，可再生）
+lo_recalc/

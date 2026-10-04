@@ -258,8 +258,9 @@ namespace OfficeAgent.Host
                 "4. 个税按月度税率表计算（应纳税所得额=应发-起征点-社保-公积金）；如需累计预扣预缴，可让 agent 加列。",
                 "5. 打开文件即自动重算；若个别单元格显示异常，按 F9 重算。" });
 
+            // 工作表排第一：打开文件直接落在工资表，参数/说明靠后
             List<ReportSheet> sheets = new List<ReportSheet>();
-            sheets.Add(cfg); sheets.Add(sh); sheets.Add(help);
+            sheets.Add(sh); sheets.Add(cfg); sheets.Add(help);
             return sheets;
         }
 
@@ -386,8 +387,8 @@ namespace OfficeAgent.Host
             cfg.Rows.Add(ParamRow("期初余额", opening, null));
 
             ReportSheet sh = HeaderSheet("流水",
-                new string[] { "日期", "摘要", "类别", "收入", "支出", "余额" },
-                new int[] { 12, 28, 12, 12, 12, 14 });
+                new string[] { "日期", "摘要", "类别", "收入", "支出", "余额", "", "汇总速览", "金额（元）" },
+                new int[] { 12, 28, 12, 12, 12, 14, 3, 12, 14 });
             for (int i = 0; i < n + LedgerBlankRows; i++)
             {
                 string[] d = i < n ? data[i] : null;
@@ -400,8 +401,25 @@ namespace OfficeAgent.Host
                 row.Add(Cell(d == null ? null : CellAt(d, 4), "m"));
                 // 余额=期初+累计收入-累计支出（扩张区间 SUM：对空行、跳行填写都稳健）
                 row.Add(ReportCell.F("IF(AND(D" + r + "=\"\",E" + r + "=\"\"),\"\",ROUND(参数!B2+SUM($D$2:D" + r + ")-SUM($E$2:E" + r + "),2))", "m"));
+                row.Add(null);   // G 列留白做分隔
                 sh.Rows.Add(row);
             }
+            // 页内汇总速览（H/I 列，与流水同页免切标签；明细增删自动联动）
+            ReportCell g1 = new ReportCell("");
+            g1.Style = "p";   // 分隔列不给边框底色
+            sh.Rows[0][6] = g1;
+            List<ReportCell> qs1 = new List<ReportCell>();
+            qs1.Add(new ReportCell("收入合计"));
+            qs1.Add(ReportCell.F("SUM(D2:D" + last + ")", "m"));
+            sh.Rows[1] = PasteAt(sh.Rows[1], qs1, 7);
+            List<ReportCell> qs2 = new List<ReportCell>();
+            qs2.Add(new ReportCell("支出合计"));
+            qs2.Add(ReportCell.F("SUM(E2:E" + last + ")", "m"));
+            sh.Rows[2] = PasteAt(sh.Rows[2], qs2, 7);
+            List<ReportCell> qs3 = new List<ReportCell>();
+            qs3.Add(new ReportCell("期末结余"));
+            qs3.Add(ReportCell.F("ROUND(I2-I3+参数!B2,2)", "m"));
+            sh.Rows[3] = PasteAt(sh.Rows[3], qs3, 7);
 
             // 分类汇总：类别取自已给数据（之后新增的类别让 agent 补公式）
             List<string> cats = new List<string>();
@@ -440,11 +458,25 @@ namespace OfficeAgent.Host
                 "流水账使用说明",
                 "1. 期初余额在「参数」页修改；「流水」页逐笔登记日期、摘要、类别、收入、支出。",
                 "2. 余额=期初+累计收入-累计支出，自动计算（支持中间空行）；已预置 100 行空白公式。",
-                "3. 「汇总」页自动统计收入/支出/期末结余与分类小计；登记时用了新类别，让 agent 补一行分类公式。" });
+                "3. 「流水」页右上角的汇总速览与「汇总」页都随明细自动联动；登记时用了新类别，让 agent 补一行分类公式。" });
 
+            // 打开文件直接落在流水页：流水第一、汇总第二、参数/说明靠后
             List<ReportSheet> sheets = new List<ReportSheet>();
-            sheets.Add(cfg); sheets.Add(sh); sheets.Add(sum); sheets.Add(help);
+            sheets.Add(sh); sheets.Add(sum); sheets.Add(cfg); sheets.Add(help);
             return sheets;
+        }
+
+        // 把小块（标签+公式）贴到既有行的指定列位（不足处补 null）
+        static List<ReportCell> PasteAt(List<ReportCell> row, List<ReportCell> block, int col)
+        {
+            while (row.Count < col) row.Add(null);
+            for (int i = 0; i < block.Count; i++)
+            {
+                int idx = col + i;
+                while (row.Count <= idx) row.Add(null);
+                row[idx] = block[i];
+            }
+            return row;
         }
 
         // ============================================================
@@ -506,6 +538,9 @@ namespace OfficeAgent.Host
                     ApplyFormulaCols(row, formulaCols, n + b + 2);
                     sh.Rows.Add(row);
                 }
+                // 数据区结束行 = 表头 + 数据 + 空白公式行（不含随后追加的合计行）。
+                // 必须在 Add(totalRow) 之前记录：汇总页若把它当分组行会多一个伪分组「合计」并双计。
+                sh.DataEndRow = sh.Rows.Count - 1;
                 if (JsonVal.Bool(spec, "totalRow", false) && n + blank > 0)
                 {
                     int last = 1 + n + blank;
@@ -554,16 +589,19 @@ namespace OfficeAgent.Host
             if (srcSheet == null) { err = "summary.source 指向的 sheet 不存在: " + srcName; return null; }
             int gc = ColIndex(groupCol);
             if (gc < 0) { err = "summary.groupCol 列号不合法: " + groupCol; return null; }
-            // 分组值取自源 sheet 数据行（按出现顺序去重；分组列需是文本/数值字面量）
+            // 分组值取自源 sheet 数据行（按出现顺序去重；分组列需是文本/数值字面量）。
+            // 扫描止于 DataEndRow：追加的「合计」行不是真实分组，纳入会产生伪分组并被双计。
+            int dataEnd = srcSheet.DataEndRow >= 0 ? srcSheet.DataEndRow : srcSheet.Rows.Count - 1;
+            if (dataEnd > srcSheet.Rows.Count - 1) dataEnd = srcSheet.Rows.Count - 1;
             List<string> groups = new List<string>();
-            for (int ri = 1; ri < srcSheet.Rows.Count; ri++)
+            for (int ri = 1; ri <= dataEnd; ri++)
             {
                 List<ReportCell> row = srcSheet.Rows[ri];
                 if (gc >= row.Count || row[gc] == null) continue;
                 string v = row[gc].IsFormula ? "" : (row[gc].Text == null ? "" : row[gc].Text.Trim());
                 if (v.Length > 0 && !groups.Contains(v)) groups.Add(v);
             }
-            int last = srcSheet.Rows.Count;
+            int last = dataEnd + 1;   // 转成 1 基 Excel 行号（SUMIF 区间上界）
 
             ReportSheet sm2 = new ReportSheet("汇总");
             string label = JsonVal.Str(sm, "labelHeader");

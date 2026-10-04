@@ -41,6 +41,10 @@ namespace OfficeAgent.Host
         public List<List<ReportCell>> Rows = new List<List<ReportCell>>();
         public int[] ColWidths = null;   // 字符宽度；null = 默认
         public int FreezeRows = 0;       // 冻结前 N 行（表头 1）
+        // 数据区结束行（0 基，含表头所在行；-1 = 未指定，按 Rows.Count 处理）。
+        // 用于"明细区"与"追加的合计行"区分：汇总 sheet 的分组扫描与 SUMIF 区间都必须止于此处，
+        // 否则会把追加的「合计」行当成一个分组值并重复计入（自由模式 totalRow+summary 双计缺陷）。
+        public int DataEndRow = -1;
 
         public ReportSheet(string name) { Name = name; }
 
@@ -231,6 +235,12 @@ namespace OfficeAgent.Host
         // 保存报表；返回 null=成功，否则错误信息
         public static string Save(string path, List<ReportSheet> sheets)
         {
+            return Save(path, sheets, 0);
+        }
+
+        // activeTab：打开文件时落在第几张表（0 起）——模板把工作表排第一时用
+        public static string Save(string path, List<ReportSheet> sheets, int activeTab)
+        {
             try
             {
                 if (File.Exists(path)) File.Delete(path);
@@ -246,7 +256,7 @@ namespace OfficeAgent.Host
                     }
                     XlsxSkeleton.Add(ents, "[Content_Types].xml", XlsxSkeleton.ContentTypes(sheets.Count, true));
                     XlsxSkeleton.Add(ents, "_rels/.rels", XlsxSkeleton.RootRels());
-                    XlsxSkeleton.Add(ents, "xl/workbook.xml", XlsxSkeleton.WorkbookXml(wbSheets.ToString()));
+                    XlsxSkeleton.Add(ents, "xl/workbook.xml", XlsxSkeleton.WorkbookXml(wbSheets.ToString(), activeTab));
                     XlsxSkeleton.Add(ents, "xl/_rels/workbook.xml.rels", XlsxSkeleton.SheetsRels(sheets.Count));
                     XlsxSkeleton.Add(ents, "xl/styles.xml", StylesXml());
                     for (int i = 0; i < sheets.Count; i++)

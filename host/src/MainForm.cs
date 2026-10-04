@@ -14,7 +14,7 @@ namespace OfficeAgent.Host
 {
     public partial class MainForm : Form
     {
-        const string Version = "0.8.0";
+        const string Version = "0.8.1";
 
         class NavEntry
         {
@@ -65,6 +65,7 @@ namespace OfficeAgent.Host
         Pdfium.PdfDoc pdfDoc = null;
         int pdfPageIndex = 0;
         string tempPdf = null;
+        string previewFolderPath = "";   // 当前预览文件的所在目录（「打开源文件所在地」按钮）
         delegate void VoidD();
         delegate void StrD(string s);
         delegate void FillEnvD(List<DetectItem> items);
@@ -871,6 +872,14 @@ namespace OfficeAgent.Host
             btnOpenPreview.Cursor = Cursors.Hand;
             btnOpenPreview.Click += new EventHandler(BtnOpenPreview_Click);
             topBar.Controls.Add(btnOpenPreview);
+            // 打开当前预览文件所在文件夹（用户实测需求：预览后想直接定位产物文件）
+            Button btnShowInFolder = new Button();
+            btnShowInFolder.Text = "打开源文件所在地";
+            btnShowInFolder.Location = new Point(142, 7);
+            btnShowInFolder.Size = new Size(130, 28);
+            btnShowInFolder.Cursor = Cursors.Hand;
+            btnShowInFolder.Click += delegate { OpenFolder.Open(previewFolderPath); };
+            topBar.Controls.Add(btnShowInFolder);
             p.Controls.Add(previewHost);
             p.Controls.Add(previewInfo);
             p.Controls.Add(topBar);
@@ -917,6 +926,7 @@ namespace OfficeAgent.Host
         public void ShowPreview(string path)
         {
             ClearPreview();
+            try { previewFolderPath = Path.GetDirectoryName(path) ?? ""; } catch { previewFolderPath = ""; }
             AuditLog.Record("file_read", path);
             string ext = (Path.GetExtension(path) ?? "").ToLowerInvariant();
             try

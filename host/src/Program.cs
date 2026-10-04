@@ -462,8 +462,20 @@ namespace OfficeAgent.Host
                 if (!cond) failed++;
             };
             string dir = Path.Combine(Path.GetTempPath(), "oa_formulatest");
+            // 必须先清空：SafeOutputPath 遇到同名文件会自动改名为 xxx(2).xlsx，
+            // 不清空的话本次产物落到 (N) 名下，而断言读的是旧的基准文件名——
+            // 测试会"通过"却实际校验的是上一轮的残留文件（曾因此漏报 13 项）。
+            try
+            {
+                if (Directory.Exists(dir))
+                    foreach (string f in Directory.GetFiles(dir)) { try { File.Delete(f); } catch { } }
+            }
+            catch { }
             try { Directory.CreateDirectory(dir); } catch { }
             if (!Directory.Exists(dir)) { Console.WriteLine("  FAIL  无法创建临时目录 " + dir); return 2; }
+            // 同名残留若因占用删不掉，宁可失败也不要误判为通过
+            if (Directory.GetFiles(dir).Length > 0)
+            { Console.WriteLine("  FAIL  临时目录未能清空（可能有文件被占用）: " + dir); return 2; }
 
             // ① JsonVal：嵌套 + 转义 + 数字/布尔
             try
@@ -486,14 +498,19 @@ namespace OfficeAgent.Host
             {
                 string wb = ReadZipEntry(payroll, "xl/workbook.xml");
                 check("workbook.xml 含 calcPr fullCalcOnLoad", wb != null && wb.Contains("fullCalcOnLoad"));
-                string s2 = ReadZipEntry(payroll, "xl/worksheets/sheet2.xml");
-                check("工资表公式：社保引用参数!B5", s2 != null && s2.Contains("*参数!B5"));
-                check("工资表公式：个税月度税率 IF 链", s2 != null && (s2.Contains("J2&lt;=12000") || s2.Contains("J3&lt;=12000")));
-                check("工资表公式：应纳税所得额 MAX 守卫", s2 != null && s2.Contains("MAX(0,G2-参数!B7"));
-                check("工资表合计行 SUM", s2 != null && s2.Contains("SUM(D2:D"));
-                check("工资表空白行 IF 守卫（不显示 0）", s2 != null && s2.Contains("IF(B54="));
-                check("工资表全部公式括号配平", AllFormulasBalanced(s2));
-                check("参数页全部公式括号配平", AllFormulasBalanced(ReadZipEntry(payroll, "xl/worksheets/sheet1.xml")));
+                // 工作表排第一：打开文件直接落在工资表（0.8.1，用户反馈）
+                check("工资表排在参数页之前", wb != null && wb.IndexOf("工资表", StringComparison.Ordinal) >= 0
+                    && wb.IndexOf("工资表", StringComparison.Ordinal) < wb.IndexOf("参数", StringComparison.Ordinal));
+                check("workbook.xml.rels 含 styles 关系（孤儿部件会让 Excel 弹修复）",
+                    (ReadZipEntry(payroll, "xl/_rels/workbook.xml.rels") ?? "").Contains("relationships/styles"));
+                string s1 = ReadZipEntry(payroll, "xl/worksheets/sheet1.xml");
+                check("工资表公式：社保引用参数!B5", s1 != null && s1.Contains("*参数!B5"));
+                check("工资表公式：个税月度税率 IF 链", s1 != null && (s1.Contains("J2&lt;=12000") || s1.Contains("J3&lt;=12000")));
+                check("工资表公式：应纳税所得额 MAX 守卫", s1 != null && s1.Contains("MAX(0,G2-参数!B7"));
+                check("工资表合计行 SUM", s1 != null && s1.Contains("SUM(D2:D"));
+                check("工资表空白行 IF 守卫（不显示 0）", s1 != null && s1.Contains("IF(B54="));
+                check("工资表全部公式括号配平", AllFormulasBalanced(s1));
+                check("参数页全部公式括号配平", AllFormulasBalanced(ReadZipEntry(payroll, "xl/worksheets/sheet2.xml")));
             }
 
             // ③ 增值税台账
@@ -520,12 +537,22 @@ namespace OfficeAgent.Host
             check("流水账生成成功", ok3 && File.Exists(ledger));
             if (ok3)
             {
+                // 0.8.1 起页序：流水(1) / 汇总(2) / 参数(3) / 说明(4)——打开即落在流水页
+                string lwb = ReadZipEntry(ledger, "xl/workbook.xml");
+                check("流水账打开即落在流水页（activeTab=0 且流水列首位）",
+                    lwb != null && lwb.Contains("activeTab=\"0\"") &&
+                    lwb.IndexOf("流水", StringComparison.Ordinal) >= 0 &&
+                    lwb.IndexOf("流水", StringComparison.Ordinal) < lwb.IndexOf("汇总", StringComparison.Ordinal));
+                string s1 = ReadZipEntry(ledger, "xl/worksheets/sheet1.xml");
+                check("流水余额=期初+扩张区间SUM", s1 != null && s1.Contains("参数!B2+SUM($D$2:D2)") && s1.Contains("SUM($E$2:E"));
+                // 页内汇总速览：与流水同页（用户要求"汇总也呈现在第一张表上"）
+                check("流水首页含汇总速览：收入合计", s1 != null && s1.Contains("收入合计") && s1.Contains("SUM(D2:D"));
+                check("流水首页含汇总速览：支出合计/期末结余", s1 != null && s1.Contains("支出合计")
+                    && s1.Contains("期末结余") && s1.Contains("ROUND(I2-I3+参数!B2,2)"));
                 string s2 = ReadZipEntry(ledger, "xl/worksheets/sheet2.xml");
-                check("流水余额=期初+扩张区间SUM", s2 != null && s2.Contains("参数!B2+SUM($D$2:D2)") && s2.Contains("SUM($E$2:E"));
-                string s3 = ReadZipEntry(ledger, "xl/worksheets/sheet3.xml");
-                check("流水分类 SUMIF", s3 != null && s3.Contains("SUMIF(流水!C2:C"));
-                check("流水期末结余公式", s3 != null && s3.Contains("ROUND(B2-B3+参数!B2,2)"));
-                check("流水两页公式括号配平", AllFormulasBalanced(ReadZipEntry(ledger, "xl/worksheets/sheet2.xml")) && AllFormulasBalanced(s3));
+                check("流水分类 SUMIF", s2 != null && s2.Contains("SUMIF(流水!C2:C"));
+                check("流水期末结余公式", s2 != null && s2.Contains("ROUND(B2-B3+参数!B2,2)"));
+                check("流水页公式括号配平", AllFormulasBalanced(s1) && AllFormulasBalanced(s2));
             }
 
             // ⑤ 自由模式：formulaCols + summary
@@ -543,7 +570,15 @@ namespace OfficeAgent.Host
                 string s1 = ReadZipEntry(free, "xl/worksheets/sheet1.xml");
                 check("自由公式列 {r} 展开为行号", s1 != null && s1.Contains("B2*C2") && s1.Contains("B12*C12"));
                 string s2 = ReadZipEntry(free, "xl/worksheets/sheet2.xml");
-                check("自由汇总 SUMIF('明细'!) 引用", s2 != null && s2.Contains("SUMIF('明细'!A2:A14,A2,'明细'!D2:D14)"));
+                // 区间止于数据区（A13/D13）：修复前是 A14/D14，把追加的「合计」行也扫进来导致双计。
+                check("自由汇总 SUMIF('明细'!) 引用（区间止于数据区）",
+                    s2 != null && s2.Contains("SUMIF('明细'!A2:A13,A2,'明细'!D2:D13)"));
+                // 0.8.1 双计缺陷回归：明细含 totalRow 时，汇总页不得把「合计」当分组行，且区间止于数据区。
+                // 数据区 = 表头(1) + 数据(2) + 空白(10) = 13 行；合计行在 ROW 14，必须落在 SUMIF 区间之外。
+                check("自由汇总不把「合计」当分组（无双计）",
+                    s2 != null && !s2.Contains("SUMIF('明细'!A2:A15,A4,"));
+                check("自由汇总分组仅含真实两组（表头+2组+合计=4行）",
+                    s2 != null && System.Text.RegularExpressions.Regex.Matches(s2, "<row[ >]").Count == 4);
             }
 
             // ⑥ 参数不合法的友好报错

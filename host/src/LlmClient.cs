@@ -52,6 +52,20 @@ namespace OfficeAgent.Host
             "glm-4-flash-250414", "glm-4-plus", "glm-4-long",
             "deepseek-chat", "deepseek-reasoner", "qwen-plus", "qwen-turbo", "gpt-4o-mini" };
 
+        // 预置模型所属的官方 OpenAI 兼容端点。内联下拉跨供应商切换模型时自动带出地址：
+        // 密钥按服务（host）分开保存（见 AppConfig），从根上杜绝"拿 A 家的密钥向 B 家发请求"。
+        // 返回 null = 未知/自建网关模型，只切模型名不动地址。
+        public static string BaseUrlForModel(string model)
+        {
+            string m = (model ?? "").Trim().ToLowerInvariant();
+            if (m.Length == 0) return null;
+            if (m.StartsWith("glm-", StringComparison.Ordinal)) return "https://open.bigmodel.cn/api/paas/v4";
+            if (m.StartsWith("deepseek-", StringComparison.Ordinal)) return "https://api.deepseek.com";
+            if (m.StartsWith("qwen-", StringComparison.Ordinal)) return "https://dashscope.aliyuncs.com/compatible-mode/v1";
+            if (m.StartsWith("gpt-", StringComparison.Ordinal)) return "https://api.openai.com/v1";
+            return null;
+        }
+
         static string NormalizeBase(string url)
         {
             if (url == null) return "";
@@ -263,24 +277,7 @@ namespace OfficeAgent.Host
                 r.Content = JsonGetString(msg, "content");
                 if (r.Content == null) r.Content = "";
                 // 工具调用解析（只认 function 类型；web_search 等服务端自执行类型不本地分发）
-                int tc = msg.IndexOf("\"tool_calls\"", StringComparison.Ordinal);
-                if (tc >= 0)
-                {
-                    r.ToolCalls = new List<string[]>();
-                    int i = 0;
-                    while ((i = msg.IndexOf("\"function\"", i + 1, StringComparison.Ordinal)) > 0)
-                    {
-                        string fobj = ExtractJsonObject(msg, msg.IndexOf('{', i));
-                        if (fobj == null) break;
-                        string name = JsonGetString(fobj, "name");
-                        string args = JsonGetString(fobj, "arguments");
-                        if (args == null) args = "{}";
-                        string id = FindNearestId(msg, i);
-                        if (name != null && name.Length > 0)
-                            r.ToolCalls.Add(new string[] { id == null ? ("call_" + r.ToolCalls.Count) : id, name, args });
-                    }
-                    r.HasToolCalls = r.ToolCalls.Count > 0;
-                }
+                ParseToolCallsInto(msg, r);
                 // 重建干净的 assistant 消息用于回显：只保留 role/content/tool_calls，
                 // 剥掉 reasoning_content（glm-4.5 推理模型会拒绝或浪费上下文）与 index 等服务端字段
                 StringBuilder asst = new StringBuilder();
@@ -314,16 +311,52 @@ namespace OfficeAgent.Host
             }
         }
 
-        // 从 msg 文本里找 function 对象之前最近的 "id":"..."（tool_call id）
-        static string FindNearestId(string msg, int pos)
+        // 工具调用解析（internal 供 /toolidtest 无头回归）。
+        // 为什么不再"从每个 function token 往回找最近的 id"：并行工具调用时，部分模型/网关
+        // 会把 id 写在 function 之后、干脆缺 id，甚至两个调用复用同一个 id——回溯找法会抓错
+        // （串到别的字段）或产出重复 id。这种请求原样回显上去，严格校验的端点（DeepSeek 等）
+        // 直接拒绝：HTTP 400 "Duplicate value for 'tool_call_id' of call_00_xxx in message[N]"
+        // ——用户侧的表现就是"一调用插件/技能就报错"。
+        // 这里把 tool_calls 数组的每个条目括号配平成独立对象，id/name/arguments 全部取条目内部，
+        // 最后做 id 归一化：缺失 → 补唯一值；重复 → 重写为唯一值。
+        // 回显消息（RawMessageJson）与 tool@id 消息都从归一化后的 ToolCalls 构建，请求必然自洽。
+        internal static void ParseToolCallsInto(string msg, LlmReply r)
         {
-            string pat = "\"id\":\"";
-            int i = msg.LastIndexOf(pat, pos, StringComparison.Ordinal);
-            if (i < 0) return null;
-            i += pat.Length;
-            StringBuilder sb = new StringBuilder();
-            while (i < msg.Length && msg[i] != '"') { sb.Append(msg[i]); i++; }
-            return sb.ToString();
+            int tc = msg.IndexOf("\"tool_calls\"", StringComparison.Ordinal);
+            if (tc < 0) return;
+            int arr = msg.IndexOf('[', tc);
+            if (arr < 0) return;
+            r.ToolCalls = new List<string[]>();
+            List<string> seenIds = new List<string>();
+            int i = arr;
+            while (true)
+            {
+                int close = msg.IndexOf(']', i + 1);
+                int b = msg.IndexOf('{', i + 1);
+                if (b < 0 || (close >= 0 && close < b)) break;   // 数组结束
+                string entry = ExtractJsonObject(msg, b);
+                if (entry == null) break;
+                i = b + entry.Length - 1;   // 连同嵌套一起跳过本条目
+                string id = JsonGetString(entry, "id");
+                string name = null, args = null;
+                int fi = entry.IndexOf("\"function\"", StringComparison.Ordinal);
+                if (fi >= 0)
+                {
+                    string fobj = ExtractJsonObject(entry, entry.IndexOf('{', fi));
+                    if (fobj != null)
+                    {
+                        name = JsonGetString(fobj, "name");
+                        args = JsonGetString(fobj, "arguments");
+                    }
+                }
+                if (name == null || name.Length == 0) continue;   // 非 function 类型（web_search 等）不本地分发
+                if (args == null) args = "{}";
+                if (id == null || id.Length == 0 || seenIds.Contains(id))
+                    id = "call_oa_" + Guid.NewGuid().ToString("N").Substring(0, 16);
+                seenIds.Add(id);
+                r.ToolCalls.Add(new string[] { id, name, args });
+            }
+            r.HasToolCalls = r.ToolCalls.Count > 0;
         }
 
         // 从 startIdx 处的 '{' 起提取括号配平的 JSON 对象（跳过字符串字面量）

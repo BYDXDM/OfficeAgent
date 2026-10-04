@@ -2,18 +2,28 @@
 // 密钥安全规约（Mimosa 约束）：API Key 只经 DPAPI（Windows 凭据保护服务）加密后落盘，
 // 支持环境变量 OFFICEAGENT_API_KEY 运行时覆盖；源码/示例/测试不写任何凭据字面量。
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 
 namespace OfficeAgent.Host
 {
+    // 一家服务（host）的密钥：每家分开 DPAPI 加密存储，
+    // 切换供应商时各取各的，杜绝"拿 A 家的密钥向 B 家发请求"。
+    public class ProviderKey
+    {
+        public string Host = "";     // 如 api.deepseek.com、open.bigmodel.cn
+        public byte[] Blob = null;   // DPAPI 密文
+    }
+
     public class AppConfig
     {
         public string BaseUrl = "";
         public string Model = "";
         public bool AllowLan = false;      // 企业内网网关显式放行（默认关闭）
-        public byte[] KeyBlob = null;      // DPAPI 密文
+        public byte[] KeyBlob = null;      // 旧版单密钥密文（仅作加载迁移用，不再写入）
+        public List<ProviderKey> ProviderKeys = new List<ProviderKey>();   // 按服务分开存的密钥
         public bool WizardDone = false;
         // 内置插件开关（默认全开，开箱即用）
         public bool PluginMemory = true;   // 记忆模块
@@ -56,6 +66,28 @@ namespace OfficeAgent.Host
             try { return File.Exists(FilePath()); } catch { return false; }
         }
 
+        // 从服务地址提取主机名（密钥的归属维度）：
+        // https://api.deepseek.com/v1 → api.deepseek.com。解析失败兜底手工截取，统一小写。
+        public static string HostOf(string baseUrl)
+        {
+            string u = (baseUrl ?? "").Trim();
+            if (u.Length == 0) return "";
+            try
+            {
+                string h = new Uri(u).Host;
+                if (h != null && h.Length > 0) return h.ToLowerInvariant();
+            }
+            catch { }
+            string s = u;
+            int p = s.IndexOf("://", StringComparison.Ordinal);
+            if (p >= 0) s = s.Substring(p + 3);
+            int slash = s.IndexOf('/');
+            if (slash >= 0) s = s.Substring(0, slash);
+            int at = s.LastIndexOf('@');
+            if (at >= 0) s = s.Substring(at + 1);
+            return s.ToLowerInvariant();
+        }
+
         public bool IsLlmConfigured()
         {
             return BaseUrl != null && BaseUrl.Length > 0 && GetKey() != null && GetKey().Length > 0;
@@ -63,8 +95,27 @@ namespace OfficeAgent.Host
 
         public void SetKey(string plain)
         {
-            if (string.IsNullOrEmpty(plain)) { KeyBlob = null; return; }
-            KeyBlob = DpapiProtect(plain);
+            // 归属到当前 BaseUrl 的主机；每家服务一把钥匙互不覆盖
+            string host = HostOf(BaseUrl);
+            int idx = -1;
+            for (int i = 0; i < ProviderKeys.Count; i++)
+            {
+                if (string.Equals(ProviderKeys[i].Host, host, StringComparison.OrdinalIgnoreCase)) { idx = i; break; }
+            }
+            if (string.IsNullOrEmpty(plain))
+            {
+                if (idx >= 0) ProviderKeys.RemoveAt(idx);   // 显式清空该服务的密钥
+                return;
+            }
+            byte[] blob = DpapiProtect(plain);
+            if (idx >= 0) ProviderKeys[idx].Blob = blob;
+            else
+            {
+                ProviderKey pk = new ProviderKey();
+                pk.Host = host;
+                pk.Blob = blob;
+                ProviderKeys.Add(pk);
+            }
         }
 
         public string GetKey()
@@ -76,8 +127,34 @@ namespace OfficeAgent.Host
                 if (!string.IsNullOrEmpty(env)) return env;
             }
             catch { }
-            if (KeyBlob == null || KeyBlob.Length == 0) return null;
-            return DpapiUnprotect(KeyBlob);
+            return KeyForHost(HostOf(BaseUrl));
+        }
+
+        // 取指定服务主机的密钥（DPAPI 解密；无则 null）。
+        // ★ 不做跨服务回退：找不到就返回 null——回退会退化回"一个 key 向各家发请求"。
+        public string KeyForHost(string host)
+        {
+            if (host == null || host.Length == 0) return null;
+            for (int i = 0; i < ProviderKeys.Count; i++)
+            {
+                if (string.Equals(ProviderKeys[i].Host, host, StringComparison.OrdinalIgnoreCase)
+                    && ProviderKeys[i].Blob != null && ProviderKeys[i].Blob.Length > 0)
+                    return DpapiUnprotect(ProviderKeys[i].Blob);
+            }
+            return null;
+        }
+
+        // 只查存在性不解密（占位符显示、跨供应商切换提示用）
+        public bool HasKeyForHost(string host)
+        {
+            if (host == null || host.Length == 0) return false;
+            for (int i = 0; i < ProviderKeys.Count; i++)
+            {
+                if (string.Equals(ProviderKeys[i].Host, host, StringComparison.OrdinalIgnoreCase)
+                    && ProviderKeys[i].Blob != null && ProviderKeys[i].Blob.Length > 0)
+                    return true;
+            }
+            return false;
         }
 
         public void Save()
@@ -102,7 +179,14 @@ namespace OfficeAgent.Host
                 sb.Append("  \"streamFinal\": ").Append(StreamFinal ? "true" : "false").Append(",\n");
                 sb.Append("  \"workspaceDir\": \"").Append(Js(WorkspaceDir)).Append("\",\n");
                 sb.Append("  \"activeWorkspaceId\": \"").Append(Js(ActiveWorkspaceId)).Append("\",\n");
-                sb.Append("  \"keyBlob\": \"").Append(KeyBlob == null ? "" : Convert.ToBase64String(KeyBlob)).Append("\"\n");
+                // 按服务分开存的密钥（扁平字段 key:<host>，base64 DPAPI 密文）
+                for (int i = 0; i < ProviderKeys.Count; i++)
+                {
+                    if (ProviderKeys[i].Blob == null || ProviderKeys[i].Blob.Length == 0) continue;
+                    sb.Append("  \"key:").Append(Js(ProviderKeys[i].Host)).Append("\": \"")
+                      .Append(Convert.ToBase64String(ProviderKeys[i].Blob)).Append("\",\n");
+                }
+                sb.Append("  \"perHostKeys\": true\n");
                 sb.Append("}\n");
                 File.WriteAllText(FilePath(), sb.ToString(), new UTF8Encoding(false));
             }
@@ -138,6 +222,49 @@ namespace OfficeAgent.Host
                 if (b64 != null && b64.Length > 0)
                 {
                     try { c.KeyBlob = Convert.FromBase64String(b64); } catch { c.KeyBlob = null; }
+                }
+                // 新版：按服务分开的密钥字段 "key:<host>": "<base64>"（扁平扫描）
+                int ki = 0;
+                while ((ki = json.IndexOf("\"key:", ki, StringComparison.Ordinal)) >= 0)
+                {
+                    int ns = ki + 5;
+                    int ne = json.IndexOf('"', ns);
+                    if (ne < 0) break;
+                    string host = json.Substring(ns, ne - ns);
+                    int j = ne + 1;
+                    while (j < json.Length && (json[j] == ' ' || json[j] == ':')) j++;
+                    if (j < json.Length && json[j] == '"')
+                    {
+                        int vs = j + 1;
+                        int ve = json.IndexOf('"', vs);
+                        if (ve > vs)
+                        {
+                            byte[] blob = null;
+                            try { blob = Convert.FromBase64String(json.Substring(vs, ve - vs)); } catch { blob = null; }
+                            if (blob != null && host.Length > 0 && !c.HasKeyForHost(host))
+                            {
+                                ProviderKey pk = new ProviderKey();
+                                pk.Host = host;
+                                pk.Blob = blob;
+                                c.ProviderKeys.Add(pk);
+                            }
+                        }
+                    }
+                    ki = ne + 1;
+                }
+                // 旧版单密钥迁移：把 keyBlob 归到它所属的服务地址下，升级为按家存储。
+                // （只迁移一次；之后 Save 不再写 keyBlob，旧字段随之消失）
+                if (c.KeyBlob != null && c.KeyBlob.Length > 0 && c.ProviderKeys.Count == 0)
+                {
+                    string h = HostOf(c.BaseUrl);
+                    if (h.Length > 0)
+                    {
+                        ProviderKey pk = new ProviderKey();
+                        pk.Host = h;
+                        pk.Blob = c.KeyBlob;
+                        c.ProviderKeys.Add(pk);
+                        c.KeyBlob = null;
+                    }
                 }
             }
             catch { }

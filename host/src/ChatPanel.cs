@@ -89,6 +89,25 @@ namespace OfficeAgent.Host
         int LeftMargin() { return (list.Width > 900) ? 170 : 20; }
         int AvailWidth() { return Math.Min(MaxTextWidth, Math.Max(200, list.Width - LeftMargin() - 60)); }
 
+        // 单块气泡的文本高度上限：大屏用固定值；列表视口更矮时随之收缩。
+        // ListBox 滚到底时视口只能停在一个条目的顶部，条目本身比视口高的话，
+        // 它的底部永远滚不进来（"下滑不到最低端"的成因之一），所以块高必须 < 视口。
+        int ChunkMaxTextH()
+        {
+            int h = MaxChunkTextH;
+            try
+            {
+                if (list != null && list.IsHandleCreated)
+                {
+                    int vh = list.ClientRectangle.Height;
+                    if (vh > 320) h = Math.Min(h, vh - 120);
+                }
+            }
+            catch { }
+            if (h < 240) h = 240;
+            return h;
+        }
+
         static Font NameFont = new Font("Microsoft YaHei UI", 8.25F);
         static Font TextFont = new Font("Microsoft YaHei UI", 9.75F);
 
@@ -266,6 +285,7 @@ namespace OfficeAgent.Host
                         msgs[pendingIdx].Text = "思考中… " + secs + "s";
                         msgs[pendingIdx].CachedTextH = -1;
                         msgs[pendingIdx].CachedHeight = -1;
+                        ReMeasure();
                         dirty = true;
                     }
                 }
@@ -441,7 +461,7 @@ namespace OfficeAgent.Host
             for (int i = msgs.Count - 1; i >= 0; i--)
             {
                 MeasureMsg(msgs[i], AvailWidth());
-                if (msgs[i].CachedTextH > MaxChunkTextH) SplitLongFinal(i);
+                if (msgs[i].CachedTextH > ChunkMaxTextH()) SplitLongFinal(i);
             }
             UpdateCtxLabel();
             MarkDirty();
@@ -765,6 +785,9 @@ namespace OfficeAgent.Host
                 msgs[streamingBubble].Text = streamText;
                 msgs[streamingBubble].Pending = false;
                 msgs[streamingBubble].CachedTextH = -1; msgs[streamingBubble].CachedHeight = -1;
+                // 文本增长后必须重挂条目让原生列表重测高度（OwnerDrawVariable 只在增删时测），
+                // 否则条目高度停在空文本的尺寸：总滚动高度偏小（滚不到底）+ 内容溢出（视觉重叠）
+                ReMeasure();
                 dirty = true;   // 交给同一定时器里的滚动/重绘逻辑
             }
         }
@@ -977,6 +1000,7 @@ namespace OfficeAgent.Host
             {
                 msgs[idx].Text = text;
                 msgs[idx].CachedTextH = -1; msgs[idx].CachedHeight = -1;
+                ReMeasure();   // 文本变了高度也会变，让原生列表重测（同 FlushStream 注释）
                 MarkDirty();
             }
         }
@@ -1142,10 +1166,27 @@ namespace OfficeAgent.Host
         {
             if (config == null || model == null || model.Length == 0 || model == config.Model) return;
             config.Model = model;
+            // 跨供应商预置模型：自动把服务地址带过去（密钥按 host 分家保存）。
+            // 不带地址的话，模型名换了端点没换——"拿 A 家的密钥向 B 家发请求"就是这么来的。
+            string note = "";
+            string presetUrl = LlmClient.BaseUrlForModel(model);
+            if (presetUrl != null)
+            {
+                string target = AppConfig.HostOf(presetUrl);
+                string cur = AppConfig.HostOf(config.BaseUrl);
+                if (target.Length > 0 && target != cur)
+                {
+                    bool haveKey = config.HasKeyForHost(target);
+                    config.BaseUrl = presetUrl;
+                    note = haveKey
+                        ? "（服务地址已自动切到 " + target + "，用这家已保存的密钥）"
+                        : "（服务地址已自动切到 " + target + "；这家还没存密钥，请点下方模型入口进设置填一次）";
+                }
+            }
             config.Save();
             client = IsConfigured() ? new LlmClient(config) : null;
             ApplyConfig(config);
-            Append("assistant", "已切换模型：" + model + "。");
+            Append("assistant", "已切换模型：" + model + note);
         }
 
         void FetchModelsThenReopen()
@@ -1696,6 +1737,7 @@ namespace OfficeAgent.Host
                 if (config.PluginHist && !isError && text != null && !text.StartsWith("✗"))
                     MemoryStore.AppendHistory("assistant", text);
                 if (!isError) { SplitLongFinal(idx); SaveSession(); }
+                else { ReMeasure(); }   // 错误气泡同样换了大文本，也要重测（SplitLongFinal 已含重测）
             }
             MarkDirty();
         }
@@ -1705,10 +1747,13 @@ namespace OfficeAgent.Host
         {
             if (idx < 0 || idx >= msgs.Count) return;
             ChatMsg head = msgs[idx];
-            List<string> parts = SplitText(head.Text, AvailWidth());
+            List<string> parts = SplitText(head.Text, AvailWidth(), ChunkMaxTextH());
             if (parts.Count <= 1)
             {
                 head.First = true; head.Last = true;
+                // 文本被替换过（"思考中…"→正式答复），必须让原生列表重测一次高度，
+                // 否则条目高度停在旧值：绘制内容溢出压到相邻气泡（重叠）、总高偏小（滚不到底）
+                ReMeasure();
                 return;
             }
             head.Text = parts[0];
@@ -1730,25 +1775,25 @@ namespace OfficeAgent.Host
             ReMeasure();
         }
 
-        // 把超长文本按测量高度切成 ≤ MaxChunkTextH 的段（优先在换行/标点处断开）
-        static List<string> SplitText(string text, int avail)
+        // 把超长文本按测量高度切成 ≤ maxChunkH 的段（优先在换行/标点处断开）
+        static List<string> SplitText(string text, int avail, int maxChunkH)
         {
             List<string> parts = new List<string>();
             if (text == null || text.Length == 0) { parts.Add(""); return parts; }
             Size ts = TextRenderer.MeasureText(text, TextFont, new Size(avail, 100000), TextFormatFlags.WordBreak);
-            if (ts.Height <= MaxChunkTextH) { parts.Add(text); return parts; }
+            if (ts.Height <= maxChunkH) { parts.Add(text); return parts; }
             int lineH = TextRenderer.MeasureText("测Mg", TextFont).Height;
             if (lineH < 8) lineH = 17;
             int linesTotal = Math.Max(1, ts.Height / lineH);
             int charsPerLine = Math.Max(10, text.Length / linesTotal);
-            int chunkLines = Math.Max(4, MaxChunkTextH / lineH - 1);
+            int chunkLines = Math.Max(4, maxChunkH / lineH - 1);
             int target = chunkLines * charsPerLine;
             string rest = text;
             int guard = 0;
             while (guard++ < 200)
             {
                 int rh = TextRenderer.MeasureText(rest, TextFont, new Size(avail, 100000), TextFormatFlags.WordBreak).Height;
-                if (rh <= MaxChunkTextH || rest.Length < 40) { parts.Add(rest); break; }
+                if (rh <= maxChunkH || rest.Length < 40) { parts.Add(rest); break; }
                 int cut = Math.Min(target, rest.Length - 1);
                 int brk = -1;
                 int floor = cut / 2;
@@ -1764,7 +1809,7 @@ namespace OfficeAgent.Host
                 if (brk <= 0) brk = cut;
                 string part = rest.Substring(0, brk);
                 int ph = TextRenderer.MeasureText(part, TextFont, new Size(avail, 100000), TextFormatFlags.WordBreak).Height;
-                while (ph > MaxChunkTextH && brk > 40)
+                while (ph > maxChunkH && brk > 40)
                 {
                     brk = brk * 3 / 4;
                     part = rest.Substring(0, brk);
@@ -1800,7 +1845,7 @@ namespace OfficeAgent.Host
             if (!pending && text != null && text.Length > 0)
             {
                 MeasureMsg(m, AvailWidth());
-                if (m.CachedTextH > MaxChunkTextH) SplitLongFinal(msgs.Count - 1);
+                if (m.CachedTextH > ChunkMaxTextH()) SplitLongFinal(msgs.Count - 1);
             }
             MarkDirty();
             return msgs.Count - 1;

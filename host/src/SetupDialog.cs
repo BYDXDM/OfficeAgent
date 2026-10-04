@@ -61,14 +61,15 @@ namespace OfficeAgent.Host
             txtUrl.Text = cfg.BaseUrl == null ? "" : cfg.BaseUrl;
             Controls.Add(txtUrl);
 
-            AddLabel("API 密钥（只存本机，DPAPI 加密）", 176);
+            AddLabel("API 密钥（每家服务分开保存，换服务商不用重填；只存本机，DPAPI 加密）", 176);
             txtKey = new TextBox();
             txtKey.Location = new Point(28, 198);
             txtKey.Size = new Size(504, 26);
             txtKey.PasswordChar = '●';
             // 已存密钥时预填占位符：让用户看到"已经存过"，不填即为不修改。
             // 此前该框恒为空 → 用户每次都要重填，且以为是没保存（旧行为还会让空值覆盖已存密钥）。
-            hasStoredKey = (cfg.GetKey() != null && cfg.GetKey().Length > 0);
+            // 密钥按服务地址（host）归属：地址栏指向哪家就显示哪家的存储状态（见 RefreshKeyState）。
+            hasStoredKey = cfg.HasKeyForHost(AppConfig.HostOf(cfg.BaseUrl));
             // 先挂 TextChanged 会被下面的占位赋值误判成"用户输入过"，故占位赋值放在事件挂接之前
             if (hasStoredKey) { txtKey.Text = KeyPlaceholder; txtKey.ForeColor = Color.FromArgb(120, 120, 130); }
             txtKey.GotFocus += delegate
@@ -85,6 +86,8 @@ namespace OfficeAgent.Host
                 if (txtKey.ForeColor != Color.Black) txtKey.ForeColor = Color.Black;
             };
             Controls.Add(txtKey);
+            // 服务地址改动 → 密钥框切换到对应服务的存储状态（修"一家 key 到处用"）
+            txtUrl.TextChanged += delegate { RefreshKeyState(); };
 
             btnFetch = AddBtn("获取模型列表", 28, 236, 120, delegate { FetchModels(); });
             AddLabel("模型", 246 - 2, 168);
@@ -181,6 +184,27 @@ namespace OfficeAgent.Host
             return k;
         }
 
+        // 服务地址变化 → 密钥框跟随该地址（host）的存储状态：
+        // 已存 → 占位符「留空沿用」；未存 → 空框等待输入。只动占位，不碰用户已输入的真实内容。
+        void RefreshKeyState()
+        {
+            bool stored = config != null && config.HasKeyForHost(AppConfig.HostOf(txtUrl.Text));
+            hasStoredKey = stored;
+            if (stored)
+            {
+                if (txtKey.Text.Length == 0)
+                {
+                    txtKey.Text = KeyPlaceholder;
+                    txtKey.ForeColor = Color.FromArgb(120, 120, 130);
+                }
+            }
+            else if (txtKey.Text == KeyPlaceholder)
+            {
+                txtKey.Text = "";
+                txtKey.ForeColor = Color.Black;
+            }
+        }
+
         LlmClient MakeClient()
         {
             AppConfig tmp = new AppConfig();
@@ -189,7 +213,7 @@ namespace OfficeAgent.Host
             tmp.AllowLan = chkLan.Checked;
             tmp.WebSearch = chkWeb.Checked;
             string key = EnteredKey();
-            if (key == null) key = config.GetKey();   // 未重填则沿用已存密钥
+            if (key == null) key = config.KeyForHost(AppConfig.HostOf(txtUrl.Text.Trim()));   // 未重填则沿用该服务已存密钥
             if (key != null) tmp.SetKey(key);
             return new LlmClient(tmp);
         }
@@ -260,10 +284,10 @@ namespace OfficeAgent.Host
         {
             string url = txtUrl.Text.Trim();
             string key = EnteredKey();
-            // 只有"地址与密钥都空且本来就没有密钥"才算离线模式；
-            // 否则会把已存密钥/地址静默清空（此前 config.json 被写成 baseUrl="" 就是这样丢的）
-            bool haveStored = config.GetKey() != null && config.GetKey().Length > 0;
-            if (url.Length == 0 && key == null && !haveStored)
+            // 地址与密钥都空 = 离线模式。只清当前指向，不删任何一家已存密钥
+            //（下次把地址填回来，该服务的密钥自动生效——此前空值覆盖导致 config 被清空的教训）。
+            // 各家已存密钥原样保留。
+            if (url.Length == 0 && key == null)
             {
                 config.BaseUrl = ""; config.Model = ""; config.WizardDone = true;
                 config.Save();

@@ -37,6 +37,7 @@ namespace OfficeAgent.Host
             bool intentTest = false;
             bool suggestTest = false;
             bool caretTest = false;
+            bool toolidTest = false;
             string gridTestInput = null;
             bool skillTest = false;
             bool auditTest = false;
@@ -60,6 +61,7 @@ namespace OfficeAgent.Host
                 else if (a == "/intents") intentTest = true;
                 else if (a == "/suggesttest") suggestTest = true;
                 else if (a == "/carettest") caretTest = true;
+                else if (a == "/toolidtest") toolidTest = true;
                 else if (a == "/gridtest" && i + 1 < args.Length) { gridTestInput = args[i + 1]; i += 1; }
                 else if (a == "/skilltest") skillTest = true;
                 else if (a == "/audittest") auditTest = true;
@@ -102,7 +104,7 @@ namespace OfficeAgent.Host
 
             // CLI 无头链同样落审计（设计方案 §7.3：每个动作可审计；GUI 的 app_start 在 MainForm）
             if (selftest || guardTest || maskTest || intentTest || suggestTest || skillTest || caretTest
-                || auditTest || detectTest || bridgeTest || planTest || perfTest
+                || auditTest || detectTest || bridgeTest || planTest || perfTest || toolidTest
                 || gridTestInput != null
                 || skillRunArgs != null || agentTestArgs != null || reconArgs != null || mergeArgs != null
                 || invoiceArgs != null || convertInput != null || renderInput != null
@@ -157,6 +159,14 @@ namespace OfficeAgent.Host
                 try { AllocConsole(); } catch { }
                 try { Console.OutputEncoding = Encoding.UTF8; } catch { }
                 return RunCaretTest();
+            }
+
+            if (toolidTest)
+            {
+                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
+                try { AllocConsole(); } catch { }
+                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                return RunToolIdTest();
             }
 
             if (skillTest)
@@ -337,6 +347,95 @@ namespace OfficeAgent.Host
                 + "\" 第3行=\"" + (rows > 2 ? g[2, 0] : "") + "\"");
 
             Console.WriteLine(failed == 0 ? "ALL PASS" : (failed + " FAILED"));
+            return failed == 0 ? 0 : 2;
+        }
+
+        // /toolidtest —— tool_calls 解析无头回归（不连网）。
+        // 背景：并行工具调用时，部分模型/网关会给出重复或缺失的 tool_call id；
+        // 旧解析法"从 function 往回找最近 id"还会串号。原样回显后，严格校验的端点
+        // 直接拒收：HTTP 400 "Duplicate value for 'tool_call_id' of call_00_xxx in message[N]"，
+        // 用户侧表现就是"一调用插件/技能就报错"。本测试用构造的响应消息验证 ParseToolCallsInto。
+        static int RunToolIdTest()
+        {
+            int failed = 0;
+            Action<string, bool> check = delegate(string name, bool ok)
+            {
+                Console.WriteLine((ok ? "  ok    " : "  FAIL  ") + name);
+                if (!ok) failed++;
+            };
+
+            // 1) 正常两条：id 各异，原样保留
+            LlmReply r1 = new LlmReply();
+            LlmClient.ParseToolCallsInto(
+                "{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[" +
+                "{\"id\":\"call_00_AAA111\",\"type\":\"function\",\"function\":{\"name\":\"list_directory\",\"arguments\":\"{}\"}}," +
+                "{\"id\":\"call_00_BBB222\",\"type\":\"function\",\"function\":{\"name\":\"read_text_file\",\"arguments\":\"{\\\"p\\\":\\\"a.txt\\\"}\"}}" +
+                "]}", r1);
+            check("正常两条全部解析", r1.ToolCalls != null && r1.ToolCalls.Count == 2 && r1.HasToolCalls);
+            check("正常 id 原样保留", r1.ToolCalls[0][0] == "call_00_AAA111" && r1.ToolCalls[1][0] == "call_00_BBB222");
+            check("正常 name/arguments 解析", r1.ToolCalls[0][1] == "list_directory" && r1.ToolCalls[1][1] == "read_text_file"
+                && r1.ToolCalls[1][2].Contains("a.txt"));
+
+            // 2) 模型复用同一 id（服务端报 Duplicate 的直接来源）→ 第二条改写为唯一值
+            LlmReply r2 = new LlmReply();
+            LlmClient.ParseToolCallsInto(
+                "{\"tool_calls\":[" +
+                "{\"id\":\"call_00_DUP\",\"type\":\"function\",\"function\":{\"name\":\"list_directory\",\"arguments\":\"{}\"}}," +
+                "{\"id\":\"call_00_DUP\",\"type\":\"function\",\"function\":{\"name\":\"list_directory\",\"arguments\":\"{}\"}}" +
+                "]}", r2);
+            check("重复 id 数量保留", r2.ToolCalls != null && r2.ToolCalls.Count == 2);
+            check("重复 id 第二条被改写为唯一", r2.ToolCalls[0][0] == "call_00_DUP"
+                && r2.ToolCalls[1][0].StartsWith("call_oa_", StringComparison.Ordinal));
+
+            // 3) 缺失 id → 补唯一值
+            LlmReply r3 = new LlmReply();
+            LlmClient.ParseToolCallsInto(
+                "{\"tool_calls\":[" +
+                "{\"type\":\"function\",\"function\":{\"name\":\"list_directory\",\"arguments\":\"{}\"}}," +
+                "{\"type\":\"function\",\"function\":{\"name\":\"read_text_file\",\"arguments\":\"{}\"}}" +
+                "]}", r3);
+            check("缺失 id 自动补齐且唯一", r3.ToolCalls != null && r3.ToolCalls.Count == 2
+                && r3.ToolCalls[0][0].Length > 0 && r3.ToolCalls[1][0].Length > 0
+                && r3.ToolCalls[0][0] != r3.ToolCalls[1][0]);
+
+            // 4) 参数串里带转义的 \"id\": 字样 → 不得串成条目 id（旧回溯法的串号场景）
+            LlmReply r4 = new LlmReply();
+            LlmClient.ParseToolCallsInto(
+                "{\"tool_calls\":[" +
+                "{\"id\":\"call_00_REAL1\",\"type\":\"function\",\"function\":{\"name\":\"create_spreadsheet\",\"arguments\":\"{\\\"rows\\\":[{\\\"id\\\":\\\"x1\\\"}]}\"}}," +
+                "{\"type\":\"function\",\"function\":{\"name\":\"read_text_file\",\"arguments\":\"{\\\"body\\\":\\\"id=x2\\\"}\"}}" +
+                "]}", r4);
+            check("参数内 id 不污染条目 id", r4.ToolCalls != null && r4.ToolCalls.Count == 2
+                && r4.ToolCalls[0][0] == "call_00_REAL1"
+                && r4.ToolCalls[1][0].StartsWith("call_oa_", StringComparison.Ordinal));
+
+            // 5) id 写在 function 之后（个别网关的乱序形态）
+            LlmReply r5 = new LlmReply();
+            LlmClient.ParseToolCallsInto(
+                "{\"tool_calls\":[" +
+                "{\"type\":\"function\",\"function\":{\"name\":\"list_directory\",\"arguments\":\"{}\"},\"id\":\"call_00_LATE\"}" +
+                "]}", r5);
+            check("乱序 id 仍取得到", r5.ToolCalls != null && r5.ToolCalls.Count == 1 && r5.ToolCalls[0][0] == "call_00_LATE");
+
+            // 6) web_search 等非 function 条目跳过
+            LlmReply r6 = new LlmReply();
+            LlmClient.ParseToolCallsInto(
+                "{\"tool_calls\":[" +
+                "{\"id\":\"ws1\",\"type\":\"web_search\",\"web_search\":{\"search_query\":\"x\"}}," +
+                "{\"id\":\"call_00_OK\",\"type\":\"function\",\"function\":{\"name\":\"list_directory\",\"arguments\":\"{}\"}}" +
+                "]}", r6);
+            check("非 function 条目跳过", r6.ToolCalls != null && r6.ToolCalls.Count == 1 && r6.ToolCalls[0][0] == "call_00_OK");
+
+            // 7) 无 tool_calls / 空数组
+            LlmReply r7 = new LlmReply();
+            LlmClient.ParseToolCallsInto("{\"role\":\"assistant\",\"content\":\"你好\"}", r7);
+            check("无 tool_calls 不误报", !r7.HasToolCalls && r7.ToolCalls == null);
+
+            LlmReply r8 = new LlmReply();
+            LlmClient.ParseToolCallsInto("{\"tool_calls\":[]}", r8);
+            check("空数组不算工具调用", r8.ToolCalls != null && r8.ToolCalls.Count == 0 && !r8.HasToolCalls);
+
+            Console.WriteLine(failed == 0 ? "toolidtest ALL PASS" : ("toolidtest FAILED=" + failed));
             return failed == 0 ? 0 : 2;
         }
 

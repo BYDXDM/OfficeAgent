@@ -22,6 +22,10 @@
 # 技能清单与配置
 *.json text eol=lf
 
+# Inno Setup 语言文件：UTF-8 带 BOM（BOM 由文件内容自带，git 不会剥除）。
+# 行尾固定 LF——Inno 两种都接受，固定以免跨机 checkout 产生 diff 噪声。
+*.isl text eol=lf
+
 # 文档
 *.md text eol=lf
 

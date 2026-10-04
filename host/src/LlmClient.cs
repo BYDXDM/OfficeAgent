@@ -46,11 +46,14 @@ namespace OfficeAgent.Host
             EnableWebSearch = c != null && c.WebSearch;
         }
 
-        // 预置常用模型（/models 拉取失败时也有得选；设置页与会话页内联下拉共用）
+        // 预置常用模型（/models 拉取失败时也有得选；设置页与会话页内联下拉共用）。
+        // 2026-10 用户定制：日常只用这五个（其余模型走「从服务刷新模型列表」或手填）。
         public static readonly string[] ModelPresets = new string[] {
-            "glm-4.6", "glm-4.5", "glm-4.5-flash", "glm-4.5-air", "glm-4.5v",
-            "glm-4-flash-250414", "glm-4-plus", "glm-4-long",
-            "deepseek-chat", "deepseek-reasoner", "qwen-plus", "qwen-turbo", "gpt-4o-mini" };
+            "deepseek-flash",          // DeepSeek-V4.1-Flash（官方 id=deepseek-flash，1M 上下文）
+            "glm-4.5-air",
+            "glm-4.1v-thinking-flash", // GLM-4.1V-Thinking 免费版（bigmodel 实际 id 带 -flash 后缀）
+            "gpt-5.6-luna",
+            "gpt-6-luna" };
 
         // 预置模型所属的官方 OpenAI 兼容端点。内联下拉跨供应商切换模型时自动带出地址：
         // 密钥按服务（host）分开保存（见 AppConfig），从根上杜绝"拿 A 家的密钥向 B 家发请求"。

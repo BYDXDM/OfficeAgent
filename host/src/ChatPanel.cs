@@ -970,6 +970,8 @@ namespace OfficeAgent.Host
             string m = (model ?? "").ToLowerInvariant();
             if (m.Length == 0) return 0;
             if (m.Contains("glm-4-long")) return 1000000;
+            if (m.Contains("deepseek-flash")) return 1000000;   // DeepSeek-V4.1-Flash 官方 1M
+            if (m.Contains("luna")) return 1000000;             // gpt-5.6/6-luna ~1.05M
             if (m.Contains("glm")) return 128000;
             if (m.Contains("deepseek")) return 64000;
             if (m.Contains("qwen")) return 128000;

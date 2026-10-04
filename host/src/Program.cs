@@ -492,6 +492,8 @@ namespace OfficeAgent.Host
                 check("工资表公式：应纳税所得额 MAX 守卫", s2 != null && s2.Contains("MAX(0,G2-参数!B7"));
                 check("工资表合计行 SUM", s2 != null && s2.Contains("SUM(D2:D"));
                 check("工资表空白行 IF 守卫（不显示 0）", s2 != null && s2.Contains("IF(B54="));
+                check("工资表全部公式括号配平", AllFormulasBalanced(s2));
+                check("参数页全部公式括号配平", AllFormulasBalanced(ReadZipEntry(payroll, "xl/worksheets/sheet1.xml")));
             }
 
             // ③ 增值税台账
@@ -507,6 +509,7 @@ namespace OfficeAgent.Host
                 check("增值税应纳税额=销项-进项", s2 != null && s2.Contains("ROUND(B3-B5,2)"));
                 string s1 = ReadZipEntry(vat, "xl/worksheets/sheet1.xml");
                 check("台账税额=金额×税率", s1 != null && s1.Contains("ROUND(D2*E2,2)"));
+                check("增值税两页公式括号配平", AllFormulasBalanced(s1) && AllFormulasBalanced(s2));
             }
 
             // ④ 流水账
@@ -522,6 +525,7 @@ namespace OfficeAgent.Host
                 string s3 = ReadZipEntry(ledger, "xl/worksheets/sheet3.xml");
                 check("流水分类 SUMIF", s3 != null && s3.Contains("SUMIF(流水!C2:C"));
                 check("流水期末结余公式", s3 != null && s3.Contains("ROUND(B2-B3+参数!B2,2)"));
+                check("流水两页公式括号配平", AllFormulasBalanced(ReadZipEntry(ledger, "xl/worksheets/sheet2.xml")) && AllFormulasBalanced(s3));
             }
 
             // ⑤ 自由模式：formulaCols + summary
@@ -592,6 +596,31 @@ namespace OfficeAgent.Host
                     return sr.ReadToEnd();
             }
             catch { return null; }
+        }
+
+        // 括号配平守卫：sheet 内所有 <f> 公式的圆括号必须配平。
+        // 背景：0.8.0 个税 IF 链曾少一个右括号——openpyxl 结构校验发现不了，
+        // LibreOffice 实算才暴露 #VALUE!；此断言让该类错误在 /formulatest 就地拦截。
+        static bool AllFormulasBalanced(string sheetXml)
+        {
+            if (sheetXml == null) return false;
+            int i = 0;
+            while ((i = sheetXml.IndexOf("<f>", i, StringComparison.Ordinal)) >= 0)
+            {
+                int end = sheetXml.IndexOf("</f>", i, StringComparison.Ordinal);
+                if (end < 0) return false;
+                string f = sheetXml.Substring(i + 3, end - i - 3);
+                int depth = 0;
+                for (int c = 0; c < f.Length; c++)
+                {
+                    if (f[c] == '(') depth++;
+                    else if (f[c] == ')') depth--;
+                    if (depth < 0) return false;
+                }
+                if (depth != 0) return false;
+                i = end;
+            }
+            return true;
         }
 
         static int RunCaretTest()

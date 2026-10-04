@@ -1,4 +1,4 @@
-; OfficeAgent Inno Setup installer script (design doc section 8.3, dual SKU).
+﻿; OfficeAgent Inno Setup installer script (design doc section 8.3, dual SKU).
 ; Build:  ISCC /DSKU=complete officeagent.iss   -> full offline (payload bundled)
 ;         ISCC /DSKU=lite officeagent.iss       -> lite online (boot fetches missing parts)
 ; Inno Setup 6.x; Win7 SP1+; PrivilegesRequired=lowest (per-user, no admin).
@@ -7,12 +7,14 @@
 
 #define AppName "OfficeAgent"
 #define AppVersion "0.8.1"
+#define AppVersionNum "0.8.1.0"
 #define AppPublisher "OfficeAgent Project"
 
 [Setup]
 AppId={{8E1F4B7A-52C0-4A5E-9A2B-OFFICEAGENTM1}
 AppName={#AppName}
 AppVersion={#AppVersion}
+AppVerName={#AppName} {#AppVersion}
 AppPublisher={#AppPublisher}
 DefaultDirName={localappdata}\{#AppName}
 PrivilegesRequired=lowest
@@ -24,11 +26,29 @@ SolidCompression=yes
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=6.1sp1
 WizardStyle=modern
+; 多语言：中文优先，按系统 UI 语言预选（中文系统直接中文向导），仍可手动切英文
+ShowLanguageDialog=auto
 SetupIconFile=..\app.ico
-UninstallDisplayIcon={app}\boot\OfficeAgentBoot.exe
+UninstallDisplayIcon={app}\host\OfficeAgent.exe
+; Setup 程序 exe 的属性页元数据（右键 → 属性 → 详细信息）
+VersionInfoCompany={#AppPublisher}
+VersionInfoDescription={#AppName} Setup
+VersionInfoProductName={#AppName}
+VersionInfoProductVersion={#AppVersion}
+VersionInfoVersion={#AppVersionNum}
+VersionInfoCopyright=Copyright (C) 2026 {#AppPublisher}
 
 [Languages]
+; 中文放首位 = 默认语言。MessagesFile 相对本 .iss 所在目录（installer\）。
+Name: "chinesesimplified"; MessagesFile: "lang\ChineseSimplified.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[CustomMessages]
+; 任务/运行项描述需本地化：Inno 不会自动翻译 [Tasks]/[Run] 里的字符串，用 {cm:} 引用。
+chinesesimplified.CreateDesktopIcon=创建桌面快捷方式(&D)
+english.CreateDesktopIcon=Create a &desktop shortcut
+chinesesimplified.LaunchApp=立即启动 OfficeAgent（首次运行自检）
+english.LaunchApp=Launch OfficeAgent (first-run check)
 
 [Files]
 ; host programs (both SKUs)
@@ -69,10 +89,10 @@ Name: "{autoprograms}\{#AppName}"; Filename: "{app}\boot\OfficeAgentBoot.exe"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\boot\OfficeAgentBoot.exe"; Tasks: desktopicon
 
 [Tasks]
-Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional tasks:"
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"
 
 [Run]
-Filename: "{app}\boot\OfficeAgentBoot.exe"; Description: "Launch bootstrap (first-run check & offline fix)"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\boot\OfficeAgentBoot.exe"; Description: "{cm:LaunchApp}"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
 ; runtime trees unpacked by the bootstrap + conversion outputs

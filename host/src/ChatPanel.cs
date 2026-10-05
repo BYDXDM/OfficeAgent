@@ -1138,17 +1138,20 @@ namespace OfficeAgent.Host
         }
 
         // 内联模型下拉（用户要求：点右下角直接选模型，不必进设置页）
+        // 条目来源：本次会话拉取的列表 + config.CustomModels（落盘的自定义模型，重启后仍在）
+        //          + 预置（含 deepseek-flash#2 这类同服务多账号条目，显示为「（号2）」）。
         void ShowModelMenu()
         {
             ContextMenu m = new ContextMenu();
             string cur = config == null ? "" : (config.Model ?? "");
             List<string> items = new List<string>();
             if (fetchedModels != null) { foreach (string f in fetchedModels) if (!items.Contains(f)) items.Add(f); }
+            if (config != null) { foreach (string cm in config.CustomModelList()) if (!items.Contains(cm)) items.Add(cm); }
             foreach (string p in LlmClient.ModelPresets) if (!items.Contains(p)) items.Add(p);
             if (cur.Length > 0 && !items.Contains(cur)) items.Insert(0, cur);
             foreach (string s in items)
             {
-                MenuItem mi = new MenuItem(s);
+                MenuItem mi = new MenuItem(LlmClient.ModelDisplay(s));
                 mi.Checked = s == cur;
                 string val = s;
                 mi.Click += delegate { SwitchModel(val); };
@@ -1168,8 +1171,10 @@ namespace OfficeAgent.Host
         {
             if (config == null || model == null || model.Length == 0 || model == config.Model) return;
             config.Model = model;
+            if (LlmClient.ModelTagOf(model).Length == 0) config.AddCustomModel(model);   // 非预置的手填/拉取模型记下来，下拉重启后仍在
             // 跨供应商预置模型：自动把服务地址带过去（密钥按 host 分家保存）。
             // 不带地址的话，模型名换了端点没换——"拿 A 家的密钥向 B 家发请求"就是这么来的。
+            // 带 #tag 的账号条目（deepseek-flash#2）密钥在 host#tag 槽，按槽检查。
             string note = "";
             string presetUrl = LlmClient.BaseUrlForModel(model);
             if (presetUrl != null)
@@ -1178,17 +1183,19 @@ namespace OfficeAgent.Host
                 string cur = AppConfig.HostOf(config.BaseUrl);
                 if (target.Length > 0 && target != cur)
                 {
-                    bool haveKey = config.HasKeyForHost(target);
+                    string tag = LlmClient.ModelTagOf(model);
+                    bool haveKey = config.HasKeyForHost(target, tag);
                     config.BaseUrl = presetUrl;
+                    string slot = tag.Length == 0 ? "" : "（号" + tag + "）";
                     note = haveKey
                         ? "（服务地址已自动切到 " + target + "，用这家已保存的密钥）"
-                        : "（服务地址已自动切到 " + target + "；这家还没存密钥，请点下方模型入口进设置填一次）";
+                        : "（服务地址已自动切到 " + target + "；" + slot + "还没存密钥，请点下方模型入口进设置，选该模型后填一次密钥）";
                 }
             }
             config.Save();
             client = IsConfigured() ? new LlmClient(config) : null;
             ApplyConfig(config);
-            Append("assistant", "已切换模型：" + model + note);
+            Append("assistant", "已切换模型：" + LlmClient.ModelDisplay(model) + note);
         }
 
         void FetchModelsThenReopen()
@@ -1198,6 +1205,12 @@ namespace OfficeAgent.Host
             {
                 string err;
                 List<string> models = client.ListModels(out err);
+                if (models != null && config != null)
+                {
+                    // 拉取过的模型落盘（此前只存内存，重启后内联下拉里就没有了——用户反馈"新添加的模型不出现"）
+                    foreach (string md in models) config.AddCustomModel(md);
+                    config.Save();
+                }
                 if (InvokeRequired)
                 {
                     Invoke((MethodInvoker)delegate

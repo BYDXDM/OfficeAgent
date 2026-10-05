@@ -230,15 +230,30 @@ namespace OfficeAgent.Host
 
         LlmClient MakeClient()
         {
+            return MakeClientAt(txtUrl.Text.Trim());
+        }
+
+        // 按 baseUrl 建临时客户端（补 /v1 重试用）。密钥按 host+账号槽 查找——
+        // 补 /v1 不改 host；模型带 #tag（如 deepseek-flash#2）时密钥在 host#tag 槽。
+        LlmClient MakeClientAt(string baseUrl)
+        {
             AppConfig tmp = new AppConfig();
-            tmp.BaseUrl = txtUrl.Text.Trim();
+            tmp.BaseUrl = baseUrl;
             tmp.Model = cmbModel.Text.Trim();
             tmp.AllowLan = chkLan.Checked;
             tmp.WebSearch = chkWeb.Checked;
+            string tag = LlmClient.ModelTagOf(tmp.Model);
             string key = EnteredKey();
-            if (key == null) key = config.KeyForHost(AppConfig.HostOf(txtUrl.Text.Trim()));   // 未重填则沿用该服务已存密钥
-            if (key != null) tmp.SetKey(key);
+            if (key == null) key = config.KeyForHost(AppConfig.HostOf(baseUrl), tag);   // 未重填则沿用该服务该账号已存密钥
+            if (key != null) tmp.SetKeyFor(AppConfig.HostOf(baseUrl), key, tag);
             return new LlmClient(tmp);
+        }
+
+        // 裸域名补 /v1 成功后回填地址栏（用户点「保存」即落盘）。补 /v1 不改 host，已存密钥照常命中。
+        void FillV1(string v1)
+        {
+            if (InvokeRequired) Invoke((MethodInvoker)delegate { FillV1(v1); });
+            else txtUrl.Text = v1;
         }
 
         void Guarded(Action work)
@@ -274,6 +289,18 @@ namespace OfficeAgent.Host
                 LlmClient c = MakeClient();
                 string err;
                 System.Collections.Generic.List<string> models = c.ListModels(out err);
+                // 裸域名（如 worldcodes.online）时 API 实际在 /v1 下——失败先补 /v1 重试，成功则回填地址栏
+                bool viaV1 = false;
+                if (models == null)
+                {
+                    string v1 = LlmClient.SuggestV1Base(txtUrl.Text.Trim());
+                    if (v1 != null)
+                    {
+                        string err2;
+                        System.Collections.Generic.List<string> m2 = MakeClientAt(v1).ListModels(out err2);
+                        if (m2 != null) { models = m2; viaV1 = true; FillV1(v1); }
+                    }
+                }
                 if (models == null) { SetResult("✗ " + err, false); return; }
                 if (InvokeRequired)
                 {
@@ -285,7 +312,7 @@ namespace OfficeAgent.Host
                         else if (cmbModel.Items.Count > 0) cmbModel.SelectedIndex = 0;
                     });
                 }
-                SetResult("✓ 获取到 " + models.Count + " 个模型，请选择后点「测试连接」", true);
+                SetResult("✓ 获取到 " + models.Count + " 个模型" + (viaV1 ? "（已自动补 /v1 并回填地址栏，点「保存」生效）" : "") + "，请选择后点「测试连接」", true);
             });
         }
 
@@ -297,9 +324,23 @@ namespace OfficeAgent.Host
                 string err;
                 System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
                 string reply = c.Chat("ping", "You are a connectivity test. Reply with exactly: pong", out err);
+                // 裸域名失败 → 补 /v1 重试（Sub2API 等网关的 API 都在 /v1 下，用户常只填域名）
+                bool viaV1 = false;
+                if (reply == null)
+                {
+                    string v1 = LlmClient.SuggestV1Base(txtUrl.Text.Trim());
+                    if (v1 != null)
+                    {
+                        string err2;
+                        LlmClient c2 = MakeClientAt(v1);
+                        string r2 = c2.Chat("ping", "You are a connectivity test. Reply with exactly: pong", out err2);
+                        if (r2 != null) { reply = r2; c = c2; viaV1 = true; FillV1(v1); }
+                    }
+                }
                 sw.Stop();
                 if (reply == null) { SetResult("✗ " + err, false); return; }
-                SetResult("✓ 模型可用：" + c.Model + "，回复 " + reply.Trim().Length + " 字符，耗时 " + (sw.ElapsedMilliseconds / 1000.0).ToString("0.0") + "s", true);
+                SetResult("✓ 模型可用：" + c.Model + "，回复 " + reply.Trim().Length + " 字符，耗时 " + (sw.ElapsedMilliseconds / 1000.0).ToString("0.0") + "s"
+                    + (viaV1 ? "（已自动补 /v1 并回填地址栏，点「保存」生效）" : ""), true);
             });
         }
 
@@ -327,8 +368,10 @@ namespace OfficeAgent.Host
             config.AllowLan = chkLan.Checked;
             config.WebSearch = chkWeb.Checked;
             config.WorkspaceDir = txtWorkspace.Text.Trim();   // 工作区目录随设置一起保存
+            config.AddCustomModel(config.Model);   // 记住该模型，内联下拉重启后仍可见
             config.WizardDone = true;
-            if (key != null) config.SetKey(key);   // 只有真正输入了新密钥才覆盖
+            // 只有真正输入了新密钥才覆盖；账号槽取自所选模型（deepseek-flash#2 → host#2）
+            if (key != null) config.SetKeyFor(AppConfig.HostOf(url), key, LlmClient.ModelTagOf(config.Model));
             config.Save();
             saved = true;
             Close();

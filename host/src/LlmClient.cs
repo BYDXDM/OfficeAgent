@@ -40,27 +40,61 @@ namespace OfficeAgent.Host
         public LlmClient(AppConfig c)
         {
             BaseUrl = NormalizeBase(c == null ? "" : c.BaseUrl);
-            ApiKey = c == null ? null : c.GetKey();
-            Model = c == null ? "" : c.Model;
+            // 模型名可带 #tag（deepseek-flash#2 = 同服务的第 2 个账号）：
+            // 密钥按 host+tag 取槽（环境变量覆盖逻辑在 GetKeyFor 内），API 调用只发剥掉后缀的模型名。
+            ApiKey = c == null ? null : c.GetKeyFor(ModelTagOf(c.Model));
+            Model = c == null ? "" : ModelWithoutTag(c.Model);
             AllowLan = c != null && c.AllowLan;
             EnableWebSearch = c != null && c.WebSearch;
         }
 
         // 预置常用模型（/models 拉取失败时也有得选；设置页与会话页内联下拉共用）。
-        // 2026-10 用户定制：日常只用这五个（其余模型走「从服务刷新模型列表」或手填）。
+        // 2026-10 用户定制：日常只用这几个（其余模型走「从服务刷新模型列表」或手填）。
+        // "deepseek-flash#2" = 同一 DeepSeek 服务的第 2 个账号（用户有两个号）：
+        // #<数字> 后缀只用于选密钥槽（host#tag），发给 API 的模型名会剥掉后缀（见 ModelWithoutTag）。
         public static readonly string[] ModelPresets = new string[] {
             "deepseek-flash",          // DeepSeek-V4.1-Flash（官方 id=deepseek-flash，1M 上下文）
+            "deepseek-flash#2",        // 同上，账号 2
             "glm-4.5-air",
+            "glm-4.6v",                // GLM 视觉模型
             "glm-4.1v-thinking-flash", // GLM-4.1V-Thinking 免费版（bigmodel 实际 id 带 -flash 后缀）
             "gpt-5.6-luna",
             "gpt-6-luna" };
+
+        // 模型名的账号标签（#<纯数字> 后缀）：deepseek-flash#2 → "2"。无后缀/非法 → ""。
+        // 只认纯数字，避免与服务商模型 id 里可能出现的 '#' 撞车。
+        public static string ModelTagOf(string model)
+        {
+            string m = (model ?? "").Trim();
+            int h = m.LastIndexOf('#');
+            if (h <= 0 || h == m.Length - 1) return "";
+            string tag = m.Substring(h + 1);
+            for (int i = 0; i < tag.Length; i++) { char ch = tag[i]; if (ch < '0' || ch > '9') return ""; }
+            return tag;
+        }
+
+        // 发给 API 的模型名：剥掉 #tag 后缀
+        public static string ModelWithoutTag(string model)
+        {
+            string m = (model ?? "").Trim();
+            string tag = ModelTagOf(m);
+            return tag.Length == 0 ? m : m.Substring(0, m.Length - tag.Length - 1).Trim();
+        }
+
+        // 界面显示：deepseek-flash#2 → deepseek-flash（号2）
+        public static string ModelDisplay(string model)
+        {
+            string m = (model ?? "").Trim();
+            string tag = ModelTagOf(m);
+            return tag.Length == 0 ? m : ModelWithoutTag(m) + "（号" + tag + "）";
+        }
 
         // 预置模型所属的官方 OpenAI 兼容端点。内联下拉跨供应商切换模型时自动带出地址：
         // 密钥按服务（host）分开保存（见 AppConfig），从根上杜绝"拿 A 家的密钥向 B 家发请求"。
         // 返回 null = 未知/自建网关模型，只切模型名不动地址。
         public static string BaseUrlForModel(string model)
         {
-            string m = (model ?? "").Trim().ToLowerInvariant();
+            string m = ModelWithoutTag(model).ToLowerInvariant();   // deepseek-flash#2 → 按 deepseek-flash 找端点
             if (m.Length == 0) return null;
             if (m.StartsWith("glm-", StringComparison.Ordinal)) return "https://open.bigmodel.cn/api/paas/v4";
             if (m.StartsWith("deepseek-", StringComparison.Ordinal)) return "https://api.deepseek.com";
@@ -182,6 +216,35 @@ namespace OfficeAgent.Host
             return s.Replace("\n", " ");
         }
 
+        // HTTP 200 但响应体不是标准 chat JSON 时的诊断（2026-10-05 worldcodes.online 案例：
+        // 用户只填裸域名，/chat/completions 落到网关的 SPA 网页上回 200 HTML，
+        // 旧报错"响应中未找到 message 对象"完全没指向真正的问题=地址少了 /v1）。
+        internal static string DescribeBadResponse(int status, string body, string missing)
+        {
+            string head = body == null ? "" : body.TrimStart();
+            if (head.StartsWith("<", StringComparison.Ordinal))
+                return "该地址返回的是网页而非 API 响应（HTTP " + status + "）——服务地址大概率少了 /v1 一类路径，或填到了网站首页";
+            return "响应中未找到 " + missing + "（HTTP " + status + "，非 OpenAI 兼容响应）响应开头: " + TrimMsg(body);
+        }
+
+        // 裸域名（只有 http(s)://host，没有任何路径）时给出补 /v1 的候选地址；null=已有路径不用补。
+        // Sub2API/one-api 等聚合网关的 API 几乎都在 /v1 下；用户"只填域名"是最常见的漏写形态。
+        // 只做建议（设置页重试成功后回填地址栏），不在 NormalizeBase 里静默改写——
+        // 官方端点各有路径习惯（/v1、/api/paas/v4），静默补全可能把能用的配置改坏。
+        public static string SuggestV1Base(string baseUrl)
+        {
+            string u = (baseUrl ?? "").Trim();
+            if (u.Length == 0) return null;
+            Uri uri;
+            if (!Uri.TryCreate(u, UriKind.Absolute, out uri)) return null;
+            if (uri.Scheme != "http" && uri.Scheme != "https") return null;
+            string path = uri.AbsolutePath == null ? "" : uri.AbsolutePath;
+            while (path.EndsWith("/")) path = path.Substring(0, path.Length - 1);
+            if (path.Length > 0) return null;
+            if (!u.EndsWith("/")) u = u + "/";
+            return u + "v1";
+        }
+
         // 拉取模型列表（GET /models），返回模型 id 列表
         public List<string> ListModels(out string err)
         {
@@ -191,7 +254,7 @@ namespace OfficeAgent.Host
                 int status;
                 string json = Send(BaseUrl + "/models", "GET", null, 30000, out status);
                 List<string> ids = JsonFindStrings(json, "id");
-                if (ids.Count == 0) { err = "响应中未找到模型列表（确认是 OpenAI 兼容端点）"; return null; }
+                if (ids.Count == 0) { err = DescribeBadResponse(status, json, "模型列表"); return null; }
                 return ids;
             }
             catch (InvalidOperationException ex)
@@ -276,7 +339,7 @@ namespace OfficeAgent.Host
                 int mi = json.IndexOf("\"message\"", StringComparison.Ordinal);
                 LastResponseBody = json;
                 string msg = mi >= 0 ? ExtractJsonObject(json, json.IndexOf('{', mi)) : null;
-                if (msg == null) throw new InvalidOperationException("响应中未找到 message 对象");
+                if (msg == null) throw new InvalidOperationException(DescribeBadResponse(status, json, "message 对象"));
                 r.Content = JsonGetString(msg, "content");
                 if (r.Content == null) r.Content = "";
                 // 工具调用解析（只认 function 类型；web_search 等服务端自执行类型不本地分发）

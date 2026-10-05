@@ -38,6 +38,7 @@ namespace OfficeAgent.Host
             bool suggestTest = false;
             bool caretTest = false;
             bool toolidTest = false;
+            bool urlTest = false;
             bool safetyTest = false;
             bool formulaTest = false;
             string gridTestInput = null;
@@ -64,6 +65,7 @@ namespace OfficeAgent.Host
                 else if (a == "/suggesttest") suggestTest = true;
                 else if (a == "/carettest") caretTest = true;
                 else if (a == "/toolidtest") toolidTest = true;
+                else if (a == "/urltest") urlTest = true;
                 else if (a == "/safetytest") safetyTest = true;
                 else if (a == "/formulatest") formulaTest = true;
                 else if (a == "/gridtest" && i + 1 < args.Length) { gridTestInput = args[i + 1]; i += 1; }
@@ -108,7 +110,7 @@ namespace OfficeAgent.Host
 
             // CLI 无头链同样落审计（设计方案 §7.3：每个动作可审计；GUI 的 app_start 在 MainForm）
             if (selftest || guardTest || maskTest || intentTest || suggestTest || skillTest || caretTest
-                || auditTest || detectTest || bridgeTest || planTest || perfTest || toolidTest || formulaTest
+                || auditTest || detectTest || bridgeTest || planTest || perfTest || toolidTest || urlTest || formulaTest
                 || safetyTest
                 || gridTestInput != null
                 || skillRunArgs != null || agentTestArgs != null || reconArgs != null || mergeArgs != null
@@ -182,6 +184,14 @@ namespace OfficeAgent.Host
                 try { AllocConsole(); } catch { }
                 try { Console.OutputEncoding = Encoding.UTF8; } catch { }
                 return RunToolIdTest();
+            }
+
+            if (urlTest)
+            {
+                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
+                try { AllocConsole(); } catch { }
+                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                return RunUrlTest();
             }
 
             if (safetyTest)
@@ -467,6 +477,66 @@ namespace OfficeAgent.Host
             check("空数组不算工具调用", r8.ToolCalls != null && r8.ToolCalls.Count == 0 && !r8.HasToolCalls);
 
             Console.WriteLine(failed == 0 ? "toolidtest ALL PASS" : ("toolidtest FAILED=" + failed));
+            return failed == 0 ? 0 : 2;
+        }
+
+        // /urltest —— 服务地址诊断回归（2026-10-05 worldcodes.online 案例）：
+        // 用户只填裸域名 → 请求落到网关 SPA 网页上回 200 HTML → 旧报错"未找到 message 对象"误导。
+        // 验证：① SuggestV1Base 只对"零路径"域名建议 /v1，已有路径（/v1、/api/paas/v4）不动；
+        //       ② DescribeBadResponse 对 HTML 给出"少了 /v1"的可行动提示，对 JSON 带上状态码与开头片段。
+        static int RunUrlTest()
+        {
+            int failed = 0;
+            Action<string, bool> check = delegate(string name, bool cond)
+            {
+                Console.WriteLine((cond ? "  ok    " : "  FAIL  ") + name);
+                if (!cond) failed++;
+            };
+
+            check("裸域名建议补 /v1", LlmClient.SuggestV1Base("https://worldcodes.online") == "https://worldcodes.online/v1");
+            check("带尾斜杠的裸域名也补", LlmClient.SuggestV1Base("https://worldcodes.online/") == "https://worldcodes.online/v1");
+            check("已带 /v1 不重复补", LlmClient.SuggestV1Base("https://worldcodes.online/v1") == null);
+            check("非 /v1 路径（bigmodel）不动", LlmClient.SuggestV1Base("https://open.bigmodel.cn/api/paas/v4") == null);
+            check("deepseek 裸域名建议 /v1（官方兼容路径）", LlmClient.SuggestV1Base("https://api.deepseek.com") == "https://api.deepseek.com/v1");
+            check("非 http(s) 不建议", LlmClient.SuggestV1Base("ftp://example.com") == null);
+            check("垃圾输入不崩", LlmClient.SuggestV1Base("不是地址") == null && LlmClient.SuggestV1Base("") == null && LlmClient.SuggestV1Base(null) == null);
+
+            string html = LlmClient.DescribeBadResponse(200, "<!doctype html><html><body>gateway</body></html>", "message 对象");
+            check("HTML 响应提示补 /v1", html.Contains("网页") && html.Contains("/v1") && html.Contains("200"));
+            string js = LlmClient.DescribeBadResponse(200, "{\"code\":\"BAD\",\"message\":\"x\"}", "message 对象");
+            check("JSON 响应带状态码与开头片段", js.Contains("HTTP 200") && js.Contains("BAD"));
+
+            // 账号槽（#tag）：deepseek-flash#2 = 同服务的第 2 个账号
+            check("ModelTagOf 提取纯数字 tag", LlmClient.ModelTagOf("deepseek-flash#2") == "2" && LlmClient.ModelTagOf("deepseek-flash") == "");
+            check("ModelTagOf 拒绝非数字/悬空#", LlmClient.ModelTagOf("m#ab") == "" && LlmClient.ModelTagOf("m#") == "" && LlmClient.ModelTagOf("#2") == "");
+            check("ModelWithoutTag 剥后缀", LlmClient.ModelWithoutTag("deepseek-flash#2") == "deepseek-flash" && LlmClient.ModelWithoutTag("glm-4.6v") == "glm-4.6v");
+            check("ModelDisplay 显示（号N）", LlmClient.ModelDisplay("deepseek-flash#2") == "deepseek-flash（号2）" && LlmClient.ModelDisplay("glm-4.6v") == "glm-4.6v");
+            check("BaseUrlForModel 按剥后缀模型找端点", LlmClient.BaseUrlForModel("deepseek-flash#2") == "https://api.deepseek.com"
+                && LlmClient.BaseUrlForModel("glm-4.6v") == "https://open.bigmodel.cn/api/paas/v4");
+
+            // 同一 host 双账号槽互不覆盖（纯内存，不落盘不碰真实 config.json）
+            AppConfig two = new AppConfig();
+            two.BaseUrl = "https://api.deepseek.com";
+            two.SetKey("k-main");
+            two.SetKeyFor("api.deepseek.com", "k-2", "2");
+            check("主账号与号2 各存各的", two.KeyForHost("api.deepseek.com") == "k-main" && two.KeyForHost("api.deepseek.com", "2") == "k-2");
+            two.Model = "deepseek-flash";
+            check("GetKey 按模型 tag 取槽（无后缀=主号）", two.GetKeyFor(LlmClient.ModelTagOf(two.Model)) == "k-main");
+            two.Model = "deepseek-flash#2";
+            check("GetKey 按模型 tag 取槽（#2=号2）", two.GetKeyFor(LlmClient.ModelTagOf(two.Model)) == "k-2");
+
+            // customModels：去重、置顶、上限（注意用非预置名——glm-4.6v 已是预置，会被正确拒绝）
+            AppConfig cm = new AppConfig();
+            cm.AddCustomModel("glm-4.6v");
+            check("预置 glm-4.6v 不进 customModels", cm.CustomModelList().Count == 0);
+            cm.AddCustomModel("world-model"); cm.AddCustomModel("world-model"); cm.AddCustomModel("my-model");
+            check("customModels 去重且最近在前", cm.CustomModelList().Count == 2 && cm.CustomModelList()[0] == "my-model");
+            bool presetRejected = false;
+            cm.AddCustomModel("gpt-6-luna");
+            foreach (string s in cm.CustomModelList()) if (s == "gpt-6-luna") presetRejected = true;
+            check("预置模型不进 customModels", !presetRejected);
+
+            Console.WriteLine(failed == 0 ? "urltest ALL PASS" : ("urltest FAILED=" + failed));
             return failed == 0 ? 0 : 2;
         }
 

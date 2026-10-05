@@ -11,9 +11,12 @@ namespace OfficeAgent.Host
 {
     // 一家服务（host）的密钥：每家分开 DPAPI 加密存储，
     // 切换供应商时各取各的，杜绝"拿 A 家的密钥向 B 家发请求"。
+    // Tag 非空 = 同一服务的第 N 个账号（如 api.deepseek.com + "2" = DeepSeek 账号2），
+    // 落盘为 "key:<host>#<tag>"，与主账号互不覆盖。
     public class ProviderKey
     {
         public string Host = "";     // 如 api.deepseek.com、open.bigmodel.cn
+        public string Tag = "";      // 账号槽；空 = 主账号
         public byte[] Blob = null;   // DPAPI 密文
     }
 
@@ -44,6 +47,9 @@ namespace OfficeAgent.Host
         // 累积的目录前缀（分号分隔），命中即不再询问（可在设置页清除）。
         public bool SafetyGuard = true;
         public string SafetyAllowPaths = "";
+        // 用户添加/用过的非预置模型名（';' 连接落盘）。内联模型下拉 = 本次拉取 + customModels + 预置；
+        // 此前拉取列表只存内存，重启后新添加的模型就从下拉里消失了（2026-10-05 用户反馈）。
+        public string CustomModels = "";
 
         // 实际生效的工作区目录（空配置回退到默认并确保存在）
         public string EffectiveWorkspace()
@@ -100,12 +106,20 @@ namespace OfficeAgent.Host
 
         public void SetKey(string plain)
         {
+            SetKeyFor(HostOf(BaseUrl), plain, "");
+        }
+
+        // 指定账号槽存密钥（tag 空 = 主账号）。归属到 host；每家每号一把钥匙互不覆盖。
+        public void SetKeyFor(string host, string plain, string tag)
+        {
             // 归属到当前 BaseUrl 的主机；每家服务一把钥匙互不覆盖
-            string host = HostOf(BaseUrl);
+            if (host == null) host = "";
+            if (tag == null) tag = "";
             int idx = -1;
             for (int i = 0; i < ProviderKeys.Count; i++)
             {
-                if (string.Equals(ProviderKeys[i].Host, host, StringComparison.OrdinalIgnoreCase)) { idx = i; break; }
+                if (string.Equals(ProviderKeys[i].Host, host, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(ProviderKeys[i].Tag ?? "", tag, StringComparison.Ordinal)) { idx = i; break; }
             }
             if (string.IsNullOrEmpty(plain))
             {
@@ -118,12 +132,19 @@ namespace OfficeAgent.Host
             {
                 ProviderKey pk = new ProviderKey();
                 pk.Host = host;
+                pk.Tag = tag;
                 pk.Blob = blob;
                 ProviderKeys.Add(pk);
             }
         }
 
         public string GetKey()
+        {
+            return GetKeyFor("");
+        }
+
+        // 按账号槽取当前服务的密钥（tag 来自模型名后缀，如 deepseek-flash#2 → "2"）。
+        public string GetKeyFor(string tag)
         {
             // 环境变量覆盖优先（安全规约允许的凭据来源之二）
             try
@@ -132,17 +153,21 @@ namespace OfficeAgent.Host
                 if (!string.IsNullOrEmpty(env)) return env;
             }
             catch { }
-            return KeyForHost(HostOf(BaseUrl));
+            return KeyForHost(HostOf(BaseUrl), tag == null ? "" : tag);
         }
 
-        // 取指定服务主机的密钥（DPAPI 解密；无则 null）。
+        // 取指定服务主机的密钥（DPAPI 解密；无则 null）。tag 空 = 主账号槽。
         // ★ 不做跨服务回退：找不到就返回 null——回退会退化回"一个 key 向各家发请求"。
-        public string KeyForHost(string host)
+        public string KeyForHost(string host) { return KeyForHost(host, ""); }
+
+        public string KeyForHost(string host, string tag)
         {
             if (host == null || host.Length == 0) return null;
+            if (tag == null) tag = "";
             for (int i = 0; i < ProviderKeys.Count; i++)
             {
                 if (string.Equals(ProviderKeys[i].Host, host, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(ProviderKeys[i].Tag ?? "", tag, StringComparison.Ordinal)
                     && ProviderKeys[i].Blob != null && ProviderKeys[i].Blob.Length > 0)
                     return DpapiUnprotect(ProviderKeys[i].Blob);
             }
@@ -150,16 +175,45 @@ namespace OfficeAgent.Host
         }
 
         // 只查存在性不解密（占位符显示、跨供应商切换提示用）
-        public bool HasKeyForHost(string host)
+        public bool HasKeyForHost(string host) { return HasKeyForHost(host, ""); }
+
+        public bool HasKeyForHost(string host, string tag)
         {
             if (host == null || host.Length == 0) return false;
+            if (tag == null) tag = "";
             for (int i = 0; i < ProviderKeys.Count; i++)
             {
                 if (string.Equals(ProviderKeys[i].Host, host, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(ProviderKeys[i].Tag ?? "", tag, StringComparison.Ordinal)
                     && ProviderKeys[i].Blob != null && ProviderKeys[i].Blob.Length > 0)
                     return true;
             }
             return false;
+        }
+
+        // 记住用户添加/用过的非预置模型（内联下拉重启后仍可见）；预置与带 #tag 的账号条目不重复收
+        public void AddCustomModel(string model)
+        {
+            string m = (model ?? "").Trim();
+            if (m.Length == 0 || m.Length > 80) return;
+            foreach (string p in LlmClient.ModelPresets) if (p == m) return;
+            List<string> items = CustomModelList();
+            if (items.Contains(m)) { items.Remove(m); items.Insert(0, m); }   // 最近用的排前
+            else items.Insert(0, m);
+            while (items.Count > 12) items.RemoveAt(items.Count - 1);
+            CustomModels = string.Join(";", items.ToArray());
+        }
+
+        public List<string> CustomModelList()
+        {
+            List<string> items = new List<string>();
+            string[] parts = (CustomModels ?? "").Split(';');
+            for (int i = 0; i < parts.Length; i++)
+            {
+                string p = parts[i].Trim();
+                if (p.Length > 0 && !items.Contains(p)) items.Add(p);
+            }
+            return items;
         }
 
         public void Save()
@@ -186,11 +240,13 @@ namespace OfficeAgent.Host
                 sb.Append("  \"activeWorkspaceId\": \"").Append(Js(ActiveWorkspaceId)).Append("\",\n");
                 sb.Append("  \"safetyGuard\": ").Append(SafetyGuard ? "true" : "false").Append(",\n");
                 sb.Append("  \"safetyAllowPaths\": \"").Append(Js(SafetyAllowPaths)).Append("\",\n");
-                // 按服务分开存的密钥（扁平字段 key:<host>，base64 DPAPI 密文）
+                sb.Append("  \"customModels\": \"").Append(Js(CustomModels)).Append("\",\n");
+                // 按服务分开存的密钥（扁平字段 key:<host> 或 key:<host>#<tag>，base64 DPAPI 密文）
                 for (int i = 0; i < ProviderKeys.Count; i++)
                 {
                     if (ProviderKeys[i].Blob == null || ProviderKeys[i].Blob.Length == 0) continue;
-                    sb.Append("  \"key:").Append(Js(ProviderKeys[i].Host)).Append("\": \"")
+                    string slot = ProviderKeys[i].Host + (string.IsNullOrEmpty(ProviderKeys[i].Tag) ? "" : "#" + ProviderKeys[i].Tag);
+                    sb.Append("  \"key:").Append(Js(slot)).Append("\": \"")
                       .Append(Convert.ToBase64String(ProviderKeys[i].Blob)).Append("\",\n");
                 }
                 sb.Append("  \"perHostKeys\": true\n");
@@ -228,19 +284,32 @@ namespace OfficeAgent.Host
                 c.SafetyGuard = GetBool(json, "safetyGuard", true);
                 c.SafetyAllowPaths = JsGet(json, "safetyAllowPaths");
                 if (c.SafetyAllowPaths == null) c.SafetyAllowPaths = "";
+                c.CustomModels = JsGet(json, "customModels");
+                if (c.CustomModels == null) c.CustomModels = "";
                 string b64 = JsGet(json, "keyBlob");
                 if (b64 != null && b64.Length > 0)
                 {
                     try { c.KeyBlob = Convert.FromBase64String(b64); } catch { c.KeyBlob = null; }
                 }
-                // 新版：按服务分开的密钥字段 "key:<host>": "<base64>"（扁平扫描）
+                // 新版：按服务分开的密钥字段 "key:<host>" 或 "key:<host>#<tag>"（扁平扫描）。
+                // host 本身不会出现 '#'，取最后一个 '#' 后是纯数字才当账号槽，否则整体视为主机名。
                 int ki = 0;
                 while ((ki = json.IndexOf("\"key:", ki, StringComparison.Ordinal)) >= 0)
                 {
                     int ns = ki + 5;
                     int ne = json.IndexOf('"', ns);
                     if (ne < 0) break;
-                    string host = json.Substring(ns, ne - ns);
+                    string slot = json.Substring(ns, ne - ns);
+                    string host = slot;
+                    string tag = "";
+                    int hash = slot.LastIndexOf('#');
+                    if (hash > 0 && hash < slot.Length - 1)
+                    {
+                        string t = slot.Substring(hash + 1);
+                        bool digits = t.Length > 0;
+                        for (int d = 0; d < t.Length; d++) { if (t[d] < '0' || t[d] > '9') { digits = false; break; } }
+                        if (digits) { host = slot.Substring(0, hash); tag = t; }
+                    }
                     int j = ne + 1;
                     while (j < json.Length && (json[j] == ' ' || json[j] == ':')) j++;
                     if (j < json.Length && json[j] == '"')
@@ -251,10 +320,11 @@ namespace OfficeAgent.Host
                         {
                             byte[] blob = null;
                             try { blob = Convert.FromBase64String(json.Substring(vs, ve - vs)); } catch { blob = null; }
-                            if (blob != null && host.Length > 0 && !c.HasKeyForHost(host))
+                            if (blob != null && host.Length > 0 && !c.HasKeyForHost(host, tag))
                             {
                                 ProviderKey pk = new ProviderKey();
                                 pk.Host = host;
+                                pk.Tag = tag;
                                 pk.Blob = blob;
                                 c.ProviderKeys.Add(pk);
                             }

@@ -59,7 +59,10 @@ namespace OfficeAgent.Host
         LlmClient client;
         bool busy = false;
         List<string> contextFiles = new List<string>();
-        Label fileChip;                 // 输入框左侧的「引用文件」提示条
+        // WorkBuddy 式引用条（0.8.4 用户要求）：输入框上方横排"格式徽标+文件名"小片，
+        // 点 × 可移除。fileChipRects 与 contextFiles 平行，存每片的矩形供点击命中。
+        Panel fileStrip;
+        List<Rectangle> fileChipRects = new List<Rectangle>();
         Form atPopup;                   // @ 引用文件弹层（无边框小窗，不抢焦点）
         ListBox atList;
         bool atActive = false;
@@ -239,19 +242,20 @@ namespace OfficeAgent.Host
             ctxLabel.AutoSize = true;
             ctxLabel.Location = new Point(24, 84);
 
-            // 引用文件提示条（输入框左侧空白区）：@ 引用或拖入文件后可见
-            fileChip = new Label();
-            fileChip.ForeColor = Color.FromArgb(70, 73, 84);
-            fileChip.Font = new Font("Microsoft YaHei UI", 8F);
-            fileChip.Location = new Point(12, 10);
-            fileChip.Size = new Size(132, 66);
-            fileChip.Visible = false;
+            // WorkBuddy 式引用条：输入框上方横排"格式徽标+文件名"小片（拖入/@ 引用后可见，点 × 移除）
+            fileStrip = new Panel();
+            fileStrip.Location = new Point(150, 12);
+            fileStrip.Size = new Size(700, 30);
+            fileStrip.BackColor = Color.White;
+            fileStrip.Visible = false;
+            fileStrip.Paint += FileStrip_Paint;
+            fileStrip.MouseClick += FileStrip_Click;
 
             bottom.Controls.Add(inputBorder);
             bottom.Controls.Add(send);
             bottom.Controls.Add(modelLink);
             bottom.Controls.Add(ctxLabel);
-            bottom.Controls.Add(fileChip);
+            Controls.Add(fileStrip);   // 悬在 bottom 上沿、输入框上方
             Controls.Add(bottom);
             bottom.SendToBack();
 
@@ -374,6 +378,12 @@ namespace OfficeAgent.Host
             input.Width = inputW - 24;
             send.Location = new Point(150 + inputW + 12, 24);
             modelLink.Location = new Point(150 + inputW - modelLink.Width - 6, 84);
+            // 引用文件条悬在输入框正上方（bottom 是 Dock=Bottom，Top 随窗口变化）
+            if (fileStrip != null)
+            {
+                fileStrip.Size = new Size(inputW + 76, 30);
+                fileStrip.Location = new Point(150, Math.Max(0, bottom.Top - 30));
+            }
         }
 
         public void ApplyConfig(AppConfig cfg)
@@ -518,21 +528,103 @@ namespace OfficeAgent.Host
             RefreshFileChip();
         }
 
+        // ===== 引用文件条（WorkBuddy 式）：横排「格式徽标+文件名+×」小片 =====
+
+        // 徽标文字/颜色按扩展名（与产物附件卡同色系：XLS绿 PDF红 DOC蓝 PPT橙）
+        static string FileBadge(string path)
+        {
+            string ext = (Path.GetExtension(path) ?? "").Trim('.').ToUpperInvariant();
+            if (ext.Length == 0) return "FILE";
+            if (ext.Length > 3) ext = ext.Substring(0, 3);
+            return ext;
+        }
+        static Color FileBadgeColor(string path)
+        {
+            string ext = (Path.GetExtension(path) ?? "").ToLowerInvariant();
+            if (ext == ".xlsx" || ext == ".xls") return Color.FromArgb(34, 139, 84);
+            if (ext == ".pdf") return Color.FromArgb(220, 60, 50);
+            if (ext == ".doc" || ext == ".docx") return Color.FromArgb(59, 110, 220);
+            if (ext == ".ppt" || ext == ".pptx") return Color.FromArgb(234, 121, 12);
+            if (ext == ".csv") return Color.FromArgb(0, 128, 128);
+            return Color.FromArgb(120, 124, 136);
+        }
+
         void RefreshFileChip()
         {
-            if (fileChip == null) return;
-            if (contextFiles.Count == 0) { fileChip.Visible = false; return; }
-            StringBuilder sb = new StringBuilder();
-            sb.Append("引用 ").Append(contextFiles.Count).Append(" 个文件\n");
+            if (fileStrip == null) return;
+            fileStrip.Visible = contextFiles.Count > 0;
+            fileStrip.Invalidate();
+        }
+
+        void FileStrip_Paint(object sender, PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            fileChipRects.Clear();
+            int x = 0, y = 3;
             int shown = 0;
             foreach (string f in contextFiles)
             {
-                if (shown >= 3) { sb.Append("…"); break; }
-                sb.Append("· ").Append(Path.GetFileName(f)).Append("\n");
+                string name = Path.GetFileName(f);
+                Font nameFont = new Font("Microsoft YaHei UI", 8.25F);
+                int nameW;
+                try { nameW = TextRenderer.MeasureText(name, nameFont).Width; }
+                catch { nameW = 60; }
+                if (nameW > 170) nameW = 170;   // 超长文件名截断（EndEllipsis）
+                int w = 6 + 16 + 5 + nameW + 6 + 12 + 6;
+                if (x + w > fileStrip.Width && shown > 0) break;   // 放不下的下轮再说（罕见于超宽屏）
+                Rectangle chip = new Rectangle(x, y, w, 24);
+                fileChipRects.Add(chip);
+                using (GraphicsPath gp = RoundRect(chip, 6))
+                {
+                    using (SolidBrush b = new SolidBrush(Color.FromArgb(243, 244, 248))) g.FillPath(b, gp);
+                    using (Pen p = new Pen(Color.FromArgb(224, 227, 234))) g.DrawPath(p, gp);
+                }
+                // 格式徽标
+                Rectangle badge = new Rectangle(x + 6, y + 4, 16, 16);
+                Color bc = FileBadgeColor(f);
+                using (GraphicsPath gp = RoundRect(badge, 4))
+                using (SolidBrush b = new SolidBrush(bc)) g.FillPath(b, gp);
+                string tag = FileBadge(f);
+                using (Font bf = new Font("Microsoft YaHei UI", 6.75F, FontStyle.Bold))
+                    TextRenderer.DrawText(g, tag, bf, badge, Color.White,
+                        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+                // 文件名
+                TextRenderer.DrawText(g, name, nameFont,
+                    new Rectangle(x + 6 + 16 + 5, y, nameW + 6, 24), Color.FromArgb(70, 73, 84),
+                    TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+                // ×（移除）
+                TextRenderer.DrawText(g, "×", new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+                    new Rectangle(x + w - 18, y, 14, 24), Color.FromArgb(150, 153, 168),
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+                x += w + 8;
                 shown++;
+                if (shown < contextFiles.Count)
+                {
+                    string more = "+" + (contextFiles.Count - shown);
+                    TextRenderer.DrawText(g, more, new Font("Microsoft YaHei UI", 8F),
+                        new Rectangle(x, y, 40, 24), Color.FromArgb(150, 153, 168),
+                        TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+                    break;
+                }
             }
-            fileChip.Text = sb.ToString().TrimEnd();
-            fileChip.Visible = true;
+        }
+
+        // 点 × 移除对应引用文件（命中最后 18px 区域）
+        void FileStrip_Click(object sender, MouseEventArgs e)
+        {
+            for (int i = 0; i < fileChipRects.Count && i < contextFiles.Count; i++)
+            {
+                if (fileChipRects[i].Contains(e.Location))
+                {
+                    if (e.X >= fileChipRects[i].Right - 18)
+                    {
+                        contextFiles.RemoveAt(i);
+                        RefreshFileChip();
+                    }
+                    return;
+                }
+            }
         }
 
         void Input_KeyDown(object sender, KeyEventArgs e)
@@ -1729,7 +1821,9 @@ namespace OfficeAgent.Host
             {
                 string w = WorkspaceStore.ActiveDir(config);
                 if (w != null && w.Length > 0) ws = "用户当前的工作区目录是 " + w +
-                    "（用户说的文件默认先在这里找；用 list_directory 列出后确认，不要凭空猜文件名）。";
+                    "（用户已有的文件默认先在这里找；用 list_directory 列出后确认，不要凭空猜文件名）。" +
+                    "你生成的所有产物（表格/PPT/下载的文件）统一保存到「下载」文件夹下的「表格」子目录" +
+                    "（工具给文件名即可，系统自动落到那里；需要指路径时用 " + AgentTools.DefaultOutputDir() + "）。";
             }
             catch { }
             string basePrompt = "你是 OfficeAgent，一款运行在 Windows 7 上的办公 AI 助手（agent），面向会计与办公人员。" +

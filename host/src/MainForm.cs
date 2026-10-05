@@ -943,8 +943,9 @@ namespace OfficeAgent.Host
             if (files == null || files.Length == 0) return;
             chat.SetContextFiles(files);
             AddTasks(files);
-            SelectPage(3);
-            ShowPreview(files[0]);
+            // 0.8.4 用户规则：拖文件进对话框**留在当前页**（此前跳去表格核对页+预览，WorkBuddy 式
+            // 交互=引用条出现在输入框上方，聊天继续在这里进行）
+            chat.FocusInput();
         }
 
         public void ShowPreview(string path)

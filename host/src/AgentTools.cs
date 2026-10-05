@@ -8,6 +8,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
+using System.Runtime.InteropServices;
 using System.Text;
 using OfficeAgent.Core;
 
@@ -16,7 +17,8 @@ namespace OfficeAgent.Host
     public static class AgentTools
     {
         // 工作区目录（MainForm/ChatPanel 在加载/修改配置时同步到这里）。
-        // 建表/建 PPT 给相对路径时落在这里；下载文件也存这里。
+        // @ 引用/列目录/读文件等"找用户已有文件"按这里解析；
+        // 产物输出不走这里——0.8.4 起统一落「下载\表格」（见 DefaultOutputDir）。
         public static string WorkspaceRoot = "";
         // 当前配置（Dispatch 入口赋值）：安全兜底需要读 cfg.SafetyGuard / SafetyAllowPaths。
         // 直接调用工具函数（如自测里的 FormulaWorkbook.Create）时为 null——
@@ -75,11 +77,11 @@ namespace OfficeAgent.Host
             string s = "[" +
                 "{\"type\":\"function\",\"function\":{\"name\":\"read_text_file\",\"description\":\"读取本地文件内容（文本类 txt/md/csv/log/json/xml/代码等；也支持 PDF——自动提取文字层）。xlsx/xls/doc/ppt 请用 convert_document 转换后再读。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"文件的绝对路径\"}},\"required\":[\"path\"]}}}," +
                 "{\"type\":\"function\",\"function\":{\"name\":\"list_directory\",\"description\":\"列出某个文件夹里的文件和子文件夹。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"文件夹的绝对路径\"}},\"required\":[\"path\"]}}}," +
-                "{\"type\":\"function\",\"function\":{\"name\":\"download_file\",\"description\":\"从 http/https 网址下载文件，保存到工作区目录并返回保存路径。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"下载链接（http/https）\"},\"filename\":{\"type\":\"string\",\"description\":\"可选：保存的文件名\"}},\"required\":[\"url\"]}}}," +
+                "{\"type\":\"function\",\"function\":{\"name\":\"download_file\",\"description\":\"从 http/https 网址下载文件，保存到「下载\\\\表格」目录并返回保存路径。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"下载链接（http/https）\"},\"filename\":{\"type\":\"string\",\"description\":\"可选：保存的文件名\"}},\"required\":[\"url\"]}}}," +
                 "{\"type\":\"function\",\"function\":{\"name\":\"convert_document\",\"description\":\"把 office 文档转格式：doc/docx/ppt/pptx/xls/xlsx 转 pdf，xlsx 转 csv，csv 转 xlsx。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\",\"description\":\"输入文件绝对路径\"},\"target\":{\"type\":\"string\",\"description\":\"目标格式：pdf 或 csv 或 xlsx\"}},\"required\":[\"input\",\"target\"]}}}," +
-                "{\"type\":\"function\",\"function\":{\"name\":\"create_spreadsheet\",\"description\":\"创建全新的 Excel 表格（.xlsx）。用 csv 参数提供表格内容：标准 CSV 文本，第一行是表头，用 \\n 表示换行。数字会自动识别为数值。path 给文件名（相对路径）时会保存到工作区目录。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"输出的 .xlsx 路径（文件名则存到工作区）\"},\"csv\":{\"type\":\"string\",\"description\":\"表格内容（CSV 文本，第一行表头）\"}},\"required\":[\"path\",\"csv\"]}}}," +
-                "{\"type\":\"function\",\"function\":{\"name\":\"create_presentation\",\"description\":\"创建全新的 PPT 演示文稿（.pptx）。用 outline 参数提供每页内容：页与页之间用 ;; 分隔，每页格式为 标题|要点1;要点2;要点3。path 给文件名（相对路径）时会保存到工作区目录。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"输出的 .pptx 路径（文件名则存到工作区）\"},\"outline\":{\"type\":\"string\",\"description\":\"每页内容：标题|要点1;要点2 ;; 下一页标题|要点\"}},\"required\":[\"path\",\"outline\"]}}}," +
-                "{\"type\":\"function\",\"function\":{\"name\":\"create_formula_workbook\",\"description\":\"生成带公式的 Excel 工作簿（.xlsx），用户填数即自动计算。优先用模板：template=payroll 工资表标准套账（社保/公积金/个税全公式，数据行CSV列序:姓名,部门,基本工资,岗位津贴,加班费）；template=vat 增值税台账（CSV列序:日期,摘要,类型(只填销项/进项),金额(不含税),税率）；template=ledger 流水账（CSV列序:日期,摘要,类别,收入,支出）。模板自带汇总页，改明细汇总自动变；可选 params 覆盖参数（工资表 pensionRate/medicalRate/unemploymentRate/housingFundRate/taxThreshold/blankRows，流水账 openingBalance），如 pensionRate=0.08;housingFundRate=0.12。自由定制用 sheets+summary（规格见参数说明）。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"输出的 .xlsx 路径（文件名则存到工作区）\"},\"template\":{\"type\":\"string\",\"description\":\"payroll|vat|ledger 三选一\"},\"rows\":{\"type\":\"string\",\"description\":\"模板数据行 CSV 文本（列序见模板说明；首行是列名时会被自动忽略）\"},\"params\":{\"type\":\"string\",\"description\":\"可选：参数覆盖 key=value;分号分隔\"},\"sheets\":{\"type\":\"string\",\"description\":\"自由模式（与 template 二选一）：sheets 数组 JSON 文本，每项 {name:表名, header:[列1,列2], rows:[[a,1],[b,2]], formulaCols:[{col:F, formula:=D{r}-E{r}}], blankRows:50, totalRow:true, widths:[10,20]}；{r} 代表当前行号，公式以 = 开头\"},\"summary\":{\"type\":\"string\",\"description\":\"可选（配合 sheets）：汇总页配置 JSON 文本 {source:明细表名, groupCol:C, labelHeader:类别, sumCols:[{col:D, header:收入},{col:E, header:支出}]}——按分组列 SUMIF 自动生成汇总，改明细汇总自动变\"}},\"required\":[\"path\"]}}}," +
+                "{\"type\":\"function\",\"function\":{\"name\":\"create_spreadsheet\",\"description\":\"创建全新的 Excel 表格（.xlsx）。用 csv 参数提供表格内容：标准 CSV 文本，第一行是表头，用 \\n 表示换行。数字会自动识别为数值。path 给文件名（相对路径）时保存到「下载\\表格」目录。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"输出的 .xlsx 路径（只给文件名则存到 下载\\\\表格）\"},\"csv\":{\"type\":\"string\",\"description\":\"表格内容（CSV 文本，第一行表头）\"}},\"required\":[\"path\",\"csv\"]}}}," +
+                "{\"type\":\"function\",\"function\":{\"name\":\"create_presentation\",\"description\":\"创建全新的 PPT 演示文稿（.pptx）。用 outline 参数提供每页内容：页与页之间用 ;; 分隔，每页格式为 标题|要点1;要点2;要点3。path 给文件名（相对路径）时保存到「下载\\表格」目录。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"输出的 .pptx 路径（只给文件名则存到 下载\\\\表格）\"},\"outline\":{\"type\":\"string\",\"description\":\"每页内容：标题|要点1;要点2 ;; 下一页标题|要点\"}},\"required\":[\"path\",\"outline\"]}}}," +
+                "{\"type\":\"function\",\"function\":{\"name\":\"create_formula_workbook\",\"description\":\"生成带公式的 Excel 工作簿（.xlsx），用户填数即自动计算。优先用模板：template=payroll 工资表标准套账（社保/公积金/个税全公式，数据行CSV列序:姓名,部门,基本工资,岗位津贴,加班费）；template=vat 增值税台账（CSV列序:日期,摘要,类型(只填销项/进项),金额(不含税),税率）；template=ledger 流水账（CSV列序:日期,摘要,类别,收入,支出）。模板自带汇总页，改明细汇总自动变；可选 params 覆盖参数（工资表 pensionRate/medicalRate/unemploymentRate/housingFundRate/taxThreshold/blankRows，流水账 openingBalance），如 pensionRate=0.08;housingFundRate=0.12。自由定制用 sheets+summary（规格见参数说明）。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"输出的 .xlsx 路径（只给文件名则存到 下载\\\\表格）\"},\"template\":{\"type\":\"string\",\"description\":\"payroll|vat|ledger 三选一\"},\"rows\":{\"type\":\"string\",\"description\":\"模板数据行 CSV 文本（列序见模板说明；首行是列名时会被自动忽略）\"},\"params\":{\"type\":\"string\",\"description\":\"可选：参数覆盖 key=value;分号分隔\"},\"sheets\":{\"type\":\"string\",\"description\":\"自由模式（与 template 二选一）：sheets 数组 JSON 文本，每项 {name:表名, header:[列1,列2], rows:[[a,1],[b,2]], formulaCols:[{col:F, formula:=D{r}-E{r}}], blankRows:50, totalRow:true, widths:[10,20]}；{r} 代表当前行号，公式以 = 开头\"},\"summary\":{\"type\":\"string\",\"description\":\"可选（配合 sheets）：汇总页配置 JSON 文本 {source:明细表名, groupCol:C, labelHeader:类别, sumCols:[{col:D, header:收入},{col:E, header:支出}]}——按分组列 SUMIF 自动生成汇总，改明细汇总自动变\"}},\"required\":[\"path\"]}}}," +
                 "{\"type\":\"function\",\"function\":{\"name\":\"excel_formula_reference\",\"description\":\"查询内置 Excel 公式大全（语法+中文说明+示例，离线）。用户问 Excel 公式怎么写、怎么算个税/折旧/条件求和时，先调用本工具查标准语法再回答，不要凭记忆给出可能出错的公式。不带参数时返回全部分类概览。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"keyword\":{\"type\":\"string\",\"description\":\"关键词（模糊匹配名称/语法/说明，如：折旧、查找、求和、个税、账龄）\"},\"category\":{\"type\":\"string\",\"description\":\"精确分类：数学与三角/统计/逻辑/文本/日期与时间/查找与引用/财务会计/其他实用\"},\"name\":{\"type\":\"string\",\"description\":\"公式名（如 VLOOKUP、SUMIF）\"}}}}}," +
                 "{\"type\":\"function\",\"function\":{\"name\":\"repair_environment\",\"description\":\"启动环境修复器（弹 UAC 提权），检测并离线安装缺失的系统组件（KB/.NET/VC++/Python/LibreOffice）。用户需在 UAC 与引导器窗口中确认。\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}," +
                 "{\"type\":\"function\",\"function\":{\"name\":\"delete_file\",\"description\":\"删除一个文件（仅文件，不能删目录）。删除表格类文件（xlsx/xls/csv 等）或位于系统盘的文件时，会先弹出确认框要求用户显式同意；用户拒绝则不删除。删除前请先确认路径正确，不要凭猜测删除。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"要删除的文件的绝对路径\"}},\"required\":[\"path\"]}}}" +
@@ -325,10 +327,8 @@ namespace OfficeAgent.Host
             if (guard != null) return "安全守卫拒绝该地址: " + guard;
 
             // 下载落盘：优先工作区目录，未配置时回退 文档\OfficeAgentDownloads
-            string dir = WorkspaceRoot;
-            if (dir == null || dir.Length == 0)
-                dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "OfficeAgentDownloads");
-            Directory.CreateDirectory(dir);
+            // 0.8.4 用户规则：下载文件统一落「下载\表格」目录
+            string dir = DefaultOutputDir();
             string name = filename != null && filename.Trim().Length > 0 ? SanitizeName(filename.Trim()) : SanitizeName(UriFileName(url));
             if (name.Length == 0) name = "download_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".bin";
             string dst = Path.Combine(dir, name);
@@ -470,7 +470,8 @@ namespace OfficeAgent.Host
         // ---------- create_spreadsheet / create_presentation ----------
 
         // 输出路径围栏（建表/建 PPT/带公式工作簿共用）：逐段拒绝 ".."、扩展名白名单。
-        // 相对路径按工作区目录解析（模型常给文件名不给全路径，此前一律拒绝体验差）。
+        // 相对路径按「下载\表格」目录解析（0.8.4 用户规则：产物统一输出到这里；
+        // 模型常给文件名不给全路径，此前一律拒绝体验差）。
         internal static string SafeOutputPath(string path, string ext, out string err)
         {
             err = null;
@@ -478,10 +479,8 @@ namespace OfficeAgent.Host
             if (p.Length == 0) { err = "缺少输出路径"; return null; }
             if (!Path.IsPathRooted(p))
             {
-                string root = WorkspaceRoot;
-                if (root == null || root.Length == 0)
-                    root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "OfficeAgentFiles");
-                p = Path.Combine(root, p);
+                // 0.8.4 用户规则：所有产物统一输出到「下载\表格」（不再落工作区目录）
+                p = Path.Combine(DefaultOutputDir(), p);
             }
             foreach (string seg in p.Replace('/', '\\').Split('\\'))
             {
@@ -499,6 +498,44 @@ namespace OfficeAgent.Host
             // 不问用户，因为询问要阻塞 agent 的后台线程——详见 AvoidOverwrite 上方注释。
             p = AvoidOverwrite(p);
             return p;
+        }
+
+        // [DllImport] 局部：SHGetKnownFolderPath（Downloads 不在 .NET SpecialFolder 枚举里）
+        [DllImport("shell32.dll")]
+        static extern int SHGetKnownFolderPath(ref Guid folderId, uint flags, IntPtr token, out IntPtr path);
+        static readonly string DownloadsIdString = "374DE290-123F-4565-9164-39C4925E467B";
+
+        // 0.8.4 用户规则：所有 agent 产物（建表/带公式工作簿/PPT/下载）统一输出到
+        // 「下载\表格」。Downloads 用 SHGetKnownFolderPath 取（用户可能把"下载"迁到 D 盘），
+        // 取不到回退 %USERPROFILE%\Downloads。目录不存在则创建。
+        public static string DefaultOutputDir()
+        {
+            string dl = null;
+            try
+            {
+                Guid fid = new Guid(DownloadsIdString);
+                IntPtr ptr;
+                if (SHGetKnownFolderPath(ref fid, 0, IntPtr.Zero, out ptr) == 0 && ptr != IntPtr.Zero)
+                {
+                    dl = Marshal.PtrToStringUni(ptr);
+                    Marshal.FreeCoTaskMem(ptr);
+                }
+            }
+            catch { }
+            if (dl == null || dl.Length == 0)
+            {
+                try
+                {
+                    string up = Environment.GetEnvironmentVariable("USERPROFILE");
+                    if (up != null && up.Length > 0) dl = Path.Combine(up, "Downloads");
+                }
+                catch { }
+            }
+            if (dl == null || dl.Length == 0)
+                dl = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+            string dir = Path.Combine(dl, "表格");
+            try { Directory.CreateDirectory(dir); } catch { }
+            return dir;
         }
 
         // CSV 文本 → xlsx（MiniCsv 解析 + MiniXlsxWrite 写带表头样式的表格）

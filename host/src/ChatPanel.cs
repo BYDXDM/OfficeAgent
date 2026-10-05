@@ -356,6 +356,65 @@ namespace OfficeAgent.Host
                 catch { list.Invalidate(); }
             };
             flushTimer.Start();
+
+            // ★ 消除拖放"死区"（0.8.8）：WinForms 的 OLE 拖放**不会从子控件冒泡到父控件**——
+            //   鼠标下压的那个控件必须自己 AllowDrop，否则拖到它上面完全没反应。
+            //   0.8.7 只给 list / input 接了，拖到 bottom（输入条背景）、inputBorder（输入框边框）、
+            //   fileStrip（引用条）、面板空白处等区域**仍然无声失败**——这正是"拖拽文件进 agent 失败"
+            //   的代码侧成因。这里把 ChatPanel 自身与其下所有子控件统一接上同一个处理器。
+            //   已自管 FileDrop 的 list / input 跳过，避免同一次拖放被处理两次。
+            EnableFileDrop(this);
+
+            // 提权提示（0.8.8）：Windows 的 UIPI 会**静默拦截**非提权进程向提权窗口的 OLE 拖放——
+            // 表现就是"拖文件进对话框毫无反应"，且代码侧无法绕过（这是系统安全机制）。
+            // 因此唯一正确做法是告知用户改用普通权限启动（双击桌面快捷方式）。
+            try
+            {
+                if (EnvDetect.IsAdmin())
+                {
+                    placeholder.Text = "⚠ 以管理员身份运行：Windows 会阻止拖入文件，请用普通方式启动";
+                    placeholder.ForeColor = Color.FromArgb(178, 34, 34);
+                    AuditLog.Record("env_warn", "host_running_elevated; drag-drop blocked by UIPI");
+                }
+            }
+            catch { }
+        }
+
+        // 递归给控件树接上文件拖放。跳过自行处理 FileDrop 的两类控件：
+        //   * ForwardWheelBox（输入框）——自管 FileDropHandler，且要保留其余格式交回基类的行为
+        //   * BufferedMsgList（消息列表）——构造时已接 DragEnter/DragDrop
+        void EnableFileDrop(Control root)
+        {
+            if (root == null) return;
+            if (!(root is ForwardWheelBox) && !(root is BufferedMsgList))
+            {
+                root.AllowDrop = true;
+                root.DragEnter += new DragEventHandler(ChatArea_DragEnter);
+                root.DragDrop += new DragEventHandler(ChatArea_DragDrop);
+            }
+            foreach (Control c in root.Controls) EnableFileDrop(c);
+        }
+
+        void ChatArea_DragEnter(object sender, DragEventArgs e)
+        {
+            if (e.Data != null && e.Data.GetDataPresent(DataFormats.FileDrop))
+                e.Effect = DragDropEffects.Copy;
+        }
+
+        void ChatArea_DragDrop(object sender, DragEventArgs e)
+        {
+            if (e.Data == null || !e.Data.GetDataPresent(DataFormats.FileDrop)) return;
+            string[] files = (string[])e.Data.GetData(DataFormats.FileDrop);
+            if (files == null || files.Length == 0) return;
+            // 审计：文件被拖入是一次真实用户动作，且是"拖放是否被系统投递到本进程"的关键证据
+            //（若用户报"拖不进去"而这里没有记录，说明事件根本没到达本进程 → 多为提权导致的 UIPI 拦截）
+            try
+            {
+                AuditLog.Record("file_drop", "area=" + (sender == null ? "?" : sender.GetType().Name) +
+                    "; count=" + files.Length + "; first=" + files[0]);
+            }
+            catch { }
+            if (FilesDropped != null) FilesDropped(files);
         }
 
         // 焦点在输入框/按钮上时，ChatPanel 也能收到滚轮并转发给消息列表
@@ -546,6 +605,34 @@ namespace OfficeAgent.Host
         }
 
         public void FocusInput() { input.Focus(); }
+
+        // ===== /droptest 探针（只读；拖放链路回归用，见 Program.RunDropTest）=====
+        public bool ListAllowDrop { get { return list != null && list.AllowDrop; } }
+        public bool InputAllowDrop { get { return input != null && input.AllowDrop; } }
+        // 0.8.8 死区探针：WinForms 拖放不冒泡，容器自身也必须 AllowDrop
+        public bool SelfAllowDrop { get { return AllowDrop; } }
+        public bool BottomAllowDrop { get { return bottom != null && bottom.AllowDrop; } }
+        public bool InputBorderAllowDrop { get { return inputBorder != null && inputBorder.AllowDrop; } }
+        public bool StripAllowDrop { get { return fileStrip != null && fileStrip.AllowDrop; } }
+        public bool StripVisible { get { return fileStrip != null && fileStrip.Visible; } }
+        // 引用条 z-order 必须在消息列表之前（index 越小越靠前），否则被 Dock=Fill 列表盖住
+        public bool StripInFrontOfList
+        {
+            get
+            {
+                if (fileStrip == null || list == null) return false;
+                return Controls.GetChildIndex(fileStrip) < Controls.GetChildIndex(list);
+            }
+        }
+        // 引用条位置必须悬在输入区上方（bottom 面板之上）
+        public bool StripAboveInput
+        {
+            get
+            {
+                if (fileStrip == null || !fileStrip.Visible || bottom == null) return false;
+                return fileStrip.Bottom <= bottom.Top + 2 && fileStrip.Top >= 0;
+            }
+        }
 
         // 拖放中转：输入框/消息列表的文件拖放统一转给宿主（MainForm 统一处理）
         void HandleFilesDropped(string[] files)

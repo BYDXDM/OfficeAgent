@@ -40,6 +40,7 @@ namespace OfficeAgent.Host
             bool toolidTest = false;
             bool urlTest = false;
             bool frpTest = false;
+            bool dropTest = false;
             bool safetyTest = false;
             bool formulaTest = false;
             string gridTestInput = null;
@@ -68,6 +69,7 @@ namespace OfficeAgent.Host
                 else if (a == "/toolidtest") toolidTest = true;
                 else if (a == "/urltest") urlTest = true;
                 else if (a == "/frptest") frpTest = true;
+                else if (a == "/droptest") dropTest = true;
                 else if (a == "/safetytest") safetyTest = true;
                 else if (a == "/formulatest") formulaTest = true;
                 else if (a == "/gridtest" && i + 1 < args.Length) { gridTestInput = args[i + 1]; i += 1; }
@@ -112,7 +114,7 @@ namespace OfficeAgent.Host
 
             // CLI 无头链同样落审计（设计方案 §7.3：每个动作可审计；GUI 的 app_start 在 MainForm）
             if (selftest || guardTest || maskTest || intentTest || suggestTest || skillTest || caretTest
-                || auditTest || detectTest || bridgeTest || planTest || perfTest || toolidTest || urlTest || frpTest || formulaTest
+                || auditTest || detectTest || bridgeTest || planTest || perfTest || toolidTest || urlTest || frpTest || dropTest || formulaTest
                 || safetyTest
                 || gridTestInput != null
                 || skillRunArgs != null || agentTestArgs != null || reconArgs != null || mergeArgs != null
@@ -186,6 +188,14 @@ namespace OfficeAgent.Host
                 try { AllocConsole(); } catch { }
                 try { Console.OutputEncoding = Encoding.UTF8; } catch { }
                 return RunToolIdTest();
+            }
+
+            if (dropTest)
+            {
+                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
+                try { AllocConsole(); } catch { }
+                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                return RunDropTest();
             }
 
             if (frpTest)
@@ -547,6 +557,61 @@ namespace OfficeAgent.Host
             check("预置模型不进 customModels", !presetRejected);
 
             Console.WriteLine(failed == 0 ? "urltest ALL PASS" : ("urltest FAILED=" + failed));
+            return failed == 0 ? 0 : 2;
+        }
+
+        // /droptest —— 拖放链路无头回归（0.8.7，用户实测拖文件无反应后加）。
+        // 用真实 ChatPanel（屏外窗体）验证三个根因的修复：
+        //   ① 引用条置顶（z-order 在消息列表之前——曾被 Dock=Fill 列表整个盖住=拖放"没反应"）；
+        //   ② SetContextFiles 后引用条可见；
+        //   ③ 消息列表与输入框 AllowDrop 已接（否则原生控件吞文件拖放）。
+        static int RunDropTest()
+        {
+            int failed = 0;
+            Action<string, bool> check = delegate(string name, bool cond)
+            {
+                Console.WriteLine((cond ? "  ok    " : "  FAIL  ") + name);
+                if (!cond) failed++;
+            };
+            Form host = new Form();
+            host.ShowInTaskbar = false;
+            host.FormBorderStyle = FormBorderStyle.None;
+            host.StartPosition = FormStartPosition.Manual;
+            host.Location = new Point(-4000, -4000);
+            host.Size = new Size(1200, 800);
+            OfficeAgent.Host.AppConfig cfg = new OfficeAgent.Host.AppConfig();
+            OfficeAgent.Host.ChatPanel chat = new OfficeAgent.Host.ChatPanel(cfg);
+            chat.Dock = DockStyle.Fill;
+            host.Controls.Add(chat);
+            host.Show();
+            Application.DoEvents();
+
+            // ③ 拖放接线
+            check("消息列表 AllowDrop", chat.ListAllowDrop);
+            check("输入框 AllowDrop", chat.InputAllowDrop);
+            // 0.8.8 死区消除：WinForms 拖放**不冒泡**，容器自身也必须 AllowDrop，
+            // 否则拖到输入条背景/输入框边框/引用条等区域完全无反应
+            check("ChatPanel 自身 AllowDrop（死区）", chat.SelfAllowDrop);
+            check("输入条容器 AllowDrop（死区）", chat.BottomAllowDrop);
+            check("输入框边框 AllowDrop（死区）", chat.InputBorderAllowDrop);
+            check("引用条 AllowDrop（死区）", chat.StripAllowDrop);
+
+            // ②+① 放入文件 → 引用条可见且在列表之前（z-order 靠前 = 不被盖）
+            string sample = Path.Combine(Path.GetTempPath(), "oa_droptest.frp");
+            try { File.WriteAllText(sample, "droptest"); } catch { }
+            chat.SetContextFiles(new string[] { sample });
+            Application.DoEvents();
+            check("引用条在放入文件后可见", chat.StripVisible);
+            check("引用条 z-order 在消息列表之前", chat.StripInFrontOfList);
+            check("引用条位于输入框上方", chat.StripAboveInput);
+
+            chat.SetContextFiles(new string[0]);
+            check("清空后引用条隐藏", !chat.StripVisible);
+
+            host.Close();
+            host.Dispose();
+            try { File.Delete(sample); } catch { }
+            Console.WriteLine(failed == 0 ? "droptest ALL PASS" : ("droptest FAILED=" + failed));
             return failed == 0 ? 0 : 2;
         }
 

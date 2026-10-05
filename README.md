@@ -69,8 +69,10 @@ build\host\OfficeAgent.exe /perftest          # 低配优化：预览有界性 +
 build\host\OfficeAgent.exe /toolidtest        # tool_call_id 解析/归一化（并行工具调用不串号）
 build\host\OfficeAgent.exe /formulatest       # 带公式工作簿：公式落位/页序/页内速览/括号配平
 build\host\OfficeAgent.exe /urltest           # 服务地址诊断：裸域名补 /v1、多账号密钥槽（#tag）
+build\host\OfficeAgent.exe /frptest           # .frp 打印模板解析 + 考勤分析（跨零点工时/无打卡日）
 build\host\OfficeAgent.exe /safetytest        # 安全兜底：C盘/删表确认、delete_file、豁免目录
 build\host\OfficeAgent.exe /audittest         # 审计哈希链校验
+build\host\OfficeAgent.exe /droptest          # 拖放链路回归：AllowDrop 接线、引用条置顶与显隐
 build\host\OfficeAgent.exe /agenttest "读一下 D:\a.txt"     # 真模型 agent 循环
 
 # 场景 CLI

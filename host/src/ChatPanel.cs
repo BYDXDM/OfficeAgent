@@ -966,6 +966,27 @@ namespace OfficeAgent.Host
             {
                 if (used >= 3) break;
                 string ext = (Path.GetExtension(p) ?? "").ToLowerInvariant();
+                // frp 打印模板：直接用结构化解析结果（read_text_file 内部同样支持，无需先转换）。
+                // 此前 frp 既不在二进制白名单、也不在 TextExts 里 → 被下面的 continue 静默丢弃，
+                // 模型根本不知道有这个文件，于是跑去 list_directory 工作区、回一句"没看到 frp 文件"。
+                if (ext == ".frp")
+                {
+                    string fe;
+                    string ft = FrpReport.ToText(p, out fe);
+                    if (fe == null && ft != null && ft.Length > 0)
+                    {
+                        if (ft.Length > 6000) ft = ft.Substring(0, 6000) + "\n…[截断，可用工具 read_text_file 读更多]";
+                        if (config.PrivacyLevel == 1) ft = MaskEngine.Mask(ft, maskHits);
+                        sb.Append("\n\n【附带文件 ").Append(p).Append("】（frp 打印模板，已解析为表格文本）\n").Append(ft);
+                    }
+                    else
+                    {
+                        sb.Append("\n\n【附带文件 ").Append(p)
+                          .Append("】（frp 打印模板，自动解析失败；可让我用 convert_document 转成 xlsx 再处理）");
+                    }
+                    used++;
+                    continue;
+                }
                 if (ext == ".xlsx" || ext == ".xls" || ext == ".pdf" || ext == ".doc" || ext == ".docx" ||
                     ext == ".ppt" || ext == ".pptx" || ext == ".png" || ext == ".jpg")
                 {
@@ -975,7 +996,15 @@ namespace OfficeAgent.Host
                 }
                 bool ok;
                 string content = AgentTools.ReadTextFilePublic(p, out ok);
-                if (!ok || content.Length == 0) continue;
+                if (!ok || content.Length == 0)
+                {
+                    // ★ 兜底（关键）：无论内容能否自动读取，都必须把**路径**告诉模型。
+                    //   否则模型不知道用户引用了什么，就会去 list_directory 乱找、然后说"没找到"。
+                    sb.Append("\n\n【附带文件 ").Append(p)
+                      .Append("】（内容未自动附带；请直接对该路径调用工具，不要去找别的文件）");
+                    used++;
+                    continue;
+                }
                 if (content.Length > 6000) content = content.Substring(0, 6000) + "\n…[截断，可用工具 read_text_file 读更多]";
                 if (config.PrivacyLevel == 1) content = MaskEngine.Mask(content, maskHits);
                 sb.Append("\n\n【附带文件 ").Append(p).Append("】\n").Append(content);

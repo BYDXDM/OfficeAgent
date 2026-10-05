@@ -85,6 +85,14 @@ namespace OfficeAgent.Host
             body.BackColor = Bg;
             body.AutoScroll = true;
 
+            // ★ 弹层必须**模态**（ShowDialog）：调用方在 Show 之后会立刻 FocusInput() 把焦点
+            //   还给输入框——若用非模态 Show()，弹层刚显示就被抢焦点 → Deactivate → 自关，
+            //   表现为"模型菜单/模型设置打不开"（0.9.2 回归，已修）。
+            //   因此所有回调都**先记录、关闭后再执行**，避免在模态循环里嵌套开新窗体。
+            Item picked = null;      // 选中的模型
+            Group renameTarget = null;   // 要改名的组
+            int act = 0;             // 0=无 1=刷新 2=打开设置
+
             int y = 8;
             for (int gi = 0; gi < groups.Count; gi++)
             {
@@ -124,7 +132,7 @@ namespace OfficeAgent.Host
                     rn.LinkColor = LinkFg;
                     rn.LinkBehavior = LinkBehavior.HoverUnderline;
                     Group capturedG = g;
-                    rn.Click += delegate { try { onRename(capturedG); } catch { } };
+                    rn.Click += delegate { renameTarget = capturedG; try { pop.Close(); } catch { } };
                     body.Controls.Add(rn);
                 }
 
@@ -159,7 +167,7 @@ namespace OfficeAgent.Host
                         ds.BackColor = Bg;
                         Item cap2 = it;
                         Form of2 = pop;
-                        ds.Click += delegate { try { of2.Close(); } catch { } if (onPick != null) onPick(cap2); };
+                        ds.Click += delegate { picked = cap2; try { of2.Close(); } catch { } };
                         ds.MouseEnter += delegate { try { ds.BackColor = BgHover; } catch { } };
                         ds.MouseLeave += delegate { try { ds.BackColor = Bg; } catch { } };
                         body.Controls.Add(ds);
@@ -169,8 +177,8 @@ namespace OfficeAgent.Host
                     Form ownerForm = pop;
                     cell.Click += delegate
                     {
+                        picked = captured;
                         try { ownerForm.Close(); } catch { }
-                        if (onPick != null) onPick(captured);
                     };
                     cell.MouseEnter += delegate { try { cell.BackColor = BgHover; } catch { } };
                     cell.MouseLeave += delegate { try { cell.BackColor = Bg; } catch { } };
@@ -202,7 +210,7 @@ namespace OfficeAgent.Host
             lkRefresh.AutoSize = true;
             lkRefresh.Location = new Point(PadX, 8);
             lkRefresh.LinkColor = LinkFg;
-            lkRefresh.Click += delegate { try { pop.Close(); } catch { } if (onRefresh != null) onRefresh(); };
+            lkRefresh.Click += delegate { act = 1; try { pop.Close(); } catch { } };
             foot.Controls.Add(lkRefresh);
 
             LinkLabel lkSet = new LinkLabel();
@@ -210,7 +218,7 @@ namespace OfficeAgent.Host
             lkSet.AutoSize = true;
             lkSet.Location = new Point(Width_ - PadX - 72, 8);
             lkSet.LinkColor = LinkFg;
-            lkSet.Click += delegate { try { pop.Close(); } catch { } if (onSettings != null) onSettings(); };
+            lkSet.Click += delegate { act = 2; try { pop.Close(); } catch { } };
             foot.Controls.Add(lkSet);
 
             int bodyH = y;
@@ -241,8 +249,31 @@ namespace OfficeAgent.Host
                 if (e.KeyCode == Keys.Escape) { try { pop.Close(); } catch { } }
             };
 
-            if (owner != null) pop.Show(owner); else pop.Show();
-            pop.Activate();
+            // ★ 模态显示：ShowDialog 会阻塞到弹层关闭为止。
+            //   调用方（ChatPanel.ShowModelMenu）在 Show 之后紧跟着 FocusInput()，
+            //   非模态时那一步会立刻抢焦点把弹层关掉（0.9.2 回归根因）。
+            //   owner 取**顶层窗体**（而非 UserControl），模态才会正确禁用主窗体。
+            Form top = owner as Form;
+            if (top == null && anchor != null) { try { top = anchor.FindForm(); } catch { } }
+            if (top != null) pop.ShowDialog(top); else pop.ShowDialog();
+
+            // 弹层已关闭，此时再执行后续动作（避免在模态循环里嵌套开新窗体）
+            if (picked != null)
+            {
+                if (onPick != null) { try { onPick(picked); } catch { } }
+            }
+            else if (renameTarget != null)
+            {
+                if (onRename != null) { try { onRename(renameTarget); } catch { } }
+            }
+            else if (act == 1)
+            {
+                if (onRefresh != null) { try { onRefresh(); } catch { } }
+            }
+            else if (act == 2)
+            {
+                if (onSettings != null) { try { onSettings(); } catch { } }
+            }
         }
 
         // 简易输入框（深色，与弹层一致）：返回新名称；取消返回 null

@@ -1042,6 +1042,49 @@ namespace OfficeAgent.Host
                 LlmClient.ModelDisplay("deepseek-flash#2", re) == "deepseek-flash（公司号）");
             check("往返后主账号槽仍无名称", re.GetKeyLabel("api.deepseek.com", "") == "");
 
+            // ---- 弹层模态性回归（0.9.2 修的那个 bug）----
+            // 现象：模型菜单/模型设置"打不开"。根因=弹层用非模态 Show()，而调用方 Show 之后
+            // 立刻 FocusInput() 抢焦点 → 弹层 Deactivate → 秒关。
+            // 测法：起一个定时器在 300ms 后关掉弹层，断言 ModelMenu.Show **阻塞了约 300ms**。
+            //       若弹层被秒关，Show 会立刻返回（耗时 <100ms）。
+            Form mh = new Form();
+            mh.ShowInTaskbar = false;
+            mh.FormBorderStyle = FormBorderStyle.None;
+            mh.StartPosition = FormStartPosition.Manual;
+            mh.Location = new Point(-4000, -4000);
+            mh.Size = new Size(900, 600);
+            mh.Show();
+            Label anc = new Label();
+            anc.Text = "anchor";
+            anc.Location = new Point(10, 10);
+            mh.Controls.Add(anc);
+
+            List<ModelMenu.Group> mgs = new List<ModelMenu.Group>();
+            ModelMenu.Group mg = new ModelMenu.Group();
+            mg.Title = "测试组"; mg.Host = "api.test.com"; mg.CanRename = true;
+            ModelMenu.Item mi = new ModelMenu.Item();
+            mi.Id = "m1"; mi.Text = "模型1";
+            mg.Items.Add(mi);
+            mgs.Add(mg);
+
+            System.Windows.Forms.Timer mtk = new System.Windows.Forms.Timer();
+            mtk.Interval = 300;
+            mtk.Tick += delegate
+            {
+                mtk.Stop();
+                foreach (Form f in Application.OpenForms)
+                {
+                    if (f != mh && f.Visible) { try { f.Close(); } catch { } break; }
+                }
+            };
+            mtk.Start();
+            System.Diagnostics.Stopwatch msw = System.Diagnostics.Stopwatch.StartNew();
+            ModelMenu.Show(mh, anc, mgs, null, null, null, null);
+            msw.Stop();
+            check("弹层为模态、不会秒关（Show 阻塞到被关闭）", msw.ElapsedMilliseconds >= 150);
+            mh.Close();
+            mh.Dispose();
+
             Console.WriteLine(failed == 0 ? "menutest ALL PASS" : ("menutest FAILED=" + failed));
             return failed == 0 ? 0 : 2;
         }

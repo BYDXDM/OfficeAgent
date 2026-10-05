@@ -267,7 +267,7 @@ namespace OfficeAgent.Host
             // WorkBuddy 式引用条：输入框上方横排"格式徽标+文件名"小片（拖入/@ 引用后可见，点 × 移除）
             fileStrip = new Panel();
             fileStrip.Location = new Point(150, 12);
-            fileStrip.Size = new Size(700, 30);
+            fileStrip.Size = new Size(700, 40);   // 0.9.4：随引用片放大（原 30）
             fileStrip.BackColor = Color.White;
             fileStrip.Visible = false;
             fileStrip.Paint += FileStrip_Paint;
@@ -707,50 +707,60 @@ namespace OfficeAgent.Host
             Graphics g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             fileChipRects.Clear();
-            int x = 0, y = 3;
+            // 0.9.4 用户要求：引用文件条整体放大、更醒目（原 8.25pt/24px 太小）。
+            // 放大时刻意保持原有风格：同样的圆角、同样的浅灰底+细边、同样的"格式徽标+文件名+×"结构。
+            const int ChipH = 30;      // 原 24
+            const int BadgeS = 20;     // 原 16
+            const int LeftPad = 8;     // 原 6
+            const int GapBadgeName = 7;// 原 5
+            const int XArea = 16;      // 原 12
+            const int RightPad = 8;    // 原 6
+            int x = 0, y = 4;          // 原 y=3
             int shown = 0;
             foreach (string f in contextFiles)
             {
                 string name = Path.GetFileName(f);
-                Font nameFont = new Font("Microsoft YaHei UI", 8.25F);
+                Font nameFont = new Font("Microsoft YaHei UI", 10F);   // 原 8.25F
                 int nameW;
                 try { nameW = TextRenderer.MeasureText(name, nameFont).Width; }
-                catch { nameW = 60; }
-                if (nameW > 170) nameW = 170;   // 超长文件名截断（EndEllipsis）
-                int w = 6 + 16 + 5 + nameW + 6 + 12 + 6;
+                catch { nameW = 70; }
+                if (nameW > 200) nameW = 200;   // 超长文件名截断（EndEllipsis）；原 170
+                int w = LeftPad + BadgeS + GapBadgeName + nameW + 8 + XArea + RightPad;
                 if (x + w > fileStrip.Width && shown > 0) break;   // 放不下的下轮再说（罕见于超宽屏）
-                Rectangle chip = new Rectangle(x, y, w, 24);
+                Rectangle chip = new Rectangle(x, y, w, ChipH);
                 fileChipRects.Add(chip);
-                using (GraphicsPath gp = RoundRect(chip, 6))
+                using (GraphicsPath gp = RoundRect(chip, 7))
                 {
                     using (SolidBrush b = new SolidBrush(Color.FromArgb(243, 244, 248))) g.FillPath(b, gp);
                     using (Pen p = new Pen(Color.FromArgb(224, 227, 234))) g.DrawPath(p, gp);
                 }
                 // 格式徽标
-                Rectangle badge = new Rectangle(x + 6, y + 4, 16, 16);
+                Rectangle badge = new Rectangle(x + LeftPad, y + (ChipH - BadgeS) / 2, BadgeS, BadgeS);
                 Color bc = FileBadgeColor(f);
-                using (GraphicsPath gp = RoundRect(badge, 4))
+                using (GraphicsPath gp = RoundRect(badge, 5))
                 using (SolidBrush b = new SolidBrush(bc)) g.FillPath(b, gp);
                 string tag = FileBadge(f);
-                using (Font bf = new Font("Microsoft YaHei UI", 6.75F, FontStyle.Bold))
+                using (Font bf = new Font("Microsoft YaHei UI", 8F, FontStyle.Bold))   // 原 6.75F
                     TextRenderer.DrawText(g, tag, bf, badge, Color.White,
                         TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
                 // 文件名
                 TextRenderer.DrawText(g, name, nameFont,
-                    new Rectangle(x + 6 + 16 + 5, y, nameW + 6, 24), Color.FromArgb(70, 73, 84),
+                    new Rectangle(x + LeftPad + BadgeS + GapBadgeName, y, nameW + 8, ChipH), Color.FromArgb(60, 63, 74),
                     TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
                 // ×（移除）
-                TextRenderer.DrawText(g, "×", new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
-                    new Rectangle(x + w - 18, y, 14, 24), Color.FromArgb(150, 153, 168),
-                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
-                x += w + 8;
+                using (Font xf = new Font("Microsoft YaHei UI", 10.5F, FontStyle.Bold))   // 原 9F
+                    TextRenderer.DrawText(g, "×", xf,
+                        new Rectangle(x + w - RightPad - XArea, y, XArea, ChipH), Color.FromArgb(150, 153, 168),
+                        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+                x += w + 10;   // 原 8
                 shown++;
                 if (shown < contextFiles.Count)
                 {
                     string more = "+" + (contextFiles.Count - shown);
-                    TextRenderer.DrawText(g, more, new Font("Microsoft YaHei UI", 8F),
-                        new Rectangle(x, y, 40, 24), Color.FromArgb(150, 153, 168),
-                        TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+                    using (Font mf = new Font("Microsoft YaHei UI", 9.5F))
+                        TextRenderer.DrawText(g, more, mf,
+                            new Rectangle(x, y, 44, ChipH), Color.FromArgb(150, 153, 168),
+                            TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
                     break;
                 }
             }
@@ -763,7 +773,8 @@ namespace OfficeAgent.Host
             {
                 if (fileChipRects[i].Contains(e.Location))
                 {
-                    if (e.X >= fileChipRects[i].Right - 18)
+                    // × 区域 = 右边距(8) + × 区宽(16)；与 FileStrip_Paint 的布局保持一致
+                    if (e.X >= fileChipRects[i].Right - 24)
                     {
                         contextFiles.RemoveAt(i);
                         RefreshFileChip();
@@ -937,6 +948,16 @@ namespace OfficeAgent.Host
             string userPayload = question + fileCtx + agentHint;
             userPayloadForHistory = userPayload;
             lastUserDisplay = text;   // 会话存档用原文（不含脱敏与文件上下文）
+
+            // 0.9.4 用户要求：引用文件**只带一轮**——本轮已把它附进提问，
+            // 下一轮不再重复携带（否则每次追问都重发一遍文件内容：费 token、也干扰模型）。
+            // 引用条同步清空/隐藏，用户想看得到"已经用掉了"。
+            if (contextFiles.Count > 0)
+            {
+                contextFiles.Clear();
+                try { RefreshFileChip(); } catch { }
+            }
+
             Thread t = new Thread(new ThreadStart(delegate
             {
                 System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();

@@ -31,6 +31,18 @@ namespace OfficeAgent.Host
         public int CachedTextW = -1;   // 气泡宽度缓存
         public int CachedHeaderW = -1; // 名字+时间宽度缓存
         public int CachedAvail = -1;   // 测量时的可用宽度（变宽后需重测）
+        // 0.9.6 文本选中：在 Text 中的选中区间（SelLen=0 表示未选中）
+        public int SelStart = 0;
+        public int SelLen = 0;
+        public bool HasSel { get { return SelLen > 0; } }
+        public void ClearSel() { SelStart = 0; SelLen = 0; }
+        public string SelectedText()
+        {
+            if (SelLen <= 0 || Text == null) return "";
+            int s = Math.Max(0, Math.Min(SelStart, Text.Length));
+            int n = Math.Min(SelLen, Text.Length - s);
+            return n <= 0 ? "" : Text.Substring(s, n);
+        }
     }
 
     public partial class ChatPanel : Panel
@@ -90,6 +102,15 @@ namespace OfficeAgent.Host
         const int WM_MOUSEWHEEL = 0x020A;
 
         List<string> fetchedModels = null;   // 从服务拉到的模型列表（内联下拉用）
+
+        // ===== 0.9.6 消息文本选中 + 一键复制 =====
+        int selIdx = -1;              // 正在选中的消息下标（-1 = 无）
+        int selAnchor = 0;            // 拖选锚点（字符下标）
+        bool selDragging = false;
+        int copyHoverIdx = -1;        // 鼠标悬停在哪条消息上（决定是否显示复制按钮）
+        int copyOnBtnIdx = -1;        // 悬停位置是否正落在该条的复制按钮上
+        Rectangle copyBtnRect;        // 复制按钮命中区（每次绘制后更新）
+        int copyBtnMsg = -1;          // copyBtnRect 属于哪条消息
 
         int LeftMargin() { return (list.Width > 900) ? 170 : 20; }
         int AvailWidth() { return Math.Min(MaxTextWidth, Math.Max(200, list.Width - LeftMargin() - 60)); }
@@ -1161,6 +1182,14 @@ namespace OfficeAgent.Host
                 FinishReply(idx, "✗ " + r.Error, true, 0);
                 return;
             }
+            // ★ 反"编造产物"护栏（0.9.6）
+            //   用户实测：答复里给了完整工资表并写「已输出为 Excel 表格，保存在 C:\...\xx.xlsx」，
+            //   但审计日志里**没有任何写文件记录**、目标目录也是空的 —— 文件从未生成。
+            //   根因是模型把工具调用写成了代码块（```python / analyze_attendance）而没有真正
+            //   发起 function call，随后凭空续写了结果。系统提示已要求"一律直接发起工具调用"，
+            //   但提示词约束不住，所以这里做**确定性检测**：声称保存了文件、而本回合
+            //   Products 为空 → 补一条醒目的纠正说明，避免用户按假路径去找文件。
+            r.FinalText = GuardFabricatedProduct(r.FinalText, r.Products == null ? 0 : r.Products.Count);
             if (r.UsedTools && r.ToolLog.Length > 0)
             {
                 // 工具调用记录留在原气泡；最终答复另起一条（顺序：日志在上、答复在下）
@@ -1221,6 +1250,28 @@ namespace OfficeAgent.Host
                 MarkDirty();
             }
             catch { }
+        }
+
+        // 反"编造产物"护栏：声称保存了文件、但本回合没有任何真实产物 → 追加纠正说明。
+        // 判定刻意收紧（"保存类措辞" + "文件扩展名或盘符路径"同时命中）以免误伤——
+        // 模型在**讨论**某个文件（如"你那个 .xlsx 有 3 张表"）时不该被误报。
+        internal static string GuardFabricatedProduct(string finalText, int productCount)
+        {
+            if (productCount > 0) return finalText;
+            if (finalText == null || finalText.Length == 0) return finalText;
+            bool claim = false;
+            string[] kw = new string[] { "已保存", "已生成", "已输出", "保存到", "输出为", "已导出", "已存为", "文件已", "已创建" };
+            foreach (string k in kw) { if (finalText.IndexOf(k, StringComparison.Ordinal) >= 0) { claim = true; break; } }
+            if (!claim) return finalText;
+            bool looksLikeFile = false;
+            string[] ext = new string[] { ".xlsx", ".xls", ".csv", ".docx", ".doc", ".pptx", ".ppt", ".pdf", ".txt" };
+            foreach (string e in ext) { if (finalText.IndexOf(e, StringComparison.OrdinalIgnoreCase) >= 0) { looksLikeFile = true; break; } }
+            if (!looksLikeFile && finalText.IndexOf(":\\", StringComparison.Ordinal) >= 0) looksLikeFile = true;
+            if (!looksLikeFile) return finalText;
+            return finalText +
+                "\n\n———\n⚠️ 系统核对：上面提到的文件**本次并没有真正生成**——本回合没有调用任何会写文件的工具" +
+                "（审计日志无写文件记录，目标目录为空）。这通常是我把工具调用写成了代码示例、而没有真正发起调用造成的。\n" +
+                "请回复「重做」，我会实际调用工具生成文件；也可以把需求再说一次。";
         }
 
         // 追加附件卡片气泡（并持久化到会话）

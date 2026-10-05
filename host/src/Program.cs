@@ -668,6 +668,20 @@ namespace OfficeAgent.Host
             }
             check("长回复分块：切点落在换行边界（不切在行内）", lineEnd);
             check("长回复分块：确实切成了多段", chunks.Count > 1);
+
+            // ★ 反"编造产物"护栏（0.9.6）：用户实测——答复给了完整表格并写
+            //   「已输出为 Excel 表格，保存在 C:\...\frp考勤工资计算表.xlsx」，
+            //   但审计无写文件记录、目录为空。这里断言检测确实命中，且不误伤。
+            string fake = "已将工资计算结果输出为Excel表格，保存在：C:\\Users\\Administrator\\Downloads\\表格\\frp考勤工资计算表.xlsx";
+            check("编造产物：声称保存但无产物 → 追加纠正说明",
+                OfficeAgent.Host.ChatPanel.GuardFabricatedProduct(fake, 0).IndexOf("并没有真正生成") >= 0);
+            check("编造产物：真有产物 → 原样返回",
+                OfficeAgent.Host.ChatPanel.GuardFabricatedProduct(fake, 1) == fake);
+            check("编造产物：只是讨论文件（无保存措辞）→ 不误伤",
+                OfficeAgent.Host.ChatPanel.GuardFabricatedProduct("你这个 .xlsx 里有 3 张工作表。", 0)
+                    == "你这个 .xlsx 里有 3 张工作表。");
+            check("编造产物：只有保存措辞、无文件指向 → 不误伤",
+                OfficeAgent.Host.ChatPanel.GuardFabricatedProduct("我已经算好了。", 0) == "我已经算好了。");
             if (!lineEnd)
             {
                 Console.WriteLine("        ↳ 段数=" + chunks.Count + " 首个失败段=" + failAt);

@@ -84,6 +84,7 @@ namespace OfficeAgent.Host
                 // 加权预算（第二期）：读型半价、技能/写型全价、task_plan 免费。
                 // 达到等效上限即进入收尾跳；HardHopLimit 是防死循环的硬兜底。
                 HopBudget.State budget = new HopBudget.State();
+                bool pseudoRetried = false;   // 伪工具调用只纠正一次，避免死循环
                 for (int hop = 0; hop < HardHopLimit; hop++)
                 {
                     bool wrapUp = HopBudget.ShouldWrapUp(budget) || hop >= MaxHops;
@@ -109,6 +110,26 @@ namespace OfficeAgent.Host
                     if (reply.Error.Length > 0) { r.Error = reply.Error; return r; }
                     if (!reply.HasToolCalls)
                     {
+                        // ★ 反"伪工具调用"（0.9.7，修用户实测的"产物丢失"）
+                        //   现象：模型把工具调用**写成代码块**（```python / analyze_attendance）
+                        //   而不是真正发起 function call，然后凭空续写结果——答复里给了完整
+                        //   表格和保存路径，但审计日志无写文件记录、目标目录为空，文件从未生成。
+                        //   系统提示已要求"一律直接发起工具调用"，但约束不住，所以这里做一次
+                        //   **强制纠正重试**：识别到伪调用就把原答复回灌 + 明确要求改用真正的
+                        //   function call 重来，让循环继续，而不是就此收尾。
+                        if (!pseudoRetried && LooksLikePseudoToolCall(reply.Content))
+                        {
+                            pseudoRetried = true;
+                            r.UsedTools = true;
+                            request.Add(new LlmTurn("assistant", reply.Content == null ? "" : reply.Content));
+                            request.Add(new LlmTurn("user",
+                                "你刚才把工具调用写成了**代码块**（例如 python 代码块里写 analyze_attendance），" +
+                                "那不是真正的调用，系统不会执行它，你后面写的结果是凭空编的。\n" +
+                                "请立刻改用**真正的工具调用**重新执行这个任务：不要输出代码示例、不要描述步骤、" +
+                                "不要凭记忆编造结果。如果确实不需要工具，就直接给出基于已知事实的答复。"));
+                            log.AppendLine("· 检测到伪工具调用（写成代码块），已要求改用真正的 function call 重试");
+                            continue;
+                        }
                         // 这一跳就是最终答复（模型不再要工具）。
                         // 流式策略：只有当本回合**已经跑过工具**（长任务，用户等待久、逐字显示有实感）
                         // 且配置开启时才复查一次 stream:true。
@@ -270,6 +291,30 @@ namespace OfficeAgent.Host
             return result.Substring(0, MaxToolResultChars) +
                 "\n…[结果过长已截断，共 " + result.Length + " 字符]。" +
                 "如需其余内容，请用更精确的参数（如指定具体文件/子目录）重新调用，不要重复读同一份。";
+        }
+
+        // 判定"伪工具调用"：答复里出现**代码块**，且块内出现已知工具名。
+        // 刻意只看代码块内部——正常答复里提到工具名（如"我用 create_formula_workbook 建的"）
+        // 不该被误判。返回 true 表示模型像是"想调工具却写成了示例代码"。
+        internal static bool LooksLikePseudoToolCall(string content)
+        {
+            if (content == null || content.Length == 0) return false;
+            List<string> tools = AgentTools.KnownToolNames();
+            if (tools.Count == 0) return false;
+            int i = 0;
+            while (true)
+            {
+                int s = content.IndexOf("```", i, StringComparison.Ordinal);
+                if (s < 0) return false;
+                int e = content.IndexOf("```", s + 3, StringComparison.Ordinal);
+                string block = e > s ? content.Substring(s + 3, e - s - 3) : content.Substring(s + 3);
+                foreach (string t in tools)
+                {
+                    if (t != null && t.Length > 2 && block.IndexOf(t, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                }
+                if (e < 0) return false;
+                i = e + 3;
+            }
         }
 
         static bool LooksLikeToolsRejected(string err)

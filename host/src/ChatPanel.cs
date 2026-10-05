@@ -35,6 +35,9 @@ namespace OfficeAgent.Host
         public int SelStart = 0;
         public int SelLen = 0;
         public bool HasSel { get { return SelLen > 0; } }
+        // 折行缓存（选中高亮与字符命中共用；宽度变了要重算）
+        public List<TextLayout.Line> Lines;
+        public int LinesW = -1;
         public void ClearSel() { SelStart = 0; SelLen = 0; }
         public string SelectedText()
         {
@@ -165,6 +168,14 @@ namespace OfficeAgent.Host
                 int idx = list.IndexFromPoint(e.Location);
                 if (idx < 0 || idx >= msgs.Count) return;
                 ContextMenu m = new ContextMenu();
+                // 有选中时优先给"复制选中"
+                string picked = SelectedTextOf();
+                if (picked.Length > 0)
+                {
+                    MenuItem cs = new MenuItem("复制选中内容");
+                    cs.Click += delegate { try { Clipboard.SetText(picked); } catch { } };
+                    m.MenuItems.Add(cs);
+                }
                 string one = msgs[idx].Text == null ? "" : msgs[idx].Text;
                 if (one.Length > 0)
                 {
@@ -176,6 +187,69 @@ namespace OfficeAgent.Host
                 c2.Click += delegate { try { Clipboard.SetText(BuildTranscript()); } catch { } };
                 m.MenuItems.Add(c2);
                 m.Show(list, e.Location);
+            };
+            // ===== 0.9.7 消息文本可选中 + 一键复制 =====
+            // 按下：先判复制按钮（命中=复制整条），否则开始选词
+            list.MouseDown += delegate(object s, MouseEventArgs e)
+            {
+                if (e.Button != MouseButtons.Left) return;
+                int idx = list.IndexFromPoint(e.Location);
+                if (idx < 0 || idx >= msgs.Count) return;
+                if (copyBtnMsg == idx && copyBtnRect.Contains(e.Location)) { CopyMsgText(idx); return; }
+                if (msgs[idx].AttachPath.Length > 0) return;      // 附件卡片不参与选词
+                int ci = CharIndexAt(idx, e.Location);
+                if (ci < 0) return;
+                ClearAllSel();
+                selIdx = idx; selAnchor = ci; selDragging = true;
+                msgs[idx].SelStart = ci; msgs[idx].SelLen = 0;
+                list.Invalidate();
+            };
+            // 移动：悬停（复制按钮）+ 拖选扩展
+            list.MouseMove += delegate(object s, MouseEventArgs e)
+            {
+                int idx = list.IndexFromPoint(e.Location);
+                int onBtn = (idx >= 0 && idx == copyBtnMsg && copyBtnRect.Contains(e.Location)) ? idx : -1;
+                if (idx != copyHoverIdx || onBtn != copyOnBtnIdx)
+                {
+                    copyHoverIdx = idx; copyOnBtnIdx = onBtn;
+                    try { list.Cursor = onBtn >= 0 ? Cursors.Hand : Cursors.Default; } catch { }
+                    list.Invalidate();
+                }
+                if (selDragging && selIdx >= 0 && selIdx < msgs.Count)
+                {
+                    int ci = CharIndexAt(selIdx, e.Location);
+                    if (ci >= 0)
+                    {
+                        int a = Math.Min(selAnchor, ci), z = Math.Max(selAnchor, ci);
+                        msgs[selIdx].SelStart = a; msgs[selIdx].SelLen = z - a;
+                        list.Invalidate();
+                    }
+                }
+            };
+            list.MouseUp += delegate(object s, MouseEventArgs e)
+            {
+                if (e.Button != MouseButtons.Left || !selDragging) return;
+                selDragging = false;
+                if (selIdx >= 0 && selIdx < msgs.Count && !msgs[selIdx].HasSel) selIdx = -1;
+                list.Invalidate();
+            };
+            list.MouseLeave += delegate
+            {
+                if (copyHoverIdx != -1 || copyOnBtnIdx != -1)
+                {
+                    copyHoverIdx = -1; copyOnBtnIdx = -1;
+                    try { list.Cursor = Cursors.Default; } catch { }
+                    list.Invalidate();
+                }
+            };
+            list.KeyDown += delegate(object s, KeyEventArgs e)
+            {
+                if (e.Control && e.KeyCode == Keys.C)
+                {
+                    string sel = SelectedTextOf();
+                    if (sel.Length > 0) { try { Clipboard.SetText(sel); } catch { } e.Handled = true; }
+                }
+                else if (e.KeyCode == Keys.Escape && selIdx >= 0) { ClearAllSel(); list.Invalidate(); }
             };
             Controls.Add(list);
 
@@ -2401,11 +2475,120 @@ namespace OfficeAgent.Host
             m.CachedTextW = Math.Max(60, Math.Min(avail, ts.Width + 2 * TextInsetX + 8));
             string header = (m.User ? "你" : "助手") + "  " + m.Time;
             m.CachedHeaderW = TextRenderer.MeasureText(header, NameFont).Width;
-            if (m.First && m.Last) m.CachedHeight = 34 + m.CachedTextH + 16;
+            // Last 条多留 ~30px：悬停时在气泡**下方**画「一键复制」按钮（0.9.7）。
+            // 按钮底 = top + textH + 20 + 2 + 20，故末条至少要留到 textH+48。
+            if (m.First && m.Last) m.CachedHeight = 34 + m.CachedTextH + 16 + 20;
             else if (m.First) m.CachedHeight = 34 + m.CachedTextH + 4;
-            else if (m.Last) m.CachedHeight = m.CachedTextH + 14;
+            else if (m.Last) m.CachedHeight = m.CachedTextH + 14 + 36;
             else m.CachedHeight = m.CachedTextH + 4;
             m.CachedAvail = avail;
+        }
+
+        // ===== 0.9.7 消息可选中 + 一键复制：几何与折行（绘制/命中共用同一套，避免漂移）=====
+
+        // 气泡矩形（item 内）
+        static Rectangle BubbleRect(Rectangle itemBounds, ChatMsg m, int leftMargin)
+        {
+            int top = itemBounds.Y + (m.First ? 22 : 2);
+            if (m.User)
+                return new Rectangle(itemBounds.Right - 20 - m.CachedTextW, top, m.CachedTextW, m.CachedTextH + 20);
+            return new Rectangle(leftMargin, top, m.CachedTextW, m.CachedTextH + 20);
+        }
+
+        // 文本绘制区（气泡内缩 TextInsetX）
+        static Rectangle TextRectOf(Rectangle bubble)
+        {
+            return new Rectangle(bubble.X + TextInsetX, bubble.Y, Math.Max(20, bubble.Width - 2 * TextInsetX), bubble.Height);
+        }
+
+        // 折行缓存（绘制宽度变化时重算）
+        List<TextLayout.Line> LinesOf(ChatMsg m, int drawW)
+        {
+            if (m.Lines != null && m.LinesW == drawW) return m.Lines;
+            m.Lines = TextLayout.ComputeLines(m.Text == null ? "" : m.Text, TextFont, drawW);
+            m.LinesW = drawW;
+            return m.Lines;
+        }
+
+        // 选中高亮：按行矩形铺半透明底色（画在文字**下面**）
+        void DrawSelection(Graphics g, ChatMsg m, Rectangle tr)
+        {
+            if (m == null || !m.HasSel) return;
+            List<TextLayout.Line> lines = LinesOf(m, tr.Width);
+            if (lines == null || lines.Count == 0) return;
+            int lh = TextLayout.LineHeight(TextFont);
+            int top = tr.Y + Math.Max(0, (tr.Height - lines.Count * lh) / 2);   // 与 VerticalCenter 对齐
+            int a0 = m.SelStart, z0 = m.SelStart + m.SelLen;
+            using (SolidBrush b = new SolidBrush(Color.FromArgb(110, 62, 99, 221)))
+            {
+                foreach (TextLayout.Line ln in lines)
+                {
+                    int a = Math.Max(ln.Start, a0);
+                    int z = Math.Min(ln.End, z0);
+                    if (z > a)
+                    {
+                        int x0 = tr.X + TextLayout.Width(m.Text.Substring(ln.Start, a - ln.Start), TextFont);
+                        int x1 = tr.X + TextLayout.Width(m.Text.Substring(ln.Start, z - ln.Start), TextFont);
+                        g.FillRectangle(b, x0, top, Math.Max(2, x1 - x0), lh);
+                    }
+                    top += lh;
+                }
+            }
+        }
+
+        // 命中：把鼠标点换算成该消息里的字符下标（不在文本区返回 -1）
+        int CharIndexAt(int idx, Point pt)
+        {
+            if (idx < 0 || idx >= msgs.Count) return -1;
+            ChatMsg m = msgs[idx];
+            if (m.AttachPath.Length > 0) return -1;
+            MeasureMsg(m, AvailWidth());
+            Rectangle tr = TextRectOf(BubbleRect(list.GetItemRectangle(idx), m, LeftMargin()));
+            if (tr.Width <= 0) return -1;
+            List<TextLayout.Line> lines = LinesOf(m, tr.Width);
+            int lh = TextLayout.LineHeight(TextFont);
+            int top = tr.Y + Math.Max(0, (tr.Height - lines.Count * lh) / 2);
+            int li = (pt.Y - top) / lh;
+            if (li < 0) li = 0;
+            if (li >= lines.Count) li = lines.Count - 1;
+            TextLayout.Line ln = lines[li];
+            int inLine = TextLayout.CharInLine(m.Text, ln.Start, ln.Len, TextFont, pt.X - tr.X);
+            return Math.Max(0, Math.Min(m.Text.Length, ln.Start + inLine));
+        }
+
+        void ClearAllSel()
+        {
+            for (int i = 0; i < msgs.Count; i++) if (msgs[i].HasSel) msgs[i].ClearSel();
+            selIdx = -1; selDragging = false;
+        }
+
+        void CopyMsgText(int idx)
+        {
+            try
+            {
+                if (idx < 0 || idx >= msgs.Count) return;
+                string t = msgs[idx].Text == null ? "" : msgs[idx].Text;
+                if (t.Length > 0) Clipboard.SetText(t);
+            }
+            catch { }
+        }
+
+        // 当前选中的文本（同一时刻只允许一条消息有选中，取第一条命中的即可）
+        string SelectedTextOf()
+        {
+            try
+            {
+                for (int i = 0; i < msgs.Count; i++)
+                {
+                    if (msgs[i].HasSel)
+                    {
+                        string s = msgs[i].SelectedText();
+                        if (s.Length > 0) return s;
+                    }
+                }
+            }
+            catch { }
+            return "";
         }
 
         void List_MeasureItem(object sender, MeasureItemEventArgs e)
@@ -2484,10 +2667,12 @@ namespace OfficeAgent.Host
                     using (Pen p = new Pen(Color.FromArgb(150, 175, 225)))
                         g.DrawPath(p, gp);
                 }
-                TextRenderer.DrawText(g, m.Text, TextFont,
-                    new Rectangle(bubble.X + TextInsetX, bubble.Y, bubble.Width - 2 * TextInsetX, bubble.Height),
+                Rectangle trU = TextRectOf(bubble);
+                DrawSelection(g, m, trU);   // 选中高亮（在文字下层）
+                TextRenderer.DrawText(g, m.Text, TextFont, trU,
                     Color.FromArgb(20, 40, 90),
                     TextFormatFlags.WordBreak | TextFormatFlags.VerticalCenter);
+                DrawCopyButton(g, e.Index, m, bubble);
             }
             else
             {
@@ -2504,12 +2689,50 @@ namespace OfficeAgent.Host
                     using (Pen p = new Pen(m.Error ? Color.FromArgb(230, 160, 160) : Color.FromArgb(222, 225, 233)))
                         g.DrawPath(p, gp);
                 }
-                TextRenderer.DrawText(g, m.Text, TextFont,
-                    new Rectangle(bubble.X + TextInsetX, bubble.Y, bubble.Width - 2 * TextInsetX, bubble.Height),
+                Rectangle trA = TextRectOf(bubble);
+                DrawSelection(g, m, trA);   // 选中高亮（在文字下层）
+                TextRenderer.DrawText(g, m.Text, TextFont, trA,
                     m.Error ? Color.FromArgb(178, 58, 58) : Color.FromArgb(28, 30, 38),
                     TextFormatFlags.WordBreak | TextFormatFlags.VerticalCenter);
+                DrawCopyButton(g, e.Index, m, bubble);
             }
             g.ResetClip();
+        }
+
+        // 悬停时在气泡**下方左侧**画「一键复制」按钮 + 「复制」提示（0.9.7 用户要求，参照其截图）
+        void DrawCopyButton(Graphics g, int idx, ChatMsg m, Rectangle bubble)
+        {
+            if (m.AttachPath.Length > 0) return;
+            if (!m.Last) return;          // 只在分块末条显示，避免一条消息出现多个按钮
+            if (idx != copyHoverIdx) return;
+            if (m.Text == null || m.Text.Length == 0) return;
+            int bw = 22, bh = 20;
+            Rectangle btn = new Rectangle(bubble.X + 2, bubble.Bottom + 2, bw, bh);
+            copyBtnRect = btn; copyBtnMsg = idx;
+            bool on = copyOnBtnIdx == idx;
+            using (GraphicsPath gp = RoundRect(btn, 5))
+            {
+                using (SolidBrush b = new SolidBrush(on ? Color.FromArgb(228, 233, 244) : Color.FromArgb(244, 245, 249)))
+                    g.FillPath(b, gp);
+                using (Pen p = new Pen(Color.FromArgb(219, 223, 233))) g.DrawPath(p, gp);
+            }
+            // 图标：两个错位的方框（复制）
+            Color ic = on ? Color.FromArgb(62, 99, 221) : Color.FromArgb(122, 126, 140);
+            using (Pen p = new Pen(ic, 1.3F))
+            {
+                g.DrawRectangle(p, btn.X + 6, btn.Y + 5, 8, 8);
+                g.DrawRectangle(p, btn.X + 9, btn.Y + 8, 8, 8);
+            }
+            if (on)
+            {
+                string tip = "复制";
+                Size ts = TextRenderer.MeasureText(tip, NameFont);
+                Rectangle tr = new Rectangle(btn.X + (bw - ts.Width) / 2 - 5, btn.Bottom + 3, ts.Width + 10, ts.Height + 6);
+                using (GraphicsPath gp = RoundRect(tr, 4))
+                using (SolidBrush b = new SolidBrush(Color.FromArgb(46, 48, 58))) g.FillPath(b, gp);
+                TextRenderer.DrawText(g, tip, NameFont, tr, Color.White,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            }
         }
 
         // 分块圆角：首条上圆下小、尾条上小下圆、中间全小

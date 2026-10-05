@@ -682,6 +682,18 @@ namespace OfficeAgent.Host
                     == "你这个 .xlsx 里有 3 张工作表。");
             check("编造产物：只有保存措辞、无文件指向 → 不误伤",
                 OfficeAgent.Host.ChatPanel.GuardFabricatedProduct("我已经算好了。", 0) == "我已经算好了。");
+
+            // ★ 反"伪工具调用"（0.9.7）：模型把工具名写进代码块、却没真正发起 function call
+            //   —— 这正是"声称已生成文件但文件不存在"的根因。检测到就要**强制纠正重试**。
+            check("伪工具调用：代码块内含工具名 → 判定为伪调用",
+                OfficeAgent.Host.AgentLoop.LooksLikePseudoToolCall(
+                    "我来分析这个考勤文件：\n```python\nanalyze_attendance\n```\n根据分析结果，工资如下…"));
+            check("伪工具调用：正常提到工具名（无代码块）→ 不误判",
+                !OfficeAgent.Host.AgentLoop.LooksLikePseudoToolCall("我用 create_formula_workbook 帮你建好了表。"));
+            check("伪工具调用：普通代码块（无工具名）→ 不误判",
+                !OfficeAgent.Host.AgentLoop.LooksLikePseudoToolCall("示例：\n```python\nprint(1)\n```"));
+            check("伪工具调用：空答复 → 不误判",
+                !OfficeAgent.Host.AgentLoop.LooksLikePseudoToolCall(""));
             if (!lineEnd)
             {
                 Console.WriteLine("        ↳ 段数=" + chunks.Count + " 首个失败段=" + failAt);

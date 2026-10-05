@@ -93,7 +93,7 @@ namespace OfficeAgent.Host
             return lineLen;
         }
 
-        static int Width(string s, Font font)
+        public static int Width(string s, Font font)
         {
             if (s == null || s.Length == 0) return 0;
             try

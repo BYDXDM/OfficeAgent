@@ -68,6 +68,31 @@ namespace OfficeAgent.Host
             return SchemasJson(false);
         }
 
+        // 内置工具名清单（0.9.7）：用于识别"伪工具调用"——模型把工具名写进代码块
+        // 而**没有真正发起 function call**。从 schema 里解析，避免硬编码漂移。
+        public static List<string> KnownToolNames()
+        {
+            List<string> names = new List<string>();
+            try
+            {
+                string json = SchemasJson(true);
+                int i = 0;
+                while (true)
+                {
+                    int k = json.IndexOf("\"name\":\"", i, StringComparison.Ordinal);
+                    if (k < 0) break;
+                    int s = k + 8;
+                    int e2 = json.IndexOf('"', s);
+                    if (e2 < 0) break;
+                    string nm = json.Substring(s, e2 - s);
+                    if (nm.Length > 0 && !names.Contains(nm)) names.Add(nm);
+                    i = e2 + 1;
+                }
+            }
+            catch { }
+            return names;
+        }
+
         // task_plan 计划栏插件的 schema（内置插件页可关）
         public const string TaskPlanSchema =
             "{\"type\":\"function\",\"function\":{\"name\":\"task_plan\",\"description\":\"复杂任务的计划清单（界面右侧计划栏向用户展示进度）。遇到 3 步以上的任务先 start 列出步骤，每完成一步用 done 勾掉，全部完成后用 finish。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"description\":\"start=创建计划；done=勾选已完成步骤；finish=全部完成\"},\"data\":{\"type\":\"string\",\"description\":\"start: 步骤列表（每行一步）；done: 步骤序号或包含的关键词\"}},\"required\":[\"action\"]}}}";

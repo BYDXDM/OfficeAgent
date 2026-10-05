@@ -59,6 +59,10 @@ namespace OfficeAgent.Host
                 book = XlsxBook.Open(path);
                 if (book.Sheets.Count == 0) { p.Error = "工作簿里没有工作表"; return p; }
                 if (sheetIndex < 0 || sheetIndex >= book.Sheets.Count) sheetIndex = 0;
+                // 无缓存值的公式格：预览用短标记而不是公式原文。
+                // 系统/ERP 生成的 xlsx 常写了公式却不写缓存值，照搬原文会把
+                // "=IF($N6=...,_xlfn.TEXTJOIN(...))" 这种上百字符的串铺进网格，看起来就是乱码。
+                book.UncachedFormulaMarker = "〔公式〕";
 
                 List<string[]> kept = new List<string[]>();
                 int count = 0;

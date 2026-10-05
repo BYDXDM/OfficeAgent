@@ -42,8 +42,24 @@ namespace OfficeAgent.Host
         //   背景：系统/ERP 程序化生成的 xlsx 很常见"写了公式但不写缓存值"，
         //         这种文件转 CSV 时若照搬公式文本，用户看到的就是"乱码"。
         public bool BlankUncachedFormula = false;
-        // 本次读取中被置空的无缓存公式单元格计数（供调用方向用户提示）
+        // 无缓存公式格的**短标记**（显示场景用，如预览网格的"〔公式〕"）。
+        // 非 null 时优先于 BlankUncachedFormula——既不写出 130 字符的公式串（像乱码），
+        // 也不留空白（会让人误以为没有数据）。
+        public string UncachedFormulaMarker = null;
+        // 本次读取中遇到的无缓存公式单元格计数（供调用方向用户提示）
         public int UncachedFormulaCount = 0;
+
+        // 无缓存值公式格的统一呈现：
+        //   Marker 非空 → 用标记（预览等显示场景）
+        //   否则 BlankUncachedFormula → 空串（导出场景）
+        //   否则 → "=公式"（核对/合并/建议等逻辑场景：标记为"非数值"，不参与计算）
+        string UncachedFormulaValue(string formula)
+        {
+            UncachedFormulaCount++;
+            if (UncachedFormulaMarker != null) return UncachedFormulaMarker;
+            if (BlankUncachedFormula) return "";
+            return "=" + formula;
+        }
 
         public static XlsxBook Open(string path)
         {
@@ -312,10 +328,7 @@ namespace OfficeAgent.Host
                             if (r.NodeType == XmlNodeType.EndElement && r.LocalName == "c")
                             {
                                 if (curCol >= 0 && curCol < maxCols)
-                                {
-                                    if (BlankUncachedFormula) { UncachedFormulaCount++; cells[curCol] = ""; }
-                                    else cells[curCol] = "=" + pendingFormula;
-                                }
+                                    cells[curCol] = UncachedFormulaValue(pendingFormula);
                                 haveCell = false;
                             }
                         }
@@ -335,15 +348,9 @@ namespace OfficeAgent.Host
                         {
                             if (curCol >= 0 && curCol < maxCols)
                             {
-                                string sv;
-                                if (val == null && hadFormula)
-                                {
-                                    // 公式无缓存值：导出场景置空（并计数），其余场景标记为公式文本
-                                    if (BlankUncachedFormula) { sv = ""; UncachedFormulaCount++; }
-                                    else sv = "=" + pendingFormula;
-                                }
-                                else sv = ResolveCell(val, cellType, styleIdx);
-                                cells[curCol] = sv;
+                                cells[curCol] = (val == null && hadFormula)
+                                    ? UncachedFormulaValue(pendingFormula)
+                                    : ResolveCell(val, cellType, styleIdx);
                             }
                             haveCell = false;
                         }
@@ -463,6 +470,10 @@ namespace OfficeAgent.Host
 
             List<string[]> rows = new List<string[]>();
             int totalRowsLocal = totalRows;
+            // 与 XlsxPreview 保持一致：无缓存值的公式格用短标记，而不是把上百字符的
+            // 公式原文铺进网格（/perftest 有一条"XlsxPreview 与 LoadGrid 逐单元格一致"
+            // 的断言，两处口径必须同步，否则该断言会红）。
+            UncachedFormulaMarker = "〔公式〕";
             string err = StreamRows(sheetIndex, maxCols, delegate(string[] row)
             {
                 // 必须拷贝：StreamRows 复用同一个 cells 缓冲并在行间 Clear，

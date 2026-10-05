@@ -560,6 +560,17 @@ namespace OfficeAgent.Host
             return failed == 0 ? 0 : 2;
         }
 
+        // 递归收集 AllowDrop=false 的控件（= 拖放死区）。
+        // 跳过不可见/禁用的控件：它们不参与命中测试（WindowFromPoint 会跳过），
+        // 拖放会落到父控件上，故不算死区。
+        static void CollectNoDrop(Control root, List<string> acc)
+        {
+            if (root == null) return;
+            if (root.Visible && root.Enabled && !root.AllowDrop)
+                acc.Add(root.GetType().Name + " text=\"" + (root.Text == null ? "" : root.Text) + "\"");
+            foreach (Control c in root.Controls) CollectNoDrop(c, acc);
+        }
+
         // /droptest —— 拖放链路无头回归（0.8.7，用户实测拖文件无反应后加）。
         // 用真实 ChatPanel（屏外窗体）验证三个根因的修复：
         //   ① 引用条置顶（z-order 在消息列表之前——曾被 Dock=Fill 列表整个盖住=拖放"没反应"）；
@@ -595,6 +606,14 @@ namespace OfficeAgent.Host
             check("输入条容器 AllowDrop（死区）", chat.BottomAllowDrop);
             check("输入框边框 AllowDrop（死区）", chat.InputBorderAllowDrop);
             check("引用条 AllowDrop（死区）", chat.StripAllowDrop);
+            // ★ 不变量：控件树里**不允许**存在 AllowDrop=false 的控件。
+            //   WinForms 的 OLE 拖放不冒泡，任何一个没接 AllowDrop 的子控件都是一块拖放死区；
+            //   这条断言把"漏接"变成编译后立刻可见的失败，防止今后新增控件时又出现无声失败。
+            List<string> noDrop = new List<string>();
+            CollectNoDrop(chat, noDrop);
+            check("控件树无 AllowDrop=false 的控件（死区不变量）", noDrop.Count == 0);
+            for (int i = 0; i < noDrop.Count && i < 5; i++)
+                Console.WriteLine("        ↳ 死区: " + noDrop[i]);
 
             // ②+① 放入文件 → 引用条可见且在列表之前（z-order 靠前 = 不被盖）
             string sample = Path.Combine(Path.GetTempPath(), "oa_droptest.frp");

@@ -1407,64 +1407,108 @@ namespace OfficeAgent.Host
             return false;
         }
 
+        // 模型选择弹层（0.9.0 重做）：按「密钥槽」分组 + 多列 + 槽位可改名。
+        // 分组口径 = host + tag（tag 来自模型名的 #<数字> 后缀，见 LlmClient.ModelTagOf）：
+        // 同一供应商的多个 Key 各成一组，组内模型排在一起；组标题优先用**用户自定义名称**。
         void ShowModelMenu()
         {
-            ContextMenu m = new ContextMenu();
-            string cur = config == null ? "" : (config.Model ?? "");
+            if (config == null) return;
+            string cur = config.Model == null ? "" : config.Model;
             string curHost = "";
-            try { curHost = AppConfig.HostOf(config == null ? "" : config.BaseUrl); } catch { }
-            bool curOfficial = IsOfficialHost(curHost);
+            try { curHost = AppConfig.HostOf(config.BaseUrl); } catch { }
 
-            List<string> ids = new List<string>();     // 原始 id（含 #tag）
-            List<string> disp = new List<string>();    // 显示文本
-            List<bool> keepUrl = new List<bool>();     // true=留在当前服务（中转），false=按预置映射切端点
-            List<bool> atCur = new List<bool>();       // 该条目的目标宿主==当前宿主（决定 ✓ 归属）
+            // ---- 收集候选（去重键 = 模型id + 目标host；同模型同宿主才算真重复）----
+            List<string> ids = new List<string>();
+            List<bool> keepUrl = new List<bool>();
+            List<string> hosts = new List<string>();
 
-            Action<string> addCustom = delegate(string f)
+            Action<string, bool> add = delegate(string f, bool keep)
             {
-                if (f == null || f.Length == 0 || ids.Contains(f)) return;
-                ids.Add(f);
-                disp.Add(LlmClient.ModelDisplay(f) + (curOfficial ? "" : "（中转 " + curHost + "）"));
-                keepUrl.Add(true);
-                atCur.Add(true);
+                string id = (f == null ? "" : f.Trim());
+                if (id.Length == 0) return;
+                string host = curHost;
+                if (!keep)
+                {
+                    string u = LlmClient.BaseUrlForModel(id);
+                    string h = u == null ? "" : AppConfig.HostOf(u);
+                    if (h != null && h.Length > 0) host = h;
+                }
+                for (int i = 0; i < ids.Count; i++)
+                    if (ids[i] == id && hosts[i] == host) return;
+                ids.Add(id); keepUrl.Add(keep); hosts.Add(host);
             };
-            if (fetchedModels != null) { foreach (string f in fetchedModels) addCustom(f); }
-            if (config != null) { foreach (string cm in config.CustomModelList()) addCustom(cm); }
+            if (fetchedModels != null) { foreach (string f in fetchedModels) add(f, true); }
+            foreach (string cm in config.CustomModelList()) add(cm, true);
+            foreach (string p in LlmClient.ModelPresets) add(p, false);
+            if (cur.Length > 0) add(cur, true);
 
-            foreach (string p in LlmClient.ModelPresets)
-            {
-                string target = LlmClient.BaseUrlForModel(p);
-                string ph = target == null ? curHost : AppConfig.HostOf(target);
-                bool sameTarget = ph == curHost;
-                if (ids.Contains(p) && sameTarget) continue;   // 同名同宿主=真重复，挤掉预置
-                string d = LlmClient.ModelDisplay(p);
-                if (!sameTarget) d += (LlmClient.ModelTagOf(p).Length > 0 ? "（官方·号" + LlmClient.ModelTagOf(p) + "）" : "（官方）");
-                ids.Add(p); disp.Add(d); keepUrl.Add(false); atCur.Add(sameTarget);
-            }
-            if (cur.Length > 0 && !ids.Contains(cur))
-            {
-                ids.Insert(0, cur); disp.Insert(0, LlmClient.ModelDisplay(cur)); keepUrl.Insert(0, true); atCur.Insert(0, true);
-            }
+            // ---- 按 (host, tag) 归组 ----
+            List<ModelMenu.Group> groups = new List<ModelMenu.Group>();
             for (int i = 0; i < ids.Count; i++)
             {
-                MenuItem mi = new MenuItem(disp[i]);
-                mi.Checked = ids[i] == cur && atCur[i];
-                string val = ids[i];
-                bool keep = keepUrl[i];
-                mi.Click += delegate { SwitchModel(val, keep); };
-                m.MenuItems.Add(mi);
+                string host = hosts[i];
+                string tag = LlmClient.ModelTagOf(ids[i]);
+                ModelMenu.Group g = null;
+                for (int k = 0; k < groups.Count; k++)
+                    if (groups[k].Host == host && groups[k].Tag == tag) { g = groups[k]; break; }
+                if (g == null)
+                {
+                    g = new ModelMenu.Group();
+                    g.Host = host;
+                    g.Tag = tag;
+                    groups.Add(g);
+                }
+                ModelMenu.Item it = new ModelMenu.Item();
+                it.Id = ids[i];
+                it.Text = LlmClient.ModelDisplay(ids[i], config);
+                it.KeepUrl = keepUrl[i];
+                it.Checked = ids[i] == cur && host == curHost;
+                g.Items.Add(it);
             }
-            m.MenuItems.Add("-");
-            MenuItem refresh = new MenuItem("从服务刷新模型列表…");
-            refresh.Click += delegate { FetchModelsThenReopen(); };
-            MenuItem more = new MenuItem("打开模型设置…");
-            more.Click += delegate { if (OnOpenSettings != null) OnOpenSettings(); };
-            m.MenuItems.Add(refresh);
-            m.MenuItems.Add(more);
-            m.Show(modelLink, new Point(0, modelLink.Height));
+            foreach (ModelMenu.Group g in groups)
+            {
+                string label = g.Host.Length > 0 ? config.GetKeyLabel(g.Host, g.Tag) : "";
+                if (label.Length == 0)
+                    label = g.Tag.Length > 0 ? "号" + g.Tag : (g.Host.Length > 0 ? g.Host : "当前服务");
+                g.Title = label;
+                g.Sub = g.Host;
+                g.CanRename = g.Host.Length > 0;
+            }
+            groups.Sort(delegate(ModelMenu.Group a, ModelMenu.Group b)
+            {
+                int ha = a.Host == curHost ? 0 : 1, hb = b.Host == curHost ? 0 : 1;
+                if (ha != hb) return ha - hb;
+                int hc = string.Compare(a.Host, b.Host, StringComparison.OrdinalIgnoreCase);
+                if (hc != 0) return hc;
+                return TagNum(a.Tag) - TagNum(b.Tag);
+            });
+
+            ModelMenu.Show(this, modelLink, groups,
+                delegate(ModelMenu.Item it) { SwitchModel(it.Id, it.KeepUrl); },
+                delegate(ModelMenu.Group g)
+                {
+                    string old = config.GetKeyLabel(g.Host, g.Tag);
+                    string dft = g.Tag.Length > 0 ? "号" + g.Tag : g.Host;
+                    string nv = ModelMenu.Prompt(this, "给这个密钥起个名字", old,
+                        "例如：公司号 / 备用号 / 张三（留空则恢复默认「" + dft + "」）");
+                    if (nv == null) return;   // 取消
+                    config.SetKeyLabel(g.Host, g.Tag, nv);
+                    config.Save();
+                    ShowModelMenu();          // 立刻重开，让新名字可见
+                },
+                delegate { FetchModelsThenReopen(); },
+                delegate { if (OnOpenSettings != null) OnOpenSettings(); });
+
             // 菜单关闭后焦点常落在 modelLink 上——用户接着打字全部丢失（"第一次输入无法上屏"）。
-            // Show 返回即菜单已收起，把焦点还给输入框（选了"打开模型设置"时在其关闭后同样回到输入框）。
             FocusInput();
+        }
+
+        // 账号槽序号排序用：无 tag 视为 0（主账号排最前），非数字给一个大值
+        static int TagNum(string tag)
+        {
+            if (tag == null || tag.Length == 0) return 0;
+            int n;
+            return int.TryParse(tag, out n) ? n : 9999;
         }
 
         void SwitchModel(string model) { SwitchModel(model, false); }

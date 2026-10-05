@@ -18,6 +18,9 @@ namespace OfficeAgent.Host
         public string Host = "";     // 如 api.deepseek.com、open.bigmodel.cn
         public string Tag = "";      // 账号槽；空 = 主账号
         public byte[] Blob = null;   // DPAPI 密文
+        // 该密钥槽的**用户自定义名称**（0.9.0）：同一供应商配多个 Key 时用户可各自命名
+        //（如"公司号""备用号"），不再显示固定的"号1/号2"。空 = 未命名，界面回退到"号<tag>"。
+        public string Label = "";
     }
 
     public class AppConfig
@@ -177,6 +180,39 @@ namespace OfficeAgent.Host
         // 只查存在性不解密（占位符显示、跨供应商切换提示用）
         public bool HasKeyForHost(string host) { return HasKeyForHost(host, ""); }
 
+        // 密钥槽的用户自定义名称；未命名返回 ""（调用方回退到"号<tag>"或主机名）
+        public string GetKeyLabel(string host, string tag)
+        {
+            if (host == null || host.Length == 0) return "";
+            if (tag == null) tag = "";
+            for (int i = 0; i < ProviderKeys.Count; i++)
+            {
+                if (string.Equals(ProviderKeys[i].Host, host, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(ProviderKeys[i].Tag ?? "", tag, StringComparison.Ordinal))
+                    return ProviderKeys[i].Label == null ? "" : ProviderKeys[i].Label;
+            }
+            return "";
+        }
+
+        // 设置密钥槽名称。槽不存在时**只记内存**（下次 SetKey 建槽时会带上）——
+        // 不为了一个名字凭空建出没有密钥的槽。
+        public void SetKeyLabel(string host, string tag, string label)
+        {
+            if (host == null || host.Length == 0) return;
+            if (tag == null) tag = "";
+            string v = label == null ? "" : label.Trim();
+            if (v.Length > 24) v = v.Substring(0, 24);
+            for (int i = 0; i < ProviderKeys.Count; i++)
+            {
+                if (string.Equals(ProviderKeys[i].Host, host, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(ProviderKeys[i].Tag ?? "", tag, StringComparison.Ordinal))
+                {
+                    ProviderKeys[i].Label = v;
+                    return;
+                }
+            }
+        }
+
         public bool HasKeyForHost(string host, string tag)
         {
             if (host == null || host.Length == 0) return false;
@@ -221,7 +257,18 @@ namespace OfficeAgent.Host
             try
             {
                 Directory.CreateDirectory(Dir());
-                StringBuilder sb = new StringBuilder();
+                File.WriteAllText(FilePath(), ToJson(), new UTF8Encoding(false));
+            }
+            catch { }
+        }
+
+        // 序列化为 JSON 文本。抽成独立方法是为了**可测**：/menutest 直接断言产出里
+        // 含 "keylabel:…"（验证密钥槽名称确实会落盘），而不必真去写用户配置文件。
+        public string ToJson()
+        {
+            StringBuilder sb = new StringBuilder();
+            try
+            {
                 sb.Append("{\n");
                 sb.Append("  \"schema\": 1,\n");
                 sb.Append("  \"baseUrl\": \"").Append(Js(BaseUrl)).Append("\",\n");
@@ -249,20 +296,39 @@ namespace OfficeAgent.Host
                     sb.Append("  \"key:").Append(Js(slot)).Append("\": \"")
                       .Append(Convert.ToBase64String(ProviderKeys[i].Blob)).Append("\",\n");
                 }
+                // 密钥槽自定义名称（扁平字段 keylabel:<host>#<tag>）
+                for (int i = 0; i < ProviderKeys.Count; i++)
+                {
+                    if (ProviderKeys[i].Label == null || ProviderKeys[i].Label.Length == 0) continue;
+                    string slot = ProviderKeys[i].Host + (string.IsNullOrEmpty(ProviderKeys[i].Tag) ? "" : "#" + ProviderKeys[i].Tag);
+                    sb.Append("  \"keylabel:").Append(Js(slot)).Append("\": \"")
+                      .Append(Js(ProviderKeys[i].Label)).Append("\",\n");
+                }
                 sb.Append("  \"perHostKeys\": true\n");
                 sb.Append("}\n");
-                File.WriteAllText(FilePath(), sb.ToString(), new UTF8Encoding(false));
+                return sb.ToString();
             }
-            catch { }
+            catch { return ""; }
         }
 
         public static AppConfig Load()
         {
+            try
+            {
+                if (!File.Exists(FilePath())) return new AppConfig();
+                return LoadFrom(File.ReadAllText(FilePath(), Encoding.UTF8));
+            }
+            catch { return new AppConfig(); }
+        }
+
+        // 从 JSON 文本解析。抽成独立方法是为了**可测**：/menutest 用合成 JSON 验证
+        // 解析逻辑（含密钥槽名称），而不必去读写用户真实的 config.json。
+        public static AppConfig LoadFrom(string json)
+        {
             AppConfig c = new AppConfig();
             try
             {
-                if (!File.Exists(FilePath())) return c;
-                string json = File.ReadAllText(FilePath(), Encoding.UTF8);
+                if (json == null) return c;
                 c.BaseUrl = JsGet(json, "baseUrl");
                 c.Model = JsGet(json, "model");
                 c.AllowLan = JsGet(json, "allowLan") == "true";
@@ -331,6 +397,43 @@ namespace OfficeAgent.Host
                         }
                     }
                     ki = ne + 1;
+                }
+                // 密钥槽自定义名称："keylabel:<host>#<tag>": "<label>"（同样是扁平扫描）。
+                // 必须在密钥解析之后——按 host#tag 回填到已建好的 ProviderKey 上。
+                int li = 0;
+                while ((li = json.IndexOf("\"keylabel:", li, StringComparison.Ordinal)) >= 0)
+                {
+                    int ns2 = li + 10;
+                    int ne2 = json.IndexOf('"', ns2);
+                    if (ne2 < 0) break;
+                    string slot2 = json.Substring(ns2, ne2 - ns2);
+                    string host2 = slot2, tag2 = "";
+                    int h2 = slot2.LastIndexOf('#');
+                    if (h2 > 0 && h2 < slot2.Length - 1)
+                    {
+                        string t2 = slot2.Substring(h2 + 1);
+                        bool dg = t2.Length > 0;
+                        for (int d = 0; d < t2.Length; d++) { if (t2[d] < '0' || t2[d] > '9') { dg = false; break; } }
+                        if (dg) { host2 = slot2.Substring(0, h2); tag2 = t2; }
+                    }
+                    int j2 = ne2 + 1;
+                    while (j2 < json.Length && (json[j2] == ' ' || json[j2] == ':')) j2++;
+                    if (j2 < json.Length && json[j2] == '"')
+                    {
+                        int vs2 = j2 + 1;
+                        int ve2 = json.IndexOf('"', vs2);
+                        if (ve2 > vs2)
+                        {
+                            string lbl = json.Substring(vs2, ve2 - vs2);
+                            for (int p = 0; p < c.ProviderKeys.Count; p++)
+                            {
+                                if (string.Equals(c.ProviderKeys[p].Host, host2, StringComparison.OrdinalIgnoreCase)
+                                    && string.Equals(c.ProviderKeys[p].Tag ?? "", tag2, StringComparison.Ordinal))
+                                { c.ProviderKeys[p].Label = lbl; break; }
+                            }
+                        }
+                    }
+                    li = ne2 + 1;
                 }
                 // 旧版单密钥迁移：把 keyBlob 归到它所属的服务地址下，升级为按家存储。
                 // （只迁移一次；之后 Save 不再写 keyBlob，旧字段随之消失）

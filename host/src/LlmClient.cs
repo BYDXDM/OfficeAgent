@@ -89,6 +89,24 @@ namespace OfficeAgent.Host
             return tag.Length == 0 ? m : ModelWithoutTag(m) + "（号" + tag + "）";
         }
 
+        // 带配置的显示名（0.9.0）：账号槽有**用户自定义名称**时用它，否则回退"号<tag>"。
+        // 例：用户把 deepseek-flash#2 的槽命名为"公司号" → 显示 deepseek-flash（公司号）。
+        public static string ModelDisplay(string model, AppConfig cfg)
+        {
+            string m = (model ?? "").Trim();
+            string tag = ModelTagOf(m);
+            if (tag.Length == 0) return m;
+            string label = "";
+            if (cfg != null)
+            {
+                string host = "";
+                try { host = AppConfig.HostOf(BaseUrlForModel(m)); } catch { }
+                if (host == null || host.Length == 0) { try { host = AppConfig.HostOf(cfg.BaseUrl); } catch { } }
+                if (host != null && host.Length > 0) label = cfg.GetKeyLabel(host, tag);
+            }
+            return ModelWithoutTag(m) + "（" + (label != null && label.Length > 0 ? label : "号" + tag) + "）";
+        }
+
         // 预置模型所属的官方 OpenAI 兼容端点。内联下拉跨供应商切换模型时自动带出地址：
         // 密钥按服务（host）分开保存（见 AppConfig），从根上杜绝"拿 A 家的密钥向 B 家发请求"。
         // 返回 null = 未知/自建网关模型，只切模型名不动地址。

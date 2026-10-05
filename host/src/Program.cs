@@ -42,6 +42,7 @@ namespace OfficeAgent.Host
             bool frpTest = false;
             bool dropTest = false;
             bool safetyTest = false;
+            bool menuTest = false;
             bool formulaTest = false;
             string gridTestInput = null;
             bool skillTest = false;
@@ -71,6 +72,7 @@ namespace OfficeAgent.Host
                 else if (a == "/frptest") frpTest = true;
                 else if (a == "/droptest") dropTest = true;
                 else if (a == "/safetytest") safetyTest = true;
+                else if (a == "/menutest") menuTest = true;
                 else if (a == "/formulatest") formulaTest = true;
                 else if (a == "/gridtest" && i + 1 < args.Length) { gridTestInput = args[i + 1]; i += 1; }
                 else if (a == "/skilltest") skillTest = true;
@@ -115,7 +117,7 @@ namespace OfficeAgent.Host
             // CLI 无头链同样落审计（设计方案 §7.3：每个动作可审计；GUI 的 app_start 在 MainForm）
             if (selftest || guardTest || maskTest || intentTest || suggestTest || skillTest || caretTest
                 || auditTest || detectTest || bridgeTest || planTest || perfTest || toolidTest || urlTest || frpTest || dropTest || formulaTest
-                || safetyTest
+                || safetyTest || menuTest
                 || gridTestInput != null
                 || skillRunArgs != null || agentTestArgs != null || reconArgs != null || mergeArgs != null
                 || invoiceArgs != null || convertInput != null || renderInput != null
@@ -212,6 +214,14 @@ namespace OfficeAgent.Host
                 try { AllocConsole(); } catch { }
                 try { Console.OutputEncoding = Encoding.UTF8; } catch { }
                 return RunUrlTest();
+            }
+
+            if (menuTest)
+            {
+                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
+                try { AllocConsole(); } catch { }
+                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                return RunMenuTest();
             }
 
             if (safetyTest)
@@ -952,6 +962,74 @@ namespace OfficeAgent.Host
             string acc = parts.Length > 0 ? parts[0] : "";
             for (int i = 1; i < parts.Length; i++) acc = Path.Combine(acc, parts[i]);
             return acc;
+        }
+
+        // /menutest —— 模型分组菜单相关逻辑回归（0.9.0）
+        // 覆盖：密钥槽自定义名称读写、ModelDisplay 用自定义名、名称长度上限、清空回退。
+        // 注意：**只测内存对象**，不调用 AppConfig.Save/Load——绝不污染用户真实 config.json。
+        static int RunMenuTest()
+        {
+            int failed = 0;
+            Action<string, bool> check = delegate(string name, bool cond)
+            {
+                Console.WriteLine((cond ? "  ok    " : "  FAIL  ") + name);
+                if (!cond) failed++;
+            };
+
+            // 场景：同一供应商（api.deepseek.com）配了两个 Key（主账号 + 号2）
+            AppConfig cfg = new AppConfig();
+            ProviderKey k1 = new ProviderKey(); k1.Host = "api.deepseek.com"; k1.Tag = ""; k1.Blob = new byte[] { 1 };
+            ProviderKey k2 = new ProviderKey(); k2.Host = "api.deepseek.com"; k2.Tag = "2"; k2.Blob = new byte[] { 2 };
+            cfg.ProviderKeys.Add(k1);
+            cfg.ProviderKeys.Add(k2);
+
+            check("未命名时 GetKeyLabel 返回空串", cfg.GetKeyLabel("api.deepseek.com", "2") == "");
+            cfg.SetKeyLabel("api.deepseek.com", "2", "公司号");
+            check("SetKeyLabel 后可读回", cfg.GetKeyLabel("api.deepseek.com", "2") == "公司号");
+            check("只影响该槽（主账号仍为空）", cfg.GetKeyLabel("api.deepseek.com", "") == "");
+            check("主机名大小写不敏感", cfg.GetKeyLabel("API.DeepSeek.com", "2") == "公司号");
+
+            check("ModelDisplay 用自定义名",
+                LlmClient.ModelDisplay("deepseek-flash#2", cfg) == "deepseek-flash（公司号）");
+            check("未命名的槽回退「号N」",
+                LlmClient.ModelDisplay("deepseek-flash#3", cfg) == "deepseek-flash（号3）");
+            check("无 #tag 的模型名原样显示",
+                LlmClient.ModelDisplay("glm-4.5-air", cfg) == "glm-4.5-air");
+            check("不传配置时与旧行为一致",
+                LlmClient.ModelDisplay("deepseek-flash#2") == "deepseek-flash（号2）");
+
+            cfg.SetKeyLabel("api.deepseek.com", "2", new string('长', 40));
+            check("名称超长截到 24 字", cfg.GetKeyLabel("api.deepseek.com", "2").Length == 24);
+
+            cfg.SetKeyLabel("api.deepseek.com", "2", "  ");
+            check("纯空白视为清空（回退号N）",
+                LlmClient.ModelDisplay("deepseek-flash#2", cfg) == "deepseek-flash（号2）");
+
+            // 槽不存在时只记内存、不凭空建槽
+            int before = cfg.ProviderKeys.Count;
+            cfg.SetKeyLabel("api.unknown.com", "", "幽灵");
+            check("给不存在的槽设名不会新建槽", cfg.ProviderKeys.Count == before);
+
+            // ---- 序列化 → 解析 往返（纯内存，绝不写用户真实 config.json）----
+            AppConfig w = new AppConfig();
+            ProviderKey a1 = new ProviderKey(); a1.Host = "api.deepseek.com"; a1.Tag = ""; a1.Blob = new byte[] { 1 };
+            ProviderKey a2 = new ProviderKey(); a2.Host = "api.deepseek.com"; a2.Tag = "2"; a2.Blob = new byte[] { 2 }; a2.Label = "公司号";
+            w.ProviderKeys.Add(a1);
+            w.ProviderKeys.Add(a2);
+            string js = w.ToJson();
+            check("序列化产出含 keylabel:host#tag 字段",
+                js.IndexOf("\"keylabel:api.deepseek.com#2\"") >= 0);
+            check("未命名的槽不写 keylabel 字段",
+                js.IndexOf("\"keylabel:api.deepseek.com\"") < 0);
+            AppConfig re = AppConfig.LoadFrom(js);
+            check("往返后密钥槽数一致", re.ProviderKeys.Count == 2);
+            check("往返后槽名称保留", re.GetKeyLabel("api.deepseek.com", "2") == "公司号");
+            check("往返后显示名用上自定义名",
+                LlmClient.ModelDisplay("deepseek-flash#2", re) == "deepseek-flash（公司号）");
+            check("往返后主账号槽仍无名称", re.GetKeyLabel("api.deepseek.com", "") == "");
+
+            Console.WriteLine(failed == 0 ? "menutest ALL PASS" : ("menutest FAILED=" + failed));
+            return failed == 0 ? 0 : 2;
         }
 
         // 安全兜底自测：判定层分支 + 确认桥交互 + delete_file 工具。

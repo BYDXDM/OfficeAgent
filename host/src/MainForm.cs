@@ -14,7 +14,7 @@ namespace OfficeAgent.Host
 {
     public partial class MainForm : Form
     {
-        const string Version = "0.8.6";
+        const string Version = "0.8.7";
 
         class NavEntry
         {
@@ -612,6 +612,8 @@ namespace OfficeAgent.Host
             chat.OnOpenSettings += delegate { ShowSetup(false); };
             chat.OnSessionSaved += delegate { RefreshSessions(); };
             chat.OnOpenPreview += delegate(string path) { ShowPreview(path); SelectPage(5); };
+            // 拖放统一入口：窗体、消息列表、输入框三处的文件拖放都汇到这里（0.8.7）
+            chat.FilesDropped += delegate(string[] files) { HandleFilesDropped(files); };
             // 同名产物避让通知（**非阻塞**）：agent 的后台线程发现目标已存在时不会覆盖，
             // 而是自动改名并回调到这里；这里只把它转成一条聊天区提示。
             // 注意：回调发生在后台线程，所有 UI 操作必须经 Invoke 封送；
@@ -951,10 +953,17 @@ namespace OfficeAgent.Host
         {
             string[] files = (string[])e.Data.GetData(DataFormats.FileDrop);
             if (files == null || files.Length == 0) return;
+            HandleFilesDropped(files);
+        }
+
+        // 拖放统一处理（窗体/消息列表/输入框三处汇入）：
+        // 0.8.4 用户规则：拖文件进对话框**留在当前页**（此前跳去表格核对页+预览，WorkBuddy 式
+        // 交互=引用条出现在输入框上方，聊天继续在这里进行）
+        void HandleFilesDropped(string[] files)
+        {
+            if (files == null || files.Length == 0) return;
             chat.SetContextFiles(files);
             AddTasks(files);
-            // 0.8.4 用户规则：拖文件进对话框**留在当前页**（此前跳去表格核对页+预览，WorkBuddy 式
-            // 交互=引用条出现在输入框上方，聊天继续在这里进行）
             chat.FocusInput();
         }
 

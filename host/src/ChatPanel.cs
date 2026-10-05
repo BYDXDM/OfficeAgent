@@ -59,6 +59,8 @@ namespace OfficeAgent.Host
         LlmClient client;
         bool busy = false;
         List<string> contextFiles = new List<string>();
+        // 拖放统一出口：列表/输入框/窗体三处的文件拖放都经它通知宿主
+        public event Action<string[]> FilesDropped;
         // WorkBuddy 式引用条（0.8.4 用户要求）：输入框上方横排"格式徽标+文件名"小片，
         // 点 × 可移除。fileChipRects 与 contextFiles 平行，存每片的矩形供点击命中。
         Panel fileStrip;
@@ -203,6 +205,7 @@ namespace OfficeAgent.Host
             input.Size = new Size(676, 50);
             input.ScrollBars = ScrollBars.Vertical;
             input.KeyDown += Input_KeyDown;
+            input.FileDropHandler = HandleFilesDropped;
             input.TextChanged += delegate { UpdatePlaceholder(); HandleAtCaret(); };
             // Win7 默认 1px 光标几乎不可见 → 获得焦点时重建为 3px、与文本行等高。
             // 时序关键：WinForms 先触发 GotFocus、控件默认 WM_SETFOCUS 处理在后——
@@ -277,6 +280,22 @@ namespace OfficeAgent.Host
             Controls.Add(fileStrip);   // 悬在 bottom 上沿、输入框上方
             Controls.Add(bottom);
             bottom.SendToBack();
+            // ★ 引用条必须置顶：它压在 Dock=Fill 的消息列表区域里，不置顶会被列表整个盖住
+            //   （0.8.4 拖放"没反应"的根因——拖放发生了，反馈条却在列表后面看不见）
+            fileStrip.BringToFront();
+
+            // 消息列表与输入框也接受文件拖放（否则拖到这两处会被原生控件吞掉，
+            // 只有拖到窗体空白处才会落进主窗体的 DragDrop）
+            list.AllowDrop = true;
+            list.DragEnter += delegate(object s, DragEventArgs e)
+            {
+                if (e.Data.GetDataPresent(DataFormats.FileDrop)) e.Effect = DragDropEffects.Copy;
+            };
+            list.DragDrop += delegate(object s, DragEventArgs e)
+            {
+                string[] files = (string[])e.Data.GetData(DataFormats.FileDrop);
+                if (files != null && files.Length > 0 && FilesDropped != null) FilesDropped(files);
+            };
 
             // @ 弹层在输入框失焦时收起（点击弹层内的列表时靠坐标判定不收）
             input.LostFocus += delegate { TryCloseAtPopupOnBlur(); };
@@ -527,6 +546,12 @@ namespace OfficeAgent.Host
         }
 
         public void FocusInput() { input.Focus(); }
+
+        // 拖放中转：输入框/消息列表的文件拖放统一转给宿主（MainForm 统一处理）
+        void HandleFilesDropped(string[] files)
+        {
+            if (files != null && files.Length > 0 && FilesDropped != null) FilesDropped(files);
+        }
 
         // 整段对话导出为纯文本（右键"复制全部对话"用；跳过空气泡与附件卡）
         string BuildTranscript()
@@ -2288,15 +2313,43 @@ namespace OfficeAgent.Host
         // 输入框持有焦点时把滚轮转发给消息列表（Win7 滚轮只作用于焦点控件，不转发就永远滚不动历史）。
         // 0.8.4 新增 IME 组合跟踪：拼音组合进行中**不得重建光标**（CreateCaret 会打散组合窗口——
         // 用户实测"第一次输入无法上屏/空格不上屏"）；KeyDown 也要放行 Enter（那是组合的提交键）。
+        // 0.8.7 新增文件拖放：TextBox 原生 OLE 只收文本会吞掉文件拖放（占位符写着"拖入文件"却没反应），
+        // 置 AllowDrop 并自管 FileDrop，其余格式交回基类。
         class ForwardWheelBox : TextBox
         {
             public Control Target;
             public bool ImeComposing;
             public event Action ImeCompositionEnded;
+            public Action<string[]> FileDropHandler;
 
             const int WM_IME_STARTCOMPOSITION = 0x010D;
             const int WM_IME_ENDCOMPOSITION = 0x010E;
             const int WM_IME_COMPOSITION = 0x010F;
+
+            public ForwardWheelBox()
+            {
+                AllowDrop = true;
+            }
+
+            protected override void OnDragEnter(DragEventArgs drgevent)
+            {
+                if (FileDropHandler != null && drgevent.Data.GetDataPresent(DataFormats.FileDrop))
+                {
+                    drgevent.Effect = DragDropEffects.Copy;
+                    return;
+                }
+                base.OnDragEnter(drgevent);
+            }
+
+            protected override void OnDragDrop(DragEventArgs drgevent)
+            {
+                if (FileDropHandler != null && drgevent.Data.GetDataPresent(DataFormats.FileDrop))
+                {
+                    string[] files = (string[])drgevent.Data.GetData(DataFormats.FileDrop);
+                    if (files != null && files.Length > 0) { FileDropHandler(files); return; }
+                }
+                base.OnDragDrop(drgevent);
+            }
 
             protected override void WndProc(ref Message m)
             {

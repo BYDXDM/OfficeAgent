@@ -2219,7 +2219,8 @@ namespace OfficeAgent.Host
         }
 
         // 把超长文本按测量高度切成 ≤ maxChunkH 的段（优先在换行/标点处断开）
-        static List<string> SplitText(string text, int avail, int maxChunkH)
+        // internal 而非 private：/droptest 要断言"绝不切在行内"（回归护栏）
+        internal static List<string> SplitText(string text, int avail, int maxChunkH)
         {
             List<string> parts = new List<string>();
             if (text == null || text.Length == 0) { parts.Add(""); return parts; }
@@ -2238,23 +2239,46 @@ namespace OfficeAgent.Host
                 int rh = TextRenderer.MeasureText(rest, TextFont, new Size(avail, 100000), TextFormatFlags.WordBreak).Height;
                 if (rh <= maxChunkH || rest.Length < 40) { parts.Add(rest); break; }
                 int cut = Math.Min(target, rest.Length - 1);
+                // ★ 断点优先级：**换行** > 标点/空格 > 硬切。
+                //   原实现只在 [cut/2, cut] 这个上半段里找分隔符，最近的换行若落在这之前就
+                //   退化成**按字符硬切** → 会把一行/一个名字劈成两半
+                //   （用户实测：「10. 李洋」被切成「…10. 李」+「洋」两个气泡，看起来像错位）。
+                //   现在换行可回溯更远（最多 600 字符），基本保证不会切在行内。
                 int brk = -1;
-                int floor = cut / 2;
-                for (int i = cut; i > floor; i--)
+                int nlFloor = Math.Max(0, cut - 600);
+                for (int i = cut; i > nlFloor; i--)
                 {
-                    char c = rest[i];
-                    if (c == '\n' || c == ' ' || c == '。' || c == '，' || c == '；' || c == '、' || c == '.' || c == ',')
+                    if (rest[i] == '\n') { brk = i + 1; break; }
+                }
+                if (brk <= 0)
+                {
+                    // 次选：标点/空格（仍从 cut 往前就近找，不跨过上面已排除的范围）
+                    int floor = Math.Max(nlFloor, cut / 2);
+                    for (int i = cut; i > floor; i--)
                     {
-                        brk = i + 1;
-                        break;
+                        char c = rest[i];
+                        if (c == ' ' || c == '。' || c == '，' || c == '；' || c == '、' || c == '.' || c == ',')
+                        {
+                            brk = i + 1;
+                            break;
+                        }
                     }
                 }
                 if (brk <= 0) brk = cut;
                 string part = rest.Substring(0, brk);
                 int ph = TextRenderer.MeasureText(part, TextFont, new Size(avail, 100000), TextFormatFlags.WordBreak).Height;
-                while (ph > maxChunkH && brk > 40)
+                // ★ 若在换行处断开后**仍然超高**（行高估计偏小、或某行特别长），
+                //   必须"往前收一段再**重新找换行**"，绝不能直接 `brk = brk*3/4` ——
+                //   那会把断点拖进行内（用户实测：缩高后「13. 员工姓名13号」被切成「13. 」+「员工姓名13号」）。
+                int shrinkGuard = 0;
+                while (ph > maxChunkH && brk > 40 && shrinkGuard++ < 12)
                 {
-                    brk = brk * 3 / 4;
+                    int nc = Math.Max(40, brk * 3 / 4);
+                    int nb = -1;
+                    for (int i = nc; i > 0; i--) { if (rest[i] == '\n') { nb = i + 1; break; } }
+                    if (nb <= 0) nb = nc;          // 全文无换行才退化为硬切
+                    if (nb >= brk) break;          // 收不动了，避免死循环
+                    brk = nb;
                     part = rest.Substring(0, brk);
                     ph = TextRenderer.MeasureText(part, TextFont, new Size(avail, 100000), TextFormatFlags.WordBreak).Height;
                 }

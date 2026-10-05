@@ -637,6 +637,43 @@ namespace OfficeAgent.Host
             chat.SetContextFiles(new string[0]);
             check("清空后引用条隐藏", !chat.StripVisible);
 
+            // ★ 长回复分块：**切点必须落在行边界**（不切在行内）。
+            //   用户实测：「10. 李洋」被切成「…10. 李」+「洋」两个气泡，接起来像错位。
+            //   根因=断点只在 [cut/2, cut] 里找换行/标点，找不到就按字符硬切。
+            //   构造多行编号列表，逐段回放原文，断言非末段的切点处原文正好是换行。
+            StringBuilder lb = new StringBuilder();
+            for (int i = 1; i <= 500; i++) lb.Append(i).Append(". 员工姓名").Append(i).Append("号\n");
+            string longText = lb.ToString();
+            List<string> chunks = OfficeAgent.Host.ChatPanel.SplitText(longText, 600, 300);
+            bool lineEnd = chunks.Count > 1;
+            int off = 0;
+            int failAt = -1; string failCtx = "";
+            for (int i = 0; i < chunks.Count && lineEnd; i++)
+            {
+                while (off < longText.Length && (longText[off] == '\n' || longText[off] == '\r')) off++;
+                string c = chunks[i];
+                if (off + c.Length > longText.Length || longText.Substring(off, c.Length) != c)
+                { lineEnd = false; failAt = i; failCtx = "内容不匹配 off=" + off; break; }
+                off += c.Length;
+                if (i < chunks.Count - 1 && (off >= longText.Length || longText[off] != '\n'))
+                {
+                    lineEnd = false; failAt = i;
+                    int s = Math.Max(0, off - 25), e = Math.Min(longText.Length, off + 25);
+                    failCtx = "段" + i + " len=" + c.Length + " off=" + off +
+                        " ch@off=" + (off < longText.Length ? ((int)longText[off]).ToString() : "EOF") +
+                        " 原文=" + longText.Length +
+                        " ctx=…" + longText.Substring(s, e - s).Replace("\n", "\\n") + "…";
+                    break;
+                }
+            }
+            check("长回复分块：切点落在换行边界（不切在行内）", lineEnd);
+            check("长回复分块：确实切成了多段", chunks.Count > 1);
+            if (!lineEnd)
+            {
+                Console.WriteLine("        ↳ 段数=" + chunks.Count + " 首个失败段=" + failAt);
+                Console.WriteLine("        ↳ " + failCtx);
+            }
+
             host.Close();
             host.Dispose();
             try { File.Delete(sample); } catch { }

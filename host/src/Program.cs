@@ -989,6 +989,20 @@ namespace OfficeAgent.Host
             check("只影响该槽（主账号仍为空）", cfg.GetKeyLabel("api.deepseek.com", "") == "");
             check("主机名大小写不敏感", cfg.GetKeyLabel("API.DeepSeek.com", "2") == "公司号");
 
+            // 组名唯一性（新增密钥时必须填唯一组名）
+            check("组名唯一性：被别的槽占用 → 不可用",
+                !cfg.IsKeyLabelFree("api.deepseek.com", "3", "公司号"));
+            check("组名唯一性：自己已用同名 → 可用",
+                cfg.IsKeyLabelFree("api.deepseek.com", "2", "公司号"));
+            check("组名唯一性：未被占用 → 可用",
+                cfg.IsKeyLabelFree("api.deepseek.com", "3", "备用号"));
+            check("组名唯一性：空名 → 不可用",
+                !cfg.IsKeyLabelFree("api.deepseek.com", "3", ""));
+            cfg.SetKeyLabel("api.deepseek.com", "2", "ABC");
+            check("组名唯一性：大小写不同视为同名",
+                !cfg.IsKeyLabelFree("api.deepseek.com", "3", "abc"));
+            cfg.SetKeyLabel("api.deepseek.com", "2", "公司号");
+
             check("ModelDisplay 用自定义名",
                 LlmClient.ModelDisplay("deepseek-flash#2", cfg) == "deepseek-flash（公司号）");
             check("未命名的槽回退「号N」",

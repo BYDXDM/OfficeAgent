@@ -13,6 +13,7 @@ namespace OfficeAgent.Host
     public class SetupDialog : Form
     {
         TextBox txtUrl, txtKey, txtWorkspace;
+        TextBox txtGroup;   // 密钥组名（0.9.0）：模型列表按组名分组，故新增密钥时必须填且唯一
         ComboBox cmbModel;
         ComboBox cmbWsDrive;   // 工作区所在磁盘（与目录框同一行）
         // 密钥框占位符：已存密钥时显示，表示"不修改"。用户一旦输入真实内容即视为要替换。
@@ -64,10 +65,10 @@ namespace OfficeAgent.Host
             txtUrl.Text = cfg.BaseUrl == null ? "" : cfg.BaseUrl;
             Controls.Add(txtUrl);
 
-            AddLabel("API 密钥（每家服务分开保存，换服务商不用重填；只存本机，DPAPI 加密）", 176);
+            AddLabel("API 密钥 与 组名（组名用于在模型列表里分组显示，需唯一；密钥只存本机，DPAPI 加密）", 176);
             txtKey = new TextBox();
             txtKey.Location = new Point(28, 198);
-            txtKey.Size = new Size(504, 26);
+            txtKey.Size = new Size(336, 26);
             txtKey.PasswordChar = '●';
             // 已存密钥时预填占位符：让用户看到"已经存过"，不填即为不修改。
             // 此前该框恒为空 → 用户每次都要重填，且以为是没保存（旧行为还会让空值覆盖已存密钥）。
@@ -89,6 +90,18 @@ namespace OfficeAgent.Host
                 if (txtKey.ForeColor != Color.Black) txtKey.ForeColor = Color.Black;
             };
             Controls.Add(txtKey);
+
+            // 组名（0.9.0）：同一供应商可配多个 Key，各 Key 需要一个**唯一组名**，
+            // 模型选择弹层会按组名分组展示（如"公司号""备用号"）。初值取当前槽已有的名字。
+            txtGroup = new TextBox();
+            txtGroup.Location = new Point(372, 198);
+            txtGroup.Size = new Size(160, 26);
+            try
+            {
+                txtGroup.Text = cfg.GetKeyLabel(AppConfig.HostOf(cfg.BaseUrl), LlmClient.ModelTagOf(cfg.Model));
+            }
+            catch { }
+            Controls.Add(txtGroup);
             // 服务地址改动 → 密钥框切换到对应服务的存储状态（修"一家 key 到处用"）
             txtUrl.TextChanged += delegate { RefreshKeyState(); };
 
@@ -226,6 +239,17 @@ namespace OfficeAgent.Host
                 txtKey.Text = "";
                 txtKey.ForeColor = Color.Black;
             }
+            // 地址/模型变了 → 组名框也切到该槽已有的名字（不覆盖用户正在输入的内容）
+            try
+            {
+                if (txtGroup != null)
+                {
+                    string cur = txtGroup.Text == null ? "" : txtGroup.Text.Trim();
+                    string saved = config.GetKeyLabel(AppConfig.HostOf(txtUrl.Text), LlmClient.ModelTagOf(cmbModel == null ? "" : cmbModel.Text));
+                    if (cur.Length == 0 || cur == saved) txtGroup.Text = saved;
+                }
+            }
+            catch { }
         }
 
         LlmClient MakeClient()
@@ -371,7 +395,27 @@ namespace OfficeAgent.Host
             config.AddCustomModel(config.Model);   // 记住该模型，内联下拉重启后仍可见
             config.WizardDone = true;
             // 只有真正输入了新密钥才覆盖；账号槽取自所选模型（deepseek-flash#2 → host#2）
-            if (key != null) config.SetKeyFor(AppConfig.HostOf(url), key, LlmClient.ModelTagOf(config.Model));
+            if (key != null)
+            {
+                string khost = AppConfig.HostOf(url);
+                string ktag = LlmClient.ModelTagOf(config.Model);
+                string gname = txtGroup == null || txtGroup.Text == null ? "" : txtGroup.Text.Trim();
+                // 0.9.0：新增密钥必须填**唯一组名**——模型列表按组名分组，重名就没法区分
+                if (gname.Length == 0)
+                {
+                    lblResult.ForeColor = Color.FromArgb(178, 58, 58);
+                    lblResult.Text = "请为该密钥填写「组名」（模型列表会按组名分组显示，如：公司号）";
+                    return;
+                }
+                if (!config.IsKeyLabelFree(khost, ktag, gname))
+                {
+                    lblResult.ForeColor = Color.FromArgb(178, 58, 58);
+                    lblResult.Text = "组名「" + gname + "」已被另一个密钥占用，请换一个（组名需唯一）";
+                    return;
+                }
+                config.SetKeyFor(khost, key, ktag);
+                config.SetKeyLabel(khost, ktag, gname);
+            }
             config.Save();
             saved = true;
             Close();

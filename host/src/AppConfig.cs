@@ -213,6 +213,25 @@ namespace OfficeAgent.Host
             }
         }
 
+        // 组名唯一性校验（0.9.0）：新增密钥时必须起一个唯一组名，否则模型列表的分组标题
+        // 会重名、无法区分。同一槽自己已用该名视为可用；被别的槽占用则不可用。
+        public bool IsKeyLabelFree(string host, string tag, string label)
+        {
+            if (label == null || label.Trim().Length == 0) return false;
+            string want = label.Trim();
+            if (tag == null) tag = "";
+            for (int i = 0; i < ProviderKeys.Count; i++)
+            {
+                string l = ProviderKeys[i].Label;
+                if (l == null || l.Length == 0) continue;
+                if (!string.Equals(l, want, StringComparison.OrdinalIgnoreCase)) continue;
+                bool sameSlot = string.Equals(ProviderKeys[i].Host, host, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(ProviderKeys[i].Tag ?? "", tag, StringComparison.Ordinal);
+                if (!sameSlot) return false;
+            }
+            return true;
+        }
+
         public bool HasKeyForHost(string host, string tag)
         {
             if (host == null || host.Length == 0) return false;

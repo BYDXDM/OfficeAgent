@@ -1,15 +1,15 @@
 // ModelMenu —— 模型选择弹层（0.9.0）
 //
-// 为什么要自建弹层而不是用 ContextMenu：ContextMenu 只能一列平铺，
-// 既做不了"按密钥槽分组"，也做不了多列。用户诉求（2026-10-05）：
-//   ① 按 API Key 分组显示模型，同组内的模型排在一起；
-//   ② 同一供应商配多个 Key 时，用户能**自己给每个 Key 起名**（不再固定显示"号1/号2"）；
-//   ③ 支持多列显示。
+// 为什么自建而不是用 ContextMenu：ContextMenu 做不了"按密钥分组 + 组标题层级"。
 //
-// 结构：每个 Group = 一个密钥槽（host + tag）。组标题 = 自定义名 / "号<tag>" / 主机名。
-// 组内模型按固定列数网格排布；组与组纵向堆叠。
+// 版式按用户给的"理想效果"图（2026-10-05）：
+//   * 深色底、浅色字；
+//   * **组标题**=该 API Key 的组名，小号、弱化颜色、左对齐；
+//   * 组内模型**单列纵向**排列，字号更大、颜色更亮；
+//   * 组与组之间一条细分隔线；
+//   * 条目可带一行弱化的说明文字（右对齐截断）。
 //
-// 红线：C# 3.0 语法；本文件只在 UI 线程使用。
+// 红线：C# 3.0 语法；只在 UI 线程使用。
 using System;
 using System.Collections.Generic;
 using System.Drawing;
@@ -23,6 +23,7 @@ namespace OfficeAgent.Host
         {
             public string Id = "";       // 原始模型 id（含 #tag）
             public string Text = "";     // 显示文本
+            public string Desc = "";     // 可选说明（弱化显示在右侧；空则不占位）
             public bool KeepUrl = true;  // true=留在当前服务（中转/自定义）；false=按预置映射切端点
             public bool Checked = false; // 当前选中项
         }
@@ -31,18 +32,29 @@ namespace OfficeAgent.Host
         {
             public string Host = "";
             public string Tag = "";      // "" = 主账号
-            public string Title = "";    // 组标题（已含自定义名或"号N"）
-            public string Sub = "";      // 副标题（主机名）
+            public string Title = "";    // 组标题 = 该 Key 的组名（用户自定义 / "号N" / 主机名）
+            public string Sub = "";      // 副标题（主机名）；与 Title 相同则不显示
             public bool CanRename = false;
             public List<Item> Items = new List<Item>();
         }
 
-        const int ColW = 208;      // 单元格宽
-        const int RowH = 26;       // 单元格高
-        const int HeadH = 34;      // 组标题高
-        const int GapH = 8;        // 组间距
-        const int PadX = 12;
-        const int Cols = 3;        // 固定 3 列（用户要求"多列显示"）
+        // 浅色配色（与应用整体一致；版式层级照"理想效果"图）
+        static readonly Color Bg = Color.White;
+        static readonly Color BgHover = Color.FromArgb(242, 245, 252);
+        static readonly Color Border = Color.FromArgb(214, 218, 228);
+        static readonly Color HeadFg = Color.FromArgb(146, 150, 168);   // 组标题：弱化
+        static readonly Color ItemFg = Color.FromArgb(38, 41, 51);      // 模型名：正文色
+        static readonly Color ItemOn = Color.FromArgb(62, 99, 221);     // 选中
+        static readonly Color DescFg = Color.FromArgb(168, 172, 188);   // 说明：更弱
+        static readonly Color Line = Color.FromArgb(234, 236, 242);
+        static readonly Color LinkFg = Color.FromArgb(62, 99, 221);
+        static readonly Color FootBg = Color.FromArgb(250, 250, 252);
+
+        const int PadX = 14;
+        const int Width_ = 336;    // 弹层宽（与图接近）
+        const int HeadH = 24;      // 组标题高
+        const int ItemH = 32;      // 模型条目高
+        const int SepH = 13;       // 分隔区高
 
         public static void Show(IWin32Window owner, Control anchor, List<Group> groups,
             Action<Item> onPick, Action<Group> onRename, Action onRefresh, Action onSettings)
@@ -54,39 +66,52 @@ namespace OfficeAgent.Host
             pop.ShowInTaskbar = false;
             pop.StartPosition = FormStartPosition.Manual;
             pop.TopMost = true;
-            pop.BackColor = Color.White;
+            pop.BackColor = Bg;
             pop.KeyPreview = true;
             try { pop.Font = new Font("Microsoft YaHei UI", 9F); } catch { }
-
-            int width = PadX * 2 + ColW * Cols;
-
-            // 纵向布局：每组 = 标题 + ceil(n/Cols) 行
-            int y = 8;
-            Panel body = new Panel();
-            body.AutoScroll = true;
-            body.BackColor = Color.White;
-
-            foreach (Group g in groups)
+            // 细边框：无边框窗体在浅色背景上容易"糊"掉
+            pop.Padding = new Padding(1);
+            pop.Paint += delegate(object s, PaintEventArgs e)
             {
-                // ---- 组标题 ----
+                try
+                {
+                    using (Pen p = new Pen(Border))
+                        e.Graphics.DrawRectangle(p, 0, 0, pop.ClientSize.Width - 1, pop.ClientSize.Height - 1);
+                }
+                catch { }
+            };
+
+            Panel body = new Panel();
+            body.BackColor = Bg;
+            body.AutoScroll = true;
+
+            int y = 8;
+            for (int gi = 0; gi < groups.Count; gi++)
+            {
+                Group g = groups[gi];
+
+                // ---- 组标题（该 Key 的组名）----
                 Label hd = new Label();
                 hd.AutoSize = false;
                 hd.Location = new Point(PadX, y);
-                hd.Size = new Size(width - PadX * 2 - 60, 20);
+                hd.Size = new Size(Width_ - PadX * 2 - 40, HeadH - 6);
                 hd.Text = g.Title;
-                try { hd.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold); } catch { }
-                hd.ForeColor = Color.FromArgb(40, 44, 56);
+                hd.ForeColor = HeadFg;
+                try { hd.Font = new Font("Microsoft YaHei UI", 7.5F); } catch { }
+                hd.TextAlign = ContentAlignment.MiddleLeft;
                 body.Controls.Add(hd);
 
-                if (g.Sub != null && g.Sub.Length > 0)
+                // 组名旁边弱化显示主机名（组名已等于主机名时不重复）
+                if (g.Sub != null && g.Sub.Length > 0 && g.Sub != g.Title)
                 {
                     Label sb = new Label();
                     sb.AutoSize = false;
-                    sb.Location = new Point(PadX + hd.Width + 6, y + 2);
-                    sb.Size = new Size(200, 16);
+                    sb.Location = new Point(PadX + hd.Width, y);
+                    sb.Size = new Size(Width_ - PadX * 2 - hd.Width, HeadH - 6);
                     sb.Text = g.Sub;
-                    sb.ForeColor = Color.FromArgb(150, 153, 168);
+                    sb.ForeColor = DescFg;
                     try { sb.Font = new Font("Microsoft YaHei UI", 7.5F); } catch { }
+                    sb.TextAlign = ContentAlignment.MiddleRight;
                     body.Controls.Add(sb);
                 }
 
@@ -95,38 +120,51 @@ namespace OfficeAgent.Host
                     LinkLabel rn = new LinkLabel();
                     rn.Text = "改名";
                     rn.AutoSize = true;
-                    rn.Location = new Point(width - PadX - 34, y + 1);
-                    rn.LinkColor = Color.FromArgb(62, 99, 221);
+                    rn.Location = new Point(Width_ - PadX - 30, y + 3);
+                    rn.LinkColor = LinkFg;
                     rn.LinkBehavior = LinkBehavior.HoverUnderline;
-                    Group captured = g;
-                    rn.Click += delegate { try { onRename(captured); } catch { } };
+                    Group capturedG = g;
+                    rn.Click += delegate { try { onRename(capturedG); } catch { } };
                     body.Controls.Add(rn);
                 }
 
-                // 分隔线
-                Panel line = new Panel();
-                line.Location = new Point(PadX, y + 22);
-                line.Size = new Size(width - PadX * 2, 1);
-                line.BackColor = Color.FromArgb(232, 234, 240);
-                body.Controls.Add(line);
-
                 y += HeadH;
 
-                // ---- 组内模型（多列网格） ----
+                // ---- 组内模型（单列）----
                 for (int i = 0; i < g.Items.Count; i++)
                 {
-                    int r = i / Cols, c = i % Cols;
                     Item it = g.Items[i];
-
                     Label cell = new Label();
                     cell.AutoSize = false;
-                    cell.Location = new Point(PadX + c * ColW, y + r * RowH);
-                    cell.Size = new Size(ColW - 6, RowH - 2);
-                    cell.Text = (it.Checked ? "✓ " : "   ") + it.Text;
+                    cell.Location = new Point(PadX, y);
+                    cell.Size = new Size(Width_ - PadX * 2, ItemH - 4);
+                    cell.Text = it.Text;
                     cell.TextAlign = ContentAlignment.MiddleLeft;
                     cell.Cursor = Cursors.Hand;
-                    cell.ForeColor = it.Checked ? Color.FromArgb(62, 99, 221) : Color.FromArgb(38, 41, 51);
-                    cell.BackColor = Color.White;
+                    cell.BackColor = Bg;
+                    cell.ForeColor = it.Checked ? ItemOn : ItemFg;
+                    try { cell.Font = new Font("Microsoft YaHei UI", 9.5F, it.Checked ? FontStyle.Bold : FontStyle.Regular); } catch { }
+
+                    if (it.Desc != null && it.Desc.Length > 0)
+                    {
+                        Label ds = new Label();
+                        ds.AutoSize = false;
+                        ds.Location = new Point(PadX + 120, y);
+                        ds.Size = new Size(Width_ - PadX * 2 - 120, ItemH - 4);
+                        ds.Text = it.Desc;
+                        ds.ForeColor = DescFg;
+                        try { ds.Font = new Font("Microsoft YaHei UI", 8F); } catch { }
+                        ds.TextAlign = ContentAlignment.MiddleRight;
+                        ds.Cursor = Cursors.Hand;
+                        ds.BackColor = Bg;
+                        Item cap2 = it;
+                        Form of2 = pop;
+                        ds.Click += delegate { try { of2.Close(); } catch { } if (onPick != null) onPick(cap2); };
+                        ds.MouseEnter += delegate { try { ds.BackColor = BgHover; } catch { } };
+                        ds.MouseLeave += delegate { try { ds.BackColor = Bg; } catch { } };
+                        body.Controls.Add(ds);
+                    }
+
                     Item captured = it;
                     Form ownerForm = pop;
                     cell.Click += delegate
@@ -134,60 +172,69 @@ namespace OfficeAgent.Host
                         try { ownerForm.Close(); } catch { }
                         if (onPick != null) onPick(captured);
                     };
-                    // 悬停高亮（WinForms 无 :hover，用 Enter/Leave 模拟）
-                    cell.MouseEnter += delegate { try { cell.BackColor = Color.FromArgb(242, 245, 252); } catch { } };
-                    cell.MouseLeave += delegate { try { cell.BackColor = Color.White; } catch { } };
+                    cell.MouseEnter += delegate { try { cell.BackColor = BgHover; } catch { } };
+                    cell.MouseLeave += delegate { try { cell.BackColor = Bg; } catch { } };
                     body.Controls.Add(cell);
+
+                    y += ItemH;
                 }
 
-                int rows = (g.Items.Count + Cols - 1) / Cols;
-                if (rows < 1) rows = 1;
-                y += rows * RowH + GapH;
+                // ---- 组分隔线（最后一组不画）----
+                if (gi < groups.Count - 1)
+                {
+                    Panel line = new Panel();
+                    line.Location = new Point(PadX, y + 6);
+                    line.Size = new Size(Width_ - PadX * 2, 1);
+                    line.BackColor = Line;
+                    body.Controls.Add(line);
+                    y += SepH;
+                }
             }
+            y += 4;
 
             // ---- 底部操作 ----
             Panel foot = new Panel();
-            foot.Height = 34;
-            foot.BackColor = Color.FromArgb(250, 250, 252);
+            foot.Height = 32;
+            foot.BackColor = FootBg;
+
             LinkLabel lkRefresh = new LinkLabel();
             lkRefresh.Text = "从服务刷新模型列表…";
             lkRefresh.AutoSize = true;
-            lkRefresh.Location = new Point(PadX, 9);
-            lkRefresh.LinkColor = Color.FromArgb(62, 99, 221);
+            lkRefresh.Location = new Point(PadX, 8);
+            lkRefresh.LinkColor = LinkFg;
             lkRefresh.Click += delegate { try { pop.Close(); } catch { } if (onRefresh != null) onRefresh(); };
             foot.Controls.Add(lkRefresh);
 
             LinkLabel lkSet = new LinkLabel();
-            lkSet.Text = "打开模型设置…";
+            lkSet.Text = "模型设置…";
             lkSet.AutoSize = true;
-            lkSet.Location = new Point(width - PadX - 104, 9);
-            lkSet.LinkColor = Color.FromArgb(62, 99, 221);
+            lkSet.Location = new Point(Width_ - PadX - 72, 8);
+            lkSet.LinkColor = LinkFg;
             lkSet.Click += delegate { try { pop.Close(); } catch { } if (onSettings != null) onSettings(); };
             foot.Controls.Add(lkSet);
 
-            int bodyH = y + 6;
-            int maxH = Screen.FromControl(anchor).WorkingArea.Height - 80;
+            int bodyH = y;
+            int maxH = Screen.FromControl(anchor).WorkingArea.Height - 90;
             if (bodyH > maxH) bodyH = maxH;
-            body.Size = new Size(width, bodyH);
-            body.Location = new Point(0, 0);
+            body.Size = new Size(Width_ - 2, bodyH);
+            body.Location = new Point(1, 1);
 
-            pop.ClientSize = new Size(width, bodyH + foot.Height);
+            pop.ClientSize = new Size(Width_, bodyH + foot.Height + 2);
             foot.Dock = DockStyle.Bottom;
             pop.Controls.Add(body);
             pop.Controls.Add(foot);
 
-            // 定位：优先在锚点上方（输入框上沿），放不下则下方
+            // 定位：优先在锚点上方（输入框上沿），放不下转下方
             Point sp = anchor.PointToScreen(new Point(0, 0));
-            int px = sp.X;
-            int pyAbove = sp.Y - pop.Height - 2;
-            int py = pyAbove >= 0 ? pyAbove : (sp.Y + anchor.Height + 2);
             Rectangle wa = Screen.FromControl(anchor).WorkingArea;
+            int px = sp.X;
+            int py = sp.Y - pop.Height - 2;
+            if (py < wa.Top) py = sp.Y + anchor.Height + 2;
             if (px + pop.Width > wa.Right) px = wa.Right - pop.Width;
             if (px < wa.Left) px = wa.Left;
             if (py + pop.Height > wa.Bottom) py = Math.Max(wa.Top, wa.Bottom - pop.Height);
             pop.Location = new Point(px, py);
 
-            // 点击别处 / Esc 关闭
             pop.Deactivate += delegate { try { pop.Close(); } catch { } };
             pop.KeyDown += delegate(object s, KeyEventArgs e)
             {
@@ -198,7 +245,7 @@ namespace OfficeAgent.Host
             pop.Activate();
         }
 
-        // 简易输入框：返回新名称；取消返回 null
+        // 简易输入框（深色，与弹层一致）：返回新名称；取消返回 null
         public static string Prompt(IWin32Window owner, string title, string initial, string hint)
         {
             string result = null;
@@ -210,34 +257,40 @@ namespace OfficeAgent.Host
                 f.MaximizeBox = false;
                 f.ShowInTaskbar = false;
                 f.StartPosition = FormStartPosition.CenterParent;
-                f.ClientSize = new Size(400, 150);
+                f.ClientSize = new Size(400, 152);
+                f.BackColor = Bg;
                 try { f.Font = new Font("Microsoft YaHei UI", 9F); } catch { }
 
                 Label lb = new Label();
                 lb.Text = hint == null ? "给它起个名字（留空则恢复默认）：" : hint;
                 lb.Location = new Point(18, 18);
                 lb.AutoSize = true;
-                lb.ForeColor = Color.FromArgb(90, 93, 105);
+                lb.ForeColor = HeadFg;
                 f.Controls.Add(lb);
 
                 TextBox tb = new TextBox();
-                tb.Location = new Point(20, 46);
+                tb.Location = new Point(20, 48);
                 tb.Size = new Size(356, 26);
                 tb.Text = initial == null ? "" : initial;
+                tb.BorderStyle = BorderStyle.FixedSingle;
                 tb.SelectAll();
                 f.Controls.Add(tb);
 
                 Button ok = new Button();
                 ok.Text = "确定";
-                ok.Location = new Point(196, 96);
+                ok.Location = new Point(196, 98);
                 ok.Size = new Size(86, 30);
                 ok.Cursor = Cursors.Hand;
+                ok.FlatStyle = FlatStyle.Flat;
+                ok.BackColor = Color.FromArgb(62, 99, 221);
+                ok.ForeColor = Color.White;
+                ok.FlatAppearance.BorderSize = 0;
                 ok.Click += delegate { result = tb.Text == null ? "" : tb.Text.Trim(); f.Close(); };
                 f.Controls.Add(ok);
 
                 Button cancel = new Button();
                 cancel.Text = "取消";
-                cancel.Location = new Point(290, 96);
+                cancel.Location = new Point(290, 98);
                 cancel.Size = new Size(86, 30);
                 cancel.Cursor = Cursors.Hand;
                 cancel.Click += delegate { result = null; f.Close(); };

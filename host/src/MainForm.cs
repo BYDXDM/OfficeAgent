@@ -14,7 +14,7 @@ namespace OfficeAgent.Host
 {
     public partial class MainForm : Form
     {
-        const string Version = "0.8.3";
+        const string Version = "0.8.4";
 
         class NavEntry
         {
@@ -552,6 +552,8 @@ namespace OfficeAgent.Host
             // 会话/新建任务不在页签导航里（由会话列表承担）→ 清除导航选中
             nav.SelectedIndex = pageToNav[idx] >= 0 ? pageToNav[idx] : -1;
             nav.Invalidate();
+            // 切到会话页把焦点还给输入框（否则第一次打字全丢——焦点停在导航/列表上）
+            if (idx <= 1 && chat != null) chat.FocusInput();
             if (idx == 6 && !envAutoDetected) { envAutoDetected = true; RunDetect(); }   // 低配机：自动检测每次会话只跑一次，可手动强制
         }
 

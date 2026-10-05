@@ -182,13 +182,19 @@ namespace OfficeAgent.Host
             input.ScrollBars = ScrollBars.Vertical;
             input.KeyDown += Input_KeyDown;
             input.TextChanged += delegate { UpdatePlaceholder(); HandleAtCaret(); };
-            // Win7 默认 1px 光标几乎不可见 → 获得焦点时重建为 3px、比行高略高。
+            // Win7 默认 1px 光标几乎不可见 → 获得焦点时重建为 3px、与文本行等高。
             // 时序关键：WinForms 先触发 GotFocus、控件默认 WM_SETFOCUS 处理在后——
             // 直接重建会被控件的默认细光标覆盖（用户实测"光标有点小"），
             // BeginInvoke 把重建排到默认处理之后；位置拍自控件已放好的系统光标，
             // 打字/点击/IME 一律交给控件原生维护（见 CaretHelper.Build 注释）。
+            // 0.8.4：拼音组合进行中禁止重建（会打散组合窗口 → "第一次输入无法上屏/
+            // 空格不上屏"），挂起到 WM_IME_ENDCOMPOSITION 再补。
             input.HandleCreated += delegate { BoldCaret(); };
             input.GotFocus += delegate { BeginInvoke((MethodInvoker)delegate { BoldCaret(); }); };
+            input.ImeCompositionEnded += delegate
+            {
+                if (caretPending) BeginInvoke((MethodInvoker)delegate { if (caretPending) BoldCaret(); });
+            };
 
             placeholder = new Label();
             placeholder.Text = "今天帮你做些什么？可直接发文件路径让我读取，或拖入文件预览/转换";
@@ -333,12 +339,16 @@ namespace OfficeAgent.Host
         }
 
         // 尺寸变化后重算高度缓存（OwnerDrawVariable 的高度查询依赖此缓存，本身代价低）
+        // 0.8.4：Clear 会把 TopIndex 归零——流式期间每 100ms"跳回顶部再拉回底部"就是闪烁；
+        // 重挂前记住滚动位置，EndUpdate 前恢复，全程只出一帧。
         void ReMeasure()
         {
             if (list == null || msgs.Count == 0) return;
+            int top = list.TopIndex;
             list.BeginUpdate();
             list.Items.Clear();
             foreach (ChatMsg m in msgs) list.Items.Add(m);
+            if (top > 0 && top < list.Items.Count) list.TopIndex = top;
             list.EndUpdate();
             list.Invalidate();
         }
@@ -535,7 +545,8 @@ namespace OfficeAgent.Host
                 if (e.KeyCode == Keys.Enter) { InsertAtSelection(); e.SuppressKeyPress = true; e.Handled = true; return; }
                 if (e.KeyCode == Keys.Escape) { CloseAtPopup(); e.SuppressKeyPress = true; e.Handled = true; return; }
             }
-            if (e.KeyCode == Keys.Enter && !e.Shift)
+            // 组合拼音时按 Enter 是"提交字母"，不是发送——拦截会把提交吃掉还误发半截话
+            if (e.KeyCode == Keys.Enter && !e.Shift && !input.ImeComposing)
             {
                 e.SuppressKeyPress = true;
                 DoSend();
@@ -784,10 +795,16 @@ namespace OfficeAgent.Host
             {
                 msgs[streamingBubble].Text = streamText;
                 msgs[streamingBubble].Pending = false;
-                msgs[streamingBubble].CachedTextH = -1; msgs[streamingBubble].CachedHeight = -1;
+                // 先算好新高度：高度没变就不重挂整表（OwnerDrawVariable 只在增删时重测，
+                // Clear+重加还会复位滚动位置——流式期间逐字增长大多不换行，重挂纯属浪费，
+                // 在无 Aero 的 Win7 上表现为每个节拍全表重绘+滚动跳动=闪烁）。
+                ChatMsg sm = msgs[streamingBubble];
+                int oldH = sm.CachedHeight;
+                sm.CachedTextH = -1; sm.CachedHeight = -1; sm.CachedAvail = -1;
+                MeasureMsg(sm, AvailWidth());
+                if (sm.CachedHeight != oldH) ReMeasure();
                 // 文本增长后必须重挂条目让原生列表重测高度（OwnerDrawVariable 只在增删时测），
                 // 否则条目高度停在空文本的尺寸：总滚动高度偏小（滚不到底）+ 内容溢出（视觉重叠）
-                ReMeasure();
                 dirty = true;   // 交给同一定时器里的滚动/重绘逻辑
             }
         }
@@ -1165,6 +1182,9 @@ namespace OfficeAgent.Host
             m.MenuItems.Add(refresh);
             m.MenuItems.Add(more);
             m.Show(modelLink, new Point(0, modelLink.Height));
+            // 菜单关闭后焦点常落在 modelLink 上——用户接着打字全部丢失（"第一次输入无法上屏"）。
+            // Show 返回即菜单已收起，把焦点还给输入框（选了"打开模型设置"时在其关闭后同样回到输入框）。
+            FocusInput();
         }
 
         void SwitchModel(string model)
@@ -1225,9 +1245,17 @@ namespace OfficeAgent.Host
             t.Start();
         }
 
-        // 光标管理：仅在获得焦点/句柄创建时重建一次（2px 宽、与字号等高），见 CaretHelper.Build。
+        // 光标管理：仅在获得焦点/句柄创建时重建一次（3px、与行等高），见 CaretHelper.Build。
         // 打字/点击/输入法过程的光标位置由编辑控件原生维护，此处不再插手。
-        void BoldCaret() { CaretHelper.Build(input, TextFont); }
+        // 0.8.4：到达时正逢拼音组合 → 先欠着（caretPending），组合结束再补——
+        // 组合中 CreateCaret 会打散 IME 组合窗口（"第一次输入无法上屏/空格不上屏"的根源）。
+        bool caretPending = false;
+        void BoldCaret()
+        {
+            if (input.ImeComposing) { caretPending = true; return; }
+            caretPending = false;
+            CaretHelper.Build(input, TextFont);
+        }
 
         // ===== @ 引用文件：输入 @ 弹出工作区文件列表（上下键选、回车插入）=====
 
@@ -1879,7 +1907,13 @@ namespace OfficeAgent.Host
             return msgs.Count - 1;
         }
 
-        // 测量单条消息（带缓存）；宽高变更后由 ReMeasure 清缓存
+        // 测量单条消息（带缓存）；宽高变更后由 ReMeasure 清缓存。
+        // ★ 0.8.4 口径统一：气泡内文字的测量宽度必须 ≥ 绘制宽度（两者都是 气泡宽-2*内边距）。
+        //   旧口径测量按全宽 avail 折行、绘制按"气泡-LeftAndRightPadding"折行——绘制更窄时
+        //   实际行数比测量多，文字纵向溢出气泡与相邻气泡重叠（有概率复现：取决于折行落点；
+        //   Win7 无 Aero 无 DWM 兜底，溢出直接可见）。绘制宽度只会 ≥ 测量宽度 → 折行只会
+        //   更松不会更密 → 高度只会矮不会高，重叠方向被根除。
+        internal static int TextInsetX = 10;   // 气泡左右内边距（测量/绘制共用同一常量）
         static void MeasureMsg(ChatMsg m, int avail)
         {
             if (m.CachedHeight >= 0 && m.CachedAvail == avail) return;
@@ -1895,11 +1929,14 @@ namespace OfficeAgent.Host
                 m.CachedAvail = avail;
                 return;
             }
+            int textW = avail - 2 * TextInsetX;
+            if (textW < 40) textW = 40;
             Size ts = TextRenderer.MeasureText(m.Text == null ? "" : m.Text, TextFont,
-                new Size(avail, 100000), TextFormatFlags.WordBreak);
+                new Size(textW, 100000), TextFormatFlags.WordBreak);
             m.CachedTextH = ts.Height;
-            // +36：左右内边距与边框余量（修复长英文单词/标点贴边破出气泡）
-            m.CachedTextW = Math.Max(60, Math.Min(avail, ts.Width + 36));
+            // 气泡宽 = 测量实际宽 + 左右内边距 + 余量；贴满 avail 时就取 avail。
+            // 绘制区宽 = 气泡宽-2*TextInsetX ≥ 测量宽 → 折行不会比测量更密
+            m.CachedTextW = Math.Max(60, Math.Min(avail, ts.Width + 2 * TextInsetX + 8));
             string header = (m.User ? "你" : "助手") + "  " + m.Time;
             m.CachedHeaderW = TextRenderer.MeasureText(header, NameFont).Width;
             if (m.First && m.Last) m.CachedHeight = 34 + m.CachedTextH + 16;
@@ -1927,6 +1964,9 @@ namespace OfficeAgent.Host
             using (SolidBrush bg = new SolidBrush(BackColor))
                 g.FillRectangle(bg, e.Bounds);
             g.SmoothingMode = SmoothingMode.AntiAlias;
+            // ★ 最后防线：绘制一律裁剪在条目矩形内——任何测量/绘制的残差都不许越界
+            // 压到相邻气泡（部分重绘只刷单条时，邻居不会被重画来擦除越界内容=重叠残影）。
+            g.SetClip(e.Bounds);
             MeasureMsg(m, AvailWidth());
             int left = LeftMargin();
             int textH = m.CachedTextH;
@@ -1982,8 +2022,10 @@ namespace OfficeAgent.Host
                     using (Pen p = new Pen(Color.FromArgb(150, 175, 225)))
                         g.DrawPath(p, gp);
                 }
-                TextRenderer.DrawText(g, m.Text, TextFont, bubble, Color.FromArgb(20, 40, 90),
-                    TextFormatFlags.WordBreak | TextFormatFlags.VerticalCenter | TextFormatFlags.LeftAndRightPadding);
+                TextRenderer.DrawText(g, m.Text, TextFont,
+                    new Rectangle(bubble.X + TextInsetX, bubble.Y, bubble.Width - 2 * TextInsetX, bubble.Height),
+                    Color.FromArgb(20, 40, 90),
+                    TextFormatFlags.WordBreak | TextFormatFlags.VerticalCenter);
             }
             else
             {
@@ -2000,10 +2042,12 @@ namespace OfficeAgent.Host
                     using (Pen p = new Pen(m.Error ? Color.FromArgb(230, 160, 160) : Color.FromArgb(222, 225, 233)))
                         g.DrawPath(p, gp);
                 }
-                TextRenderer.DrawText(g, m.Text, TextFont, bubble,
+                TextRenderer.DrawText(g, m.Text, TextFont,
+                    new Rectangle(bubble.X + TextInsetX, bubble.Y, bubble.Width - 2 * TextInsetX, bubble.Height),
                     m.Error ? Color.FromArgb(178, 58, 58) : Color.FromArgb(28, 30, 38),
-                    TextFormatFlags.WordBreak | TextFormatFlags.VerticalCenter | TextFormatFlags.LeftAndRightPadding);
+                    TextFormatFlags.WordBreak | TextFormatFlags.VerticalCenter);
             }
+            g.ResetClip();
         }
 
         // 分块圆角：首条上圆下小、尾条上小下圆、中间全小
@@ -2060,12 +2104,31 @@ namespace OfficeAgent.Host
             }
         }
 
-        // 输入框持有焦点时把滚轮转发给消息列表（Win7 滚轮只作用于焦点控件，不转发就永远滚不动历史）
+        // 输入框持有焦点时把滚轮转发给消息列表（Win7 滚轮只作用于焦点控件，不转发就永远滚不动历史）。
+        // 0.8.4 新增 IME 组合跟踪：拼音组合进行中**不得重建光标**（CreateCaret 会打散组合窗口——
+        // 用户实测"第一次输入无法上屏/空格不上屏"）；KeyDown 也要放行 Enter（那是组合的提交键）。
         class ForwardWheelBox : TextBox
         {
             public Control Target;
+            public bool ImeComposing;
+            public event Action ImeCompositionEnded;
+
+            const int WM_IME_STARTCOMPOSITION = 0x010D;
+            const int WM_IME_ENDCOMPOSITION = 0x010E;
+            const int WM_IME_COMPOSITION = 0x010F;
+
             protected override void WndProc(ref Message m)
             {
+                if (m.Msg == WM_IME_STARTCOMPOSITION || m.Msg == WM_IME_COMPOSITION)
+                {
+                    ImeComposing = true;
+                }
+                else if (m.Msg == WM_IME_ENDCOMPOSITION)
+                {
+                    bool was = ImeComposing;
+                    ImeComposing = false;
+                    if (was && ImeCompositionEnded != null) { try { ImeCompositionEnded(); } catch { } }
+                }
                 if (m.Msg == WM_MOUSEWHEEL && Target != null && !Target.IsDisposed && Target.IsHandleCreated)
                 {
                     try { SendMessage(Target.Handle, WM_MOUSEWHEEL, m.WParam, m.LParam); } catch { }

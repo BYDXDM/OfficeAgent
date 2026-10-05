@@ -87,7 +87,8 @@ namespace OfficeAgent.Host
         // 重建后原位恢复，之后**完全交给控件自己管理**（打字/点击/IME/滚动都是控件原生维护）。
         // 不要在按键/文本变化时用 EM_POSFROMCHAR 自算位置再 SetCaretPos：真机上
         // （DPI 感知 + 中文 IME）自算坐标有偏差，光标看起来乱跳；无头测试测不出该差异。
-        // 尺寸 3px 宽、比行高再高一点（上提 3px 居中）：用户反馈 2px 行高太细太小。
+        // 0.8.4：高度回到与文本行等高（此前 font.Height+6 外出行高、看着不正常）；
+        // 宽度保持 3px（Win7 原生 1px 用户反馈几乎不可见）。调用方保证不在 IME 组合中调用。
         public static void Build(TextBox box, Font font)
         {
             try
@@ -95,13 +96,13 @@ namespace OfficeAgent.Host
                 if (box == null || !box.IsHandleCreated) return;
                 NativePoint cur = new NativePoint();
                 bool have = GetCaretPos(ref cur);
-                CreateCaret(box.Handle, IntPtr.Zero, 3, font.Height + 6);
+                CreateCaret(box.Handle, IntPtr.Zero, 3, font.Height);
                 if (have && cur.X >= 0 && cur.Y >= 0)
-                    SetCaretPos(cur.X, Math.Max(0, cur.Y - 3));
+                    SetCaretPos(cur.X, cur.Y);
                 else
                 {
                     int x, y;
-                    if (TryInsertionPoint(box, font, out x, out y)) SetCaretPos(x + 1, Math.Max(0, y - 3));
+                    if (TryInsertionPoint(box, font, out x, out y)) SetCaretPos(x + 1, y);
                 }
                 ShowCaret(box.Handle);
             }

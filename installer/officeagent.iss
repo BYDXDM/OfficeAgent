@@ -6,8 +6,8 @@
 ; File must be saved as UTF-8 with BOM (Inno requirement for non-ASCII).
 
 #define AppName "OfficeAgent"
-#define AppVersion "0.8.3"
-#define AppVersionNum "0.8.3.0"
+#define AppVersion "0.8.4"
+#define AppVersionNum "0.8.4.0"
 #define AppPublisher "OfficeAgent Project"
 
 [Setup]

@@ -1283,21 +1283,63 @@ namespace OfficeAgent.Host
         // 内联模型下拉（用户要求：点右下角直接选模型，不必进设置页）
         // 条目来源：本次会话拉取的列表 + config.CustomModels（落盘的自定义模型，重启后仍在）
         //          + 预置（含 deepseek-flash#2 这类同服务多账号条目，显示为「（号2）」）。
+        // 0.8.4 防混（用户实况：DS 有官号与中转站两路）：每条注明目标服务——
+        // 当前服务不是官方端点时，拉取/自定义条目标「中转·host」，预置条目标「官方」；
+        // 同名模型若两边宿主不同则**两条并存**（原先同名互挤，且点中转条目会被拽到官方端点）。
+        // 点「中转」条目保持当前服务地址与密钥；点「官方」条目才切换端点。
+        static bool IsOfficialHost(string h)
+        {
+            if (h == null || h.Length == 0) return false;
+            string[] off = new string[] { "open.bigmodel.cn", "api.deepseek.com", "dashscope.aliyuncs.com", "api.openai.com" };
+            foreach (string o in off) { if (o == h) return true; }
+            return false;
+        }
+
         void ShowModelMenu()
         {
             ContextMenu m = new ContextMenu();
             string cur = config == null ? "" : (config.Model ?? "");
-            List<string> items = new List<string>();
-            if (fetchedModels != null) { foreach (string f in fetchedModels) if (!items.Contains(f)) items.Add(f); }
-            if (config != null) { foreach (string cm in config.CustomModelList()) if (!items.Contains(cm)) items.Add(cm); }
-            foreach (string p in LlmClient.ModelPresets) if (!items.Contains(p)) items.Add(p);
-            if (cur.Length > 0 && !items.Contains(cur)) items.Insert(0, cur);
-            foreach (string s in items)
+            string curHost = "";
+            try { curHost = AppConfig.HostOf(config == null ? "" : config.BaseUrl); } catch { }
+            bool curOfficial = IsOfficialHost(curHost);
+
+            List<string> ids = new List<string>();     // 原始 id（含 #tag）
+            List<string> disp = new List<string>();    // 显示文本
+            List<bool> keepUrl = new List<bool>();     // true=留在当前服务（中转），false=按预置映射切端点
+            List<bool> atCur = new List<bool>();       // 该条目的目标宿主==当前宿主（决定 ✓ 归属）
+
+            Action<string> addCustom = delegate(string f)
             {
-                MenuItem mi = new MenuItem(LlmClient.ModelDisplay(s));
-                mi.Checked = s == cur;
-                string val = s;
-                mi.Click += delegate { SwitchModel(val); };
+                if (f == null || f.Length == 0 || ids.Contains(f)) return;
+                ids.Add(f);
+                disp.Add(LlmClient.ModelDisplay(f) + (curOfficial ? "" : "（中转 " + curHost + "）"));
+                keepUrl.Add(true);
+                atCur.Add(true);
+            };
+            if (fetchedModels != null) { foreach (string f in fetchedModels) addCustom(f); }
+            if (config != null) { foreach (string cm in config.CustomModelList()) addCustom(cm); }
+
+            foreach (string p in LlmClient.ModelPresets)
+            {
+                string target = LlmClient.BaseUrlForModel(p);
+                string ph = target == null ? curHost : AppConfig.HostOf(target);
+                bool sameTarget = ph == curHost;
+                if (ids.Contains(p) && sameTarget) continue;   // 同名同宿主=真重复，挤掉预置
+                string d = LlmClient.ModelDisplay(p);
+                if (!sameTarget) d += (LlmClient.ModelTagOf(p).Length > 0 ? "（官方·号" + LlmClient.ModelTagOf(p) + "）" : "（官方）");
+                ids.Add(p); disp.Add(d); keepUrl.Add(false); atCur.Add(sameTarget);
+            }
+            if (cur.Length > 0 && !ids.Contains(cur))
+            {
+                ids.Insert(0, cur); disp.Insert(0, LlmClient.ModelDisplay(cur)); keepUrl.Insert(0, true); atCur.Insert(0, true);
+            }
+            for (int i = 0; i < ids.Count; i++)
+            {
+                MenuItem mi = new MenuItem(disp[i]);
+                mi.Checked = ids[i] == cur && atCur[i];
+                string val = ids[i];
+                bool keep = keepUrl[i];
+                mi.Click += delegate { SwitchModel(val, keep); };
                 m.MenuItems.Add(mi);
             }
             m.MenuItems.Add("-");
@@ -1313,7 +1355,12 @@ namespace OfficeAgent.Host
             FocusInput();
         }
 
-        void SwitchModel(string model)
+        void SwitchModel(string model) { SwitchModel(model, false); }
+
+        // preferCurrentUrl=true：该条目来自当前服务（中转站拉取/自定义）——模型换了但
+        // 服务地址与密钥都不动（否则点中转站的 deepseek 会被预置映射拽到官方端点，
+        // 拿中转 key 打官号=401；官号/中转混用就是从这里来的）
+        void SwitchModel(string model, bool preferCurrentUrl)
         {
             if (config == null || model == null || model.Length == 0 || model == config.Model) return;
             config.Model = model;
@@ -1322,7 +1369,7 @@ namespace OfficeAgent.Host
             // 不带地址的话，模型名换了端点没换——"拿 A 家的密钥向 B 家发请求"就是这么来的。
             // 带 #tag 的账号条目（deepseek-flash#2）密钥在 host#tag 槽，按槽检查。
             string note = "";
-            string presetUrl = LlmClient.BaseUrlForModel(model);
+            string presetUrl = preferCurrentUrl ? null : LlmClient.BaseUrlForModel(model);
             if (presetUrl != null)
             {
                 string target = AppConfig.HostOf(presetUrl);
@@ -1337,6 +1384,10 @@ namespace OfficeAgent.Host
                         ? "（服务地址已自动切到 " + target + "，用这家已保存的密钥）"
                         : "（服务地址已自动切到 " + target + "；" + slot + "还没存密钥，请点下方模型入口进设置，选该模型后填一次密钥）";
                 }
+            }
+            else if (preferCurrentUrl)
+            {
+                note = "（继续用当前服务 " + AppConfig.HostOf(config.BaseUrl) + " 和它的密钥）";
             }
             config.Save();
             client = IsConfigured() ? new LlmClient(config) : null;

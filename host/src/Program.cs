@@ -506,6 +506,31 @@ namespace OfficeAgent.Host
             LlmClient.ParseToolCallsInto("{\"tool_calls\":[]}", r8);
             check("空数组不算工具调用", r8.ToolCalls != null && r8.ToolCalls.Count == 0 && !r8.HasToolCalls);
 
+            // ★ 兼容旧式 function_call（0.9.8）：原实现找不到 "tool_calls" 就直接 return，
+            //   工具调用被**整个丢弃** → 循环把这轮 content 当最终答复，
+            //   表现就是"模型没调工具就给了结论/编了产物"。
+            LlmReply r9 = new LlmReply();
+            LlmClient.ParseToolCallsInto(
+                "{\"role\":\"assistant\",\"content\":\"\",\"function_call\":" +
+                "{\"name\":\"list_directory\",\"arguments\":\"{\\\"path\\\":\\\"D:\\\\x\\\"}\"}}", r9);
+            check("旧式 function_call 也能解析出工具调用",
+                r9.HasToolCalls && r9.ToolCalls.Count == 1 && r9.ToolCalls[0][1] == "list_directory");
+
+            // ★ arguments 为**对象**（非字符串）时不能静默变 "{}"（否则工具空参执行）。
+            LlmReply r10 = new LlmReply();
+            LlmClient.ParseToolCallsInto(
+                "{\"role\":\"assistant\",\"tool_calls\":[" +
+                "{\"id\":\"call_00_X\",\"type\":\"function\",\"function\":{\"name\":\"read_text_file\"," +
+                "\"arguments\":{\"path\":\"a.txt\"}}}]}", r10);
+            check("arguments 为对象时取到原始 JSON（不再是空参）",
+                r10.HasToolCalls && r10.ToolCalls[0][2].IndexOf("a.txt") >= 0);
+
+            LlmReply r11 = new LlmReply();
+            LlmClient.ParseToolCallsInto(
+                "{\"role\":\"assistant\",\"function_call\":{\"name\":\"list_directory\",\"arguments\":{\"path\":\"D:\\\\y\"}}}", r11);
+            check("旧式 function_call + 对象 arguments 也取到参数",
+                r11.HasToolCalls && r11.ToolCalls[0][2].IndexOf("y") >= 0);
+
             Console.WriteLine(failed == 0 ? "toolidtest ALL PASS" : ("toolidtest FAILED=" + failed));
             return failed == 0 ? 0 : 2;
         }
@@ -694,6 +719,20 @@ namespace OfficeAgent.Host
                 !OfficeAgent.Host.AgentLoop.LooksLikePseudoToolCall("示例：\n```python\nprint(1)\n```"));
             check("伪工具调用：空答复 → 不误判",
                 !OfficeAgent.Host.AgentLoop.LooksLikePseudoToolCall(""));
+
+            // ★★ 根因护栏：**不能因为一次偶发错误就剥掉全部工具**
+            //   原判定把裸 "http 400"/"http 422"/"tools"/"unknown"/"未知参数" 全当"不支持工具"，
+            //   一次限流/网关抖动就会静默降级为纯对话 → 模型无工具可用 → 凭空编造结果。
+            check("降级判定：偶发 HTTP 400（与工具无关）→ 不降级",
+                !OfficeAgent.Host.AgentLoop.LooksLikeToolsRejected("HTTP 400: rate limit exceeded, please retry later"));
+            check("降级判定：HTTP 422 参数错误（未提工具）→ 不降级",
+                !OfficeAgent.Host.AgentLoop.LooksLikeToolsRejected("HTTP 422: invalid request body"));
+            check("降级判定：错误串里只是碰巧含 tools → 不降级",
+                !OfficeAgent.Host.AgentLoop.LooksLikeToolsRejected("HTTP 400: too many tools in context window exceeded"));
+            check("降级判定：明确不支持 function calling → 降级",
+                OfficeAgent.Host.AgentLoop.LooksLikeToolsRejected("HTTP 400: this model does not support tools"));
+            check("降级判定：中文明确不支持工具 → 降级",
+                OfficeAgent.Host.AgentLoop.LooksLikeToolsRejected("HTTP 400: 当前模型不支持工具调用"));
             if (!lineEnd)
             {
                 Console.WriteLine("        ↳ 段数=" + chunks.Count + " 首个失败段=" + failAt);

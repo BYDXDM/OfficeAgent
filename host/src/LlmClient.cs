@@ -407,7 +407,15 @@ namespace OfficeAgent.Host
         internal static void ParseToolCallsInto(string msg, LlmReply r)
         {
             int tc = msg.IndexOf("\"tool_calls\"", StringComparison.Ordinal);
-            if (tc < 0) return;
+            if (tc < 0)
+            {
+                // ★ 兼容旧式 function_call（0.9.8）
+                //   部分端点/模型回的是 {"function_call":{"name":"…","arguments":"…"}}
+                //   而不是 tool_calls。原实现直接 return → 工具调用被**整个丢弃**，
+                //   循环把这一轮的 content 当成最终答复 —— 表现就是"模型没调工具就给了结论"。
+                ParseLegacyFunctionCall(msg, r);
+                return;
+            }
             int arr = msg.IndexOf('[', tc);
             if (arr < 0) return;
             r.ToolCalls = new List<string[]>();
@@ -431,16 +439,53 @@ namespace OfficeAgent.Host
                     {
                         name = JsonGetString(fobj, "name");
                         args = JsonGetString(fobj, "arguments");
+                        // ★ arguments 可能是**对象**而非字符串（部分端点）。
+                        //   原实现只认字符串，对象时静默变成 "{}" → 工具**空参执行**（静默错行为）。
+                        if (args == null || args.Length == 0) args = RawArguments(fobj);
                     }
                 }
                 if (name == null || name.Length == 0) continue;   // 非 function 类型（web_search 等）不本地分发
-                if (args == null) args = "{}";
+                if (args == null || args.Length == 0) args = "{}";
                 if (id == null || id.Length == 0 || seenIds.Contains(id))
                     id = "call_oa_" + Guid.NewGuid().ToString("N").Substring(0, 16);
                 seenIds.Add(id);
                 r.ToolCalls.Add(new string[] { id, name, args });
             }
             r.HasToolCalls = r.ToolCalls.Count > 0;
+        }
+
+        // 旧式 function_call 形态：{"function_call":{"name":"…","arguments":…}}
+        static void ParseLegacyFunctionCall(string msg, LlmReply r)
+        {
+            int fc = msg.IndexOf("\"function_call\"", StringComparison.Ordinal);
+            if (fc < 0) return;
+            int b = msg.IndexOf('{', fc);
+            if (b < 0) return;
+            string fobj = ExtractJsonObject(msg, b);
+            if (fobj == null) return;
+            string name = JsonGetString(fobj, "name");
+            if (name == null || name.Length == 0) return;
+            string args = JsonGetString(fobj, "arguments");
+            if (args == null || args.Length == 0) args = RawArguments(fobj);
+            if (args == null || args.Length == 0) args = "{}";
+            r.ToolCalls = new List<string[]>();
+            r.ToolCalls.Add(new string[] { "call_oa_" + Guid.NewGuid().ToString("N").Substring(0, 16), name, args });
+            r.HasToolCalls = true;
+        }
+
+        // 取 arguments 的**原始 JSON 对象文本**（当它是对象而非字符串时）。
+        // 返回 null 表示不是对象形态（调用方再退化为 "{}"）。
+        static string RawArguments(string fobj)
+        {
+            if (fobj == null) return null;
+            int ai = fobj.IndexOf("\"arguments\"", StringComparison.Ordinal);
+            if (ai < 0) return null;
+            int colon = fobj.IndexOf(':', ai + 11);
+            if (colon < 0) return null;
+            int s = colon + 1;
+            while (s < fobj.Length && char.IsWhiteSpace(fobj[s])) s++;
+            if (s >= fobj.Length || fobj[s] != '{') return null;
+            return ExtractJsonObject(fobj, s);
         }
 
         // 从 startIdx 处的 '{' 起提取括号配平的 JSON 对象（跳过字符串字面量）

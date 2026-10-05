@@ -17,6 +17,8 @@ namespace OfficeAgent.Host
             public bool UsedTools;
             public string Error = "";        // 非空 = 请求失败
             public string FirstError = "";   // 降级前的原始错误（诊断用）
+            public bool ToolsDropped;        // 端点拒绝工具调用 → 本轮降级为纯对话（必须告知用户）
+            public string ToolsDropReason = "";
             public List<string> Products = new List<string>();   // 本回合产出的文件（附件卡片）
             public int Hops;                 // 实际轮数
             public bool ThinkingStripped;    // 最终答复里剥掉过模型的思考段（诊断用）
@@ -103,7 +105,9 @@ namespace OfficeAgent.Host
                     // 剥掉 tools 重发会让请求自相矛盾（tool 消息引用未声明的函数）→ 服务端必拒
                     if (reply.Error.Length > 0 && hop == 0 && tools != null && LooksLikeToolsRejected(reply.Error))
                     {
-                        r.FirstError = reply.Error;   // 保留原始错误供诊断（降级后不可见）
+                        r.FirstError = reply.Error;   // 保留原始错误供诊断
+                        r.ToolsDropped = true;        // ★ 必须让用户看见：无工具=无法真正执行任务
+                        r.ToolsDropReason = reply.Error;
                         tools = null;   // 端点不支持 function calling → 降级纯对话重试一次
                         reply = client.ChatRaw(LlmClient.BuildMessagesJson(sysPrompt, request), null, true);
                     }
@@ -317,11 +321,29 @@ namespace OfficeAgent.Host
             }
         }
 
-        static bool LooksLikeToolsRejected(string err)
+        // 只在**明确指向"工具/函数 schema 被端点拒绝"**时才降级为纯对话。
+        //
+        // 原实现（0.9.7 及以前）：
+        //   e.Contains("http 400") || e.Contains("http 422") || e.Contains("tools") ||
+        //   (e.Contains("tool") && e.Contains("not")) || e.Contains("未知参数") || e.Contains("unknown")
+        // 判定宽到几乎"任何错误都命中"：一次偶发 400（限流、网关抖动、某个无关参数小错）
+        // 就会把**全部工具剥掉**重发。而 tools 变量此后一直是 null → **整个回合的每一跳**
+        // 都再无 function 工具；模型却仍按系统提示"直接去做事"，只能**凭空编造**结果
+        // （用户实测：答复给了完整工资表和保存路径，审计无写文件记录、目录为空）。
+        // 这是"表做不出来"的真正病根，不是模型不听话。
+        //
+        // 现在要求**同时**命中"工具/函数"与"不支持/非法"两类语义，缺一不可。
+        internal static bool LooksLikeToolsRejected(string err)
         {
             string e = (err ?? "").ToLowerInvariant();
-            return e.Contains("http 400") || e.Contains("http 422") || e.Contains("tools") ||
-                   (e.Contains("tool") && e.Contains("not")) || e.Contains("未知参数") || e.Contains("unknown");
+            if (e.Length == 0) return false;
+            bool aboutTools = e.Contains("tool") || e.Contains("function") ||
+                              e.Contains("工具") || e.Contains("函数");
+            if (!aboutTools) return false;
+            return e.Contains("not support") || e.Contains("unsupported") || e.Contains("does not support")
+                || e.Contains("不支持") || e.Contains("invalid") || e.Contains("illegal")
+                || e.Contains("unknown parameter") || e.Contains("未知参数")
+                || e.Contains("unrecognized") || e.Contains("no such");
         }
     }
 }

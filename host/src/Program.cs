@@ -39,6 +39,7 @@ namespace OfficeAgent.Host
             bool caretTest = false;
             bool toolidTest = false;
             bool urlTest = false;
+            bool frpTest = false;
             bool safetyTest = false;
             bool formulaTest = false;
             string gridTestInput = null;
@@ -66,6 +67,7 @@ namespace OfficeAgent.Host
                 else if (a == "/carettest") caretTest = true;
                 else if (a == "/toolidtest") toolidTest = true;
                 else if (a == "/urltest") urlTest = true;
+                else if (a == "/frptest") frpTest = true;
                 else if (a == "/safetytest") safetyTest = true;
                 else if (a == "/formulatest") formulaTest = true;
                 else if (a == "/gridtest" && i + 1 < args.Length) { gridTestInput = args[i + 1]; i += 1; }
@@ -110,7 +112,7 @@ namespace OfficeAgent.Host
 
             // CLI 无头链同样落审计（设计方案 §7.3：每个动作可审计；GUI 的 app_start 在 MainForm）
             if (selftest || guardTest || maskTest || intentTest || suggestTest || skillTest || caretTest
-                || auditTest || detectTest || bridgeTest || planTest || perfTest || toolidTest || urlTest || formulaTest
+                || auditTest || detectTest || bridgeTest || planTest || perfTest || toolidTest || urlTest || frpTest || formulaTest
                 || safetyTest
                 || gridTestInput != null
                 || skillRunArgs != null || agentTestArgs != null || reconArgs != null || mergeArgs != null
@@ -184,6 +186,14 @@ namespace OfficeAgent.Host
                 try { AllocConsole(); } catch { }
                 try { Console.OutputEncoding = Encoding.UTF8; } catch { }
                 return RunToolIdTest();
+            }
+
+            if (frpTest)
+            {
+                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
+                try { AllocConsole(); } catch { }
+                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                return RunFrpTest();
             }
 
             if (urlTest)
@@ -537,6 +547,93 @@ namespace OfficeAgent.Host
             check("预置模型不进 customModels", !presetRejected);
 
             Console.WriteLine(failed == 0 ? "urltest ALL PASS" : ("urltest FAILED=" + failed));
+            return failed == 0 ? 0 : 2;
+        }
+
+        // /frptest —— .frp 打印模板解析回归（0.8.5，格式由用户实样 1.frp 逆向）。
+        // 用合成样例（按逆向出的记录格式生成），不依赖用户文件：
+        //   记录 = [u16 名长][名][00][02 00][u32 左][u32 上][u32 宽][u32 高][属性串][文本串][字体名串]
+        static int RunFrpTest()
+        {
+            int failed = 0;
+            Action<string, bool> check = delegate(string name, bool cond)
+            {
+                Console.WriteLine((cond ? "  ok    " : "  FAIL  ") + name);
+                if (!cond) failed++;
+            };
+            string dir = Path.Combine(Path.GetTempPath(), "oa_frptest");
+            try { Directory.CreateDirectory(dir); } catch { }
+            string frp = Path.Combine(dir, "sample.frp");
+            string xlsx = Path.Combine(dir, "sample-frp.xlsx");
+            try { File.Delete(frp); } catch { }
+            try { File.Delete(xlsx); } catch { }
+
+            // 头部（对齐实样：长度串「虚拟打印机」等）
+            List<byte> w = new List<byte>();
+            Action<string> wstr = delegate(string s)
+            {
+                byte[] raw = Encoding.GetEncoding("GBK").GetBytes(s);
+                w.Add((byte)0); w.Add((byte)(raw.Length & 0xff)); w.Add((byte)(raw.Length >> 8));
+                for (int k = 0; k < raw.Length; k++) w.Add(raw[k]);
+            };
+            // 注意 3.5 目标只有 1/2 参 Action（4 参起是 .NET 4.0），几何用 int[] 传
+            Action<string, int[]> wobj = delegate(string name, int[] geo)
+            {
+                wstr(name);
+                w.Add(0); w.Add(2); w.Add(0);
+                for (int g = 0; g < 4; g++)
+                    for (int k = 0; k < 4; k++) w.Add((byte)(geo[g] >> (8 * k)));
+            };
+            w.Add(0x19); w.Add(0x00);
+            wstr("虚拟打印机");
+            wobj("Line1", new int[] { 64, 68, 324, 0 });
+            wstr("@ ");
+            wobj("Memo32", new int[] { 56, 40, 280, 26 });
+            wstr("8");
+            wstr("员工上下班时间表");
+            wstr("Arial");
+            wobj("Memo1", new int[] { 64, 71, 120, 19 });
+            wstr("1");
+            wstr("宋体");
+            wobj("Memo2", new int[] { 128, 71, 140, 19 });
+            wstr("李奎远");
+            wstr("宋体");
+            wobj("Memo3", new int[] { 192, 71, 64, 19 });
+            wstr("07:47-     ");
+            wstr("宋体");
+            wobj("Memo4", new int[] { 256, 71, 64, 19 });
+            wstr("工资");
+            wstr("宋体");
+            wobj("Memo5", new int[] { 64, 96, 120, 19 });
+            wstr("2");
+            wstr("宋体");
+            wobj("Memo6", new int[] { 128, 96, 140, 19 });
+            wstr("王五");
+            wstr("宋体");
+            wobj("Memo7", new int[] { 192, 96, 64, 19 });
+            wstr("     -     ");
+            wstr("宋体");
+            File.WriteAllBytes(frp, w.ToArray());
+
+            string ok2 = null;
+            string msg = FrpReport.ToText(frp, out ok2);
+            check("frp 解析成功", ok2 == null && msg.Length > 0);
+            check("标题命中", msg.Contains("员工上下班时间表"));
+            check("文本命中（人名/时间/空班次）", msg.Contains("李奎远") && msg.Contains("07:47-") && msg.Contains("-"));
+            check("列序正确（工号在人名左）", msg.IndexOf("1") >= 0 && msg.IndexOf("1") < msg.IndexOf("李奎远"));
+
+            string cerr = FrpReport.ConvertToXlsx(frp, xlsx);
+            check("转 xlsx 成功", cerr == null && File.Exists(xlsx));
+            if (cerr == null && File.Exists(xlsx))
+            {
+                // 读回验证（xlsx 结构：2 数据行 + 表头行内容来自第一横行）
+                string wb = ReadZipEntry(xlsx, "xl/worksheets/sheet1.xml");
+                check("转出内容含标题与人名", wb != null && wb.Contains("员工上下班时间表") && wb.Contains("李奎远"));
+                string missing;
+                check("frp 非法文件给友好报错", FrpReport.ToText(frp + ".nope", out missing) == "" && missing != null);
+            }
+
+            Console.WriteLine(failed == 0 ? "frptest ALL PASS" : ("frptest FAILED=" + failed));
             return failed == 0 ? 0 : 2;
         }
 
@@ -1055,6 +1152,23 @@ namespace OfficeAgent.Host
             else if (t == "csv") target = ConvTarget.Csv;
             else if (t == "xlsx") target = ConvTarget.Xlsx;
             else { Console.WriteLine("未知目标: " + targetText); return 3; }
+
+            // frp 打印模板 → xlsx：自有解析器（0.8.5），不走转换引擎
+            if ((System.IO.Path.GetExtension(input) ?? "").ToLowerInvariant() == ".frp")
+            {
+                if (target != ConvTarget.Xlsx) { Console.WriteLine("frp 只支持转 xlsx"); return 3; }
+                string outFrp = System.IO.Path.Combine(
+                    System.IO.Path.GetDirectoryName(input) ?? ".",
+                    System.IO.Path.GetFileNameWithoutExtension(input) + "-frp.xlsx");
+                string ferr = FrpReport.ConvertToXlsx(input, outFrp);
+                if (ferr == null)
+                {
+                    Console.WriteLine("OK: " + outFrp + "  (" + new System.IO.FileInfo(outFrp).Length + " bytes)");
+                    return 0;
+                }
+                Console.WriteLine("FAIL: " + ferr);
+                return 2;
+            }
 
             string root = EnvDetect.FindRoot();
             ConvertEngine engine = new ConvertEngine();

@@ -75,10 +75,10 @@ namespace OfficeAgent.Host
         public static string SchemasJson(bool includePlan)
         {
             string s = "[" +
-                "{\"type\":\"function\",\"function\":{\"name\":\"read_text_file\",\"description\":\"读取本地文件内容（文本类 txt/md/csv/log/json/xml/代码等；也支持 PDF——自动提取文字层）。xlsx/xls/doc/ppt 请用 convert_document 转换后再读。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"文件的绝对路径\"}},\"required\":[\"path\"]}}}," +
+                "{\"type\":\"function\",\"function\":{\"name\":\"read_text_file\",\"description\":\"读取本地文件内容（文本类 txt/md/csv/log/json/xml/代码等；也支持 PDF——自动提取文字层；frp 打印模板——解析为表格文本）。xlsx/xls/doc/ppt 请用 convert_document 转换后再读。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"文件的绝对路径\"}},\"required\":[\"path\"]}}}," +
                 "{\"type\":\"function\",\"function\":{\"name\":\"list_directory\",\"description\":\"列出某个文件夹里的文件和子文件夹。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"文件夹的绝对路径\"}},\"required\":[\"path\"]}}}," +
                 "{\"type\":\"function\",\"function\":{\"name\":\"download_file\",\"description\":\"从 http/https 网址下载文件，保存到「下载\\\\表格」目录并返回保存路径。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"下载链接（http/https）\"},\"filename\":{\"type\":\"string\",\"description\":\"可选：保存的文件名\"}},\"required\":[\"url\"]}}}," +
-                "{\"type\":\"function\",\"function\":{\"name\":\"convert_document\",\"description\":\"把 office 文档转格式：doc/docx/ppt/pptx/xls/xlsx 转 pdf，xlsx 转 csv，csv 转 xlsx。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\",\"description\":\"输入文件绝对路径\"},\"target\":{\"type\":\"string\",\"description\":\"目标格式：pdf 或 csv 或 xlsx\"}},\"required\":[\"input\",\"target\"]}}}," +
+                "{\"type\":\"function\",\"function\":{\"name\":\"convert_document\",\"description\":\"把 office 文档转格式：doc/docx/ppt/pptx/xls/xlsx 转 pdf，xlsx 转 csv，csv 转 xlsx；frp 打印模板可转 xlsx（按版面坐标重建表格）。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\",\"description\":\"输入文件绝对路径\"},\"target\":{\"type\":\"string\",\"description\":\"目标格式：pdf 或 csv 或 xlsx\"}},\"required\":[\"input\",\"target\"]}}}," +
                 "{\"type\":\"function\",\"function\":{\"name\":\"create_spreadsheet\",\"description\":\"创建全新的 Excel 表格（.xlsx）。用 csv 参数提供表格内容：标准 CSV 文本，第一行是表头，用 \\n 表示换行。数字会自动识别为数值。path 给文件名（相对路径）时保存到「下载\\表格」目录。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"输出的 .xlsx 路径（只给文件名则存到 下载\\\\表格）\"},\"csv\":{\"type\":\"string\",\"description\":\"表格内容（CSV 文本，第一行表头）\"}},\"required\":[\"path\",\"csv\"]}}}," +
                 "{\"type\":\"function\",\"function\":{\"name\":\"create_presentation\",\"description\":\"创建全新的 PPT 演示文稿（.pptx）。用 outline 参数提供每页内容：页与页之间用 ;; 分隔，每页格式为 标题|要点1;要点2;要点3。path 给文件名（相对路径）时保存到「下载\\表格」目录。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"输出的 .pptx 路径（只给文件名则存到 下载\\\\表格）\"},\"outline\":{\"type\":\"string\",\"description\":\"每页内容：标题|要点1;要点2 ;; 下一页标题|要点\"}},\"required\":[\"path\",\"outline\"]}}}," +
                 "{\"type\":\"function\",\"function\":{\"name\":\"create_formula_workbook\",\"description\":\"生成带公式的 Excel 工作簿（.xlsx），用户填数即自动计算。优先用模板：template=payroll 工资表标准套账（社保/公积金/个税全公式，数据行CSV列序:姓名,部门,基本工资,岗位津贴,加班费）；template=vat 增值税台账（CSV列序:日期,摘要,类型(只填销项/进项),金额(不含税),税率）；template=ledger 流水账（CSV列序:日期,摘要,类别,收入,支出）。模板自带汇总页，改明细汇总自动变；可选 params 覆盖参数（工资表 pensionRate/medicalRate/unemploymentRate/housingFundRate/taxThreshold/blankRows，流水账 openingBalance），如 pensionRate=0.08;housingFundRate=0.12。自由定制用 sheets+summary（规格见参数说明）。\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"输出的 .xlsx 路径（只给文件名则存到 下载\\\\表格）\"},\"template\":{\"type\":\"string\",\"description\":\"payroll|vat|ledger 三选一\"},\"rows\":{\"type\":\"string\",\"description\":\"模板数据行 CSV 文本（列序见模板说明；首行是列名时会被自动忽略）\"},\"params\":{\"type\":\"string\",\"description\":\"可选：参数覆盖 key=value;分号分隔\"},\"sheets\":{\"type\":\"string\",\"description\":\"自由模式（与 template 二选一）：sheets 数组 JSON 文本，每项 {name:表名, header:[列1,列2], rows:[[a,1],[b,2]], formulaCols:[{col:F, formula:=D{r}-E{r}}], blankRows:50, totalRow:true, widths:[10,20]}；{r} 代表当前行号，公式以 = 开头\"},\"summary\":{\"type\":\"string\",\"description\":\"可选（配合 sheets）：汇总页配置 JSON 文本 {source:明细表名, groupCol:C, labelHeader:类别, sumCols:[{col:D, header:收入},{col:E, header:支出}]}——按分组列 SUMIF 自动生成汇总，改明细汇总自动变\"}},\"required\":[\"path\"]}}}," +
@@ -238,6 +238,14 @@ namespace OfficeAgent.Host
             if (path.Length == 0) return "缺少 path 参数";
             if (!File.Exists(path)) return "文件不存在: " + path;
             string ext = (Path.GetExtension(path) ?? "").ToLowerInvariant();
+            // frp 打印模板（二进制表单）：结构化解析成表格文本（0.8.5，用户样例逆向）
+            if (ext == ".frp")
+            {
+                string frpErr;
+                string txt = FrpReport.ToText(path, out frpErr);
+                if (frpErr != null) return "frp 解析失败: " + frpErr + "。可用 convert_document 转 xlsx 再处理。";
+                return txt;
+            }
             // PDF 走 pdfium 文本层提取（无需外部阅读器）；扫描件无文字层时给出明确提示
             if (ext == ".pdf")
             {
@@ -436,6 +444,22 @@ namespace OfficeAgent.Host
             ok = false;
             if (input == null || input.Length == 0 || !File.Exists(input)) return "输入文件不存在: " + input;
             string t = (target == null ? "pdf" : target.Trim().ToLowerInvariant());
+            // frp 打印模板 → xlsx：不走转换引擎（自有解析器，0.8.5）
+            if ((Path.GetExtension(input) ?? "").ToLowerInvariant() == ".frp")
+            {
+                if (t != "xlsx") return "frp 模板目前只支持转 xlsx（要打印请用原来的打印程序）";
+                string outFrp = Path.Combine(Path.GetDirectoryName(input) ?? "",
+                    Path.GetFileNameWithoutExtension(input) + "-frp.xlsx");
+                // 与其他转换一致：写系统盘先过确认
+                string frpSafety;
+                if (!SafetyConfirm.Ensure(SafetyOp.Write, outFrp, Current, out frpSafety)) return frpSafety;
+                string frpErr = FrpReport.ConvertToXlsx(input, outFrp);
+                if (frpErr != null) return "frp 转换失败: " + frpErr;
+                ok = true;
+                LastProduct = outFrp;
+                AuditLog.Record("file_write", "agent_frp_to_xlsx " + outFrp);
+                return "frp 模板已转成 Excel（按版面坐标重建表格）: " + outFrp;
+            }
             ConvTarget ct;
             if (t == "pdf") ct = ConvTarget.Pdf;
             else if (t == "csv") ct = ConvTarget.Csv;

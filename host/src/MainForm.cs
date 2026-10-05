@@ -14,7 +14,7 @@ namespace OfficeAgent.Host
 {
     public partial class MainForm : Form
     {
-        const string Version = "0.8.4";
+        const string Version = "0.8.5";
 
         class NavEntry
         {
@@ -925,7 +925,7 @@ namespace OfficeAgent.Host
             using (OpenFileDialog dlg = new OpenFileDialog())
             {
                 dlg.Title = "打开预览文件";
-                dlg.Filter = "可预览|*.xlsx;*.csv;*.pdf;*.xls;*.doc;*.docx;*.ppt;*.pptx|全部文件|*.*";
+                dlg.Filter = "可预览|*.xlsx;*.csv;*.pdf;*.xls;*.doc;*.docx;*.ppt;*.pptx;*.frp|全部文件|*.*";
                 try { dlg.InitialDirectory = config.EffectiveWorkspace(); } catch { }
                 if (dlg.ShowDialog(this) == DialogResult.OK) ShowPreview(dlg.FileName);
             }
@@ -969,6 +969,16 @@ namespace OfficeAgent.Host
                 if (ext == ".pdf") { ShowPdf(path); return; }
                 if (ext == ".xlsx") { ShowXlsx(path); return; }
                 if (ext == ".csv") { ShowCsv(path); return; }
+                // frp 打印模板：解析成网格 → 临时 xlsx → 走既有 xlsx 预览（0.8.5）
+                if (ext == ".frp")
+                {
+                    if (!Directory.Exists(PreviewDir)) Directory.CreateDirectory(PreviewDir);
+                    string tmp = Path.Combine(PreviewDir, "frp-preview.xlsx");
+                    string frpErr = FrpReport.ConvertToXlsx(path, tmp);
+                    if (frpErr != null) { SetPreviewInfo("frp 解析失败: " + frpErr); return; }
+                    ShowXlsx(tmp);
+                    return;
+                }
                 if (ext == ".xls" || ext == ".doc" || ext == ".docx" || ext == ".ppt" || ext == ".pptx")
                 {
                     previewInfo.Text = "正在通过转换引擎生成预览（Office COM / LibreOffice）...";

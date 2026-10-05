@@ -481,7 +481,11 @@ namespace OfficeAgent.Host
             if (err != null) return ExplainConvertError(input, t, err);
             ok = true;
             LastProduct = outPath;
-            return "转换完成，输出文件: " + outPath;
+            string convMsg = "转换完成，输出文件: " + outPath;
+            // 转换成功但有需用户知晓的情况（如源表公式无缓存值、导出格被置空）
+            if (conv.LastWarning != null && conv.LastWarning.Length > 0)
+                convMsg += "\n注意：" + conv.LastWarning;
+            return convMsg;
         }
 
         // 转换失败 → 按格式给出可操作建议（xlsx→pdf 依赖 LibreOffice/Office，是最常见的失败点）

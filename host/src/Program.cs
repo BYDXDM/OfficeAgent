@@ -1297,6 +1297,8 @@ namespace OfficeAgent.Host
             if (err == null)
             {
                 Console.WriteLine("OK: " + outPath + "  (" + new System.IO.FileInfo(outPath).Length + " bytes)");
+                if (engine.LastWarning != null && engine.LastWarning.Length > 0)
+                    Console.WriteLine("WARN: " + engine.LastWarning);
                 return 0;
             }
             Console.WriteLine("FAIL: " + err);

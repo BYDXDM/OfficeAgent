@@ -17,6 +17,9 @@ namespace OfficeAgent.Host
     public class ConvertEngine
     {
         public string SofficePath = null;   // 探测到的 soffice.exe；null = 无 LO
+        // 最近一次转换的**附加提示**（null=无）。用于"转换成功但需用户知晓"的情况——
+        // 例如源表公式没有缓存值、CSV 里这些格被置空（否则会写成一墙公式文本，被当成乱码）。
+        public string LastWarning = null;
 
         public static string FindSoffice(string root)
         {
@@ -48,6 +51,7 @@ namespace OfficeAgent.Host
         public string Convert(string input, ConvTarget target, out string outputPath)
         {
             outputPath = null;
+            LastWarning = null;   // 每次转换重置，避免把上一次的提示带给本次调用方
             if (!File.Exists(input)) return "输入文件不存在: " + input;
             input = Path.GetFullPath(input);   // COM/LO 均要求绝对路径
             string ext = (Path.GetExtension(input) ?? "").ToLowerInvariant();
@@ -293,6 +297,10 @@ namespace OfficeAgent.Host
             outputPath = OutputPathOf(input, ConvTarget.Csv);
             using (XlsxBook book = XlsxBook.Open(input))
             {
+                // 导出场景：无缓存值的公式格**置空**。
+                // 若照搬 "=公式" 文本，系统/ERP 生成的表（写了公式但不写缓存值）会导出
+                // 一墙 "=IF(...,_xlfn.TEXTJOIN(...))"，用户看到的就是"乱码"。
+                book.BlankUncachedFormula = true;
                 List<string[]> rows = new List<string[]>();
                 string err = book.StreamRows(0, 256, delegate(string[] row)
                 {
@@ -303,6 +311,12 @@ namespace OfficeAgent.Host
                     rows.Add(clean.ToArray());
                 });
                 if (err != null) { outputPath = null; return "读取 xlsx 失败: " + err; }
+                if (book.UncachedFormulaCount > 0)
+                {
+                    LastWarning = "源表有 " + book.UncachedFormulaCount + " 个公式单元格没有缓存值" +
+                        "（常见于系统/ERP 导出的 xlsx），CSV 中这些格已留空。" +
+                        "如需它们的计算值：先用 Excel/WPS 打开该表并另存一次（让公式算出结果），再转换。";
+                }
                 return MiniCsv.Write(outputPath, rows) ?? null;
             }
         }

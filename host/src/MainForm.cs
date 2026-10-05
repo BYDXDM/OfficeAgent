@@ -14,7 +14,7 @@ namespace OfficeAgent.Host
 {
     public partial class MainForm : Form
     {
-        const string Version = "0.8.8";
+        const string Version = "0.8.9";
 
         class NavEntry
         {
@@ -830,7 +830,10 @@ namespace OfficeAgent.Host
                     if (err == null)
                     {
                         ok++;
-                        SetTaskRow(i, "完成 → " + outPath, Color.DarkGreen);
+                        // 成功但有附加提示（如源表公式无缓存值、导出格被置空）也要让用户看见
+                        string note = (engine.LastWarning != null && engine.LastWarning.Length > 0)
+                            ? ("（注意：" + engine.LastWarning + "）") : "";
+                        SetTaskRow(i, "完成 → " + outPath + note, Color.DarkGreen);
                         AuditLog.Record("file_write", outPath);
                     }
                     else { fail++; SetTaskRow(i, "失败: " + err, Color.Red); }

@@ -34,6 +34,17 @@ namespace OfficeAgent.Host
 
         public List<XlsxSheetInfo> Sheets = new List<XlsxSheetInfo>();
 
+        // 公式单元格**无缓存值**时的呈现策略（0.8.9）：
+        //   false（默认）= 输出 "=公式" 文本。核对/合并/建议等场景需要把公式格识别为
+        //                  "非数值"（否则公式串会被当数据参与计算），故保持原行为。
+        //   true          = 输出空串。**导出场景**（xlsx→csv）用——用户要的是数据，
+        //                  把一墙 "=IF($N6="""",...,_xlfn.TEXTJOIN(...))" 写进 CSV 只会被当成乱码。
+        //   背景：系统/ERP 程序化生成的 xlsx 很常见"写了公式但不写缓存值"，
+        //         这种文件转 CSV 时若照搬公式文本，用户看到的就是"乱码"。
+        public bool BlankUncachedFormula = false;
+        // 本次读取中被置空的无缓存公式单元格计数（供调用方向用户提示）
+        public int UncachedFormulaCount = 0;
+
         public static XlsxBook Open(string path)
         {
             XlsxBook b = new XlsxBook();
@@ -289,7 +300,24 @@ namespace OfficeAgent.Host
                             if (ftxt == null || ftxt.Length == 0) ftxt = "(共享公式)";
                             if (ftxt.Length > 128) ftxt = ftxt.Substring(0, 128) + "…";
                             pendingFormula = ftxt;
-                            // ReadElementContentAsString 已推进越过 </f>，随后的 <v> 照常解析
+                            // ReadElementContentAsString 已推进越过 </f>，随后的 <v> 照常解析。
+                            //
+                            // ★ 但若 </f> 之后**紧跟 </c>**（本格只有公式、没有 <v> 缓存值），
+                            //   主循环的 r.Read() 会直接越过 </c> → 下方 EndElement("c") 分支
+                            //   永不触发，本格既不提交、也走不到"无缓存公式"处理。
+                            //   实测两种 xlsx 形态会走不同分支：
+                            //     · <f>内容</f></c>      → 被跳过（本函数生成的文件就是这种）
+                            //     · <f/>（自闭合，共享公式）→ 正常落到 EndElement("c")
+                            //   导出时前者会静默丢格、后者会写出 "=公式" 文本，两者都必须在此统一。
+                            if (r.NodeType == XmlNodeType.EndElement && r.LocalName == "c")
+                            {
+                                if (curCol >= 0 && curCol < maxCols)
+                                {
+                                    if (BlankUncachedFormula) { UncachedFormulaCount++; cells[curCol] = ""; }
+                                    else cells[curCol] = "=" + pendingFormula;
+                                }
+                                haveCell = false;
+                            }
                         }
                         else if (r.NodeType == XmlNodeType.Element && r.LocalName == "v" && haveCell)
                         {
@@ -307,9 +335,14 @@ namespace OfficeAgent.Host
                         {
                             if (curCol >= 0 && curCol < maxCols)
                             {
-                                string sv = val == null && hadFormula
-                                    ? "=" + pendingFormula      // 公式无缓存值：标记为公式文本，核对场景按非数值处理
-                                    : ResolveCell(val, cellType, styleIdx);
+                                string sv;
+                                if (val == null && hadFormula)
+                                {
+                                    // 公式无缓存值：导出场景置空（并计数），其余场景标记为公式文本
+                                    if (BlankUncachedFormula) { sv = ""; UncachedFormulaCount++; }
+                                    else sv = "=" + pendingFormula;
+                                }
+                                else sv = ResolveCell(val, cellType, styleIdx);
                                 cells[curCol] = sv;
                             }
                             haveCell = false;

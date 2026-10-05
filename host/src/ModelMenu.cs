@@ -57,7 +57,7 @@ namespace OfficeAgent.Host
         const int SepH = 13;       // 分隔区高
 
         public static void Show(IWin32Window owner, Control anchor, List<Group> groups,
-            Action<Item> onPick, Action<Group> onRename, Action onRefresh, Action onSettings)
+            Action<Item> onPick, Action<Group> onRename, Action onRefresh, Action onSettings, Action onClosed)
         {
             if (groups == null) groups = new List<Group>();
 
@@ -249,31 +249,35 @@ namespace OfficeAgent.Host
                 if (e.KeyCode == Keys.Escape) { try { pop.Close(); } catch { } }
             };
 
-            // ★ 模态显示：ShowDialog 会阻塞到弹层关闭为止。
-            //   调用方（ChatPanel.ShowModelMenu）在 Show 之后紧跟着 FocusInput()，
-            //   非模态时那一步会立刻抢焦点把弹层关掉（0.9.2 回归根因）。
-            //   owner 取**顶层窗体**（而非 UserControl），模态才会正确禁用主窗体。
-            Form top = owner as Form;
-            if (top == null && anchor != null) { try { top = anchor.FindForm(); } catch { } }
-            if (top != null) pop.ShowDialog(top); else pop.ShowDialog();
-
-            // 弹层已关闭，此时再执行后续动作（避免在模态循环里嵌套开新窗体）
-            if (picked != null)
+            // ★ 非模态显示（不能用 ShowDialog）：模态会**禁用主窗口**，
+            //   用户实测"一打开模型列表就点不了其他"。菜单要的是"点别处就关"。
+            //   ★ 也**不能**在 Show 之后由调用方立刻 FocusInput()——那会抢焦点把弹层关掉
+            //   （0.9.2 第一版的回归）。所以：Show 后调用方什么都不做，
+            //   所有收尾动作（还焦点 / 选模型 / 改名 / 刷新 / 设置）统一放在 FormClosed 里。
+            pop.FormClosed += delegate
             {
-                if (onPick != null) { try { onPick(picked); } catch { } }
-            }
-            else if (renameTarget != null)
-            {
-                if (onRename != null) { try { onRename(renameTarget); } catch { } }
-            }
-            else if (act == 1)
-            {
-                if (onRefresh != null) { try { onRefresh(); } catch { } }
-            }
-            else if (act == 2)
-            {
-                if (onSettings != null) { try { onSettings(); } catch { } }
-            }
+                // 先还焦点，再做后续动作——否则"改名后重开弹层"会被随后的 FocusInput 又关掉
+                if (onClosed != null) { try { onClosed(); } catch { } }
+                if (picked != null)
+                {
+                    if (onPick != null) { try { onPick(picked); } catch { } }
+                }
+                else if (renameTarget != null)
+                {
+                    if (onRename != null) { try { onRename(renameTarget); } catch { } }
+                }
+                else if (act == 1)
+                {
+                    if (onRefresh != null) { try { onRefresh(); } catch { } }
+                }
+                else if (act == 2)
+                {
+                    if (onSettings != null) { try { onSettings(); } catch { } }
+                }
+            };
+            Form topForm = owner as Form;
+            if (topForm == null && anchor != null) { try { topForm = anchor.FindForm(); } catch { } }
+            if (topForm != null) pop.Show(topForm); else pop.Show();
         }
 
         // 简易输入框（深色，与弹层一致）：返回新名称；取消返回 null

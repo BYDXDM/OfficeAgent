@@ -1526,10 +1526,10 @@ namespace OfficeAgent.Host
                     ShowModelMenu();          // 立刻重开，让新名字可见
                 },
                 delegate { FetchModelsThenReopen(); },
-                delegate { if (OnOpenSettings != null) OnOpenSettings(); });
-
-            // 菜单关闭后焦点常落在 modelLink 上——用户接着打字全部丢失（"第一次输入无法上屏"）。
-            FocusInput();
+                delegate { if (OnOpenSettings != null) OnOpenSettings(); },
+                // 弹层关闭后再把焦点还给输入框。**绝不能**写在 Show 之后——
+                // 那会立刻抢焦点把刚打开的弹层关掉（0.9.2 第一版回归）。
+                delegate { FocusInput(); });
         }
 
         // 账号槽序号排序用：无 tag 视为 0（主账号排最前），非数字给一个大值

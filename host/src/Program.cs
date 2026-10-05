@@ -1042,11 +1042,11 @@ namespace OfficeAgent.Host
                 LlmClient.ModelDisplay("deepseek-flash#2", re) == "deepseek-flash（公司号）");
             check("往返后主账号槽仍无名称", re.GetKeyLabel("api.deepseek.com", "") == "");
 
-            // ---- 弹层模态性回归（0.9.2 修的那个 bug）----
-            // 现象：模型菜单/模型设置"打不开"。根因=弹层用非模态 Show()，而调用方 Show 之后
-            // 立刻 FocusInput() 抢焦点 → 弹层 Deactivate → 秒关。
-            // 测法：起一个定时器在 300ms 后关掉弹层，断言 ModelMenu.Show **阻塞了约 300ms**。
-            //       若弹层被秒关，Show 会立刻返回（耗时 <100ms）。
+            // ---- 弹层"秒关"回归（0.9.2）----
+            // 语义要求：**非模态**（模态会禁用主窗口，用户实测"一打开就点不了其他"），
+            // 但**打开后必须保持打开**——旧 bug 是调用方在 Show 之后立刻 FocusInput() 抢焦点，
+            // 弹层 Deactivate 秒关，表现为"模型菜单/设置打不开"。
+            // 这里断言：Show 返回后弹层仍存在（未秒关）。
             Form mh = new Form();
             mh.ShowInTaskbar = false;
             mh.FormBorderStyle = FormBorderStyle.None;
@@ -1067,21 +1067,14 @@ namespace OfficeAgent.Host
             mg.Items.Add(mi);
             mgs.Add(mg);
 
-            System.Windows.Forms.Timer mtk = new System.Windows.Forms.Timer();
-            mtk.Interval = 300;
-            mtk.Tick += delegate
-            {
-                mtk.Stop();
-                foreach (Form f in Application.OpenForms)
-                {
-                    if (f != mh && f.Visible) { try { f.Close(); } catch { } break; }
-                }
-            };
-            mtk.Start();
-            System.Diagnostics.Stopwatch msw = System.Diagnostics.Stopwatch.StartNew();
-            ModelMenu.Show(mh, anc, mgs, null, null, null, null);
-            msw.Stop();
-            check("弹层为模态、不会秒关（Show 阻塞到被关闭）", msw.ElapsedMilliseconds >= 150);
+            bool closedFired = false;
+            ModelMenu.Show(mh, anc, mgs, null, null, null, null, delegate { closedFired = true; });
+
+            Form popForm = null;
+            foreach (Form f in Application.OpenForms) { if (f != mh && f.Visible) { popForm = f; break; } }
+            check("弹层打开后仍然存在（未秒关）", popForm != null);
+            if (popForm != null) { try { popForm.Close(); } catch { } }
+            check("弹层关闭后触发收尾回调（还焦点）", closedFired);
             mh.Close();
             mh.Dispose();
 

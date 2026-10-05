@@ -558,6 +558,9 @@ namespace OfficeAgent.Host
                     if (ri == 0) { row.Add(ReportCell.S(cell)); continue; }
                     double num;
                     string t = (cell == null ? "" : cell.Trim());
+                    // 模型把公式塞进 csv 参数（"=IF(...)"）：按公式写入而不是文本——
+                    // 否则 Excel 里显示字面公式且不计算（0.8.4 用户实测症状之一）
+                    if (t.Length > 1 && t[0] == '=') { row.Add(ReportCell.F(t.Substring(1), "n")); continue; }
                     if (t.Length > 0 && double.TryParse(t, out num)) row.Add(ReportCell.N(num, "n"));
                     else row.Add(ReportCell.S(t));
                 }

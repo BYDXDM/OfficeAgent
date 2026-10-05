@@ -135,6 +135,25 @@ namespace OfficeAgent.Host
                 if (idx < 0 || idx >= msgs.Count) return;
                 if (msgs[idx].AttachPath.Length > 0 && OnOpenPreview != null) OnOpenPreview(msgs[idx].AttachPath);
             };
+            // 右键气泡：复制这条 / 复制全部对话（0.8.4 用户要求"复制对话"功能）
+            list.MouseUp += delegate(object s, MouseEventArgs e)
+            {
+                if (e.Button != MouseButtons.Right) return;
+                int idx = list.IndexFromPoint(e.Location);
+                if (idx < 0 || idx >= msgs.Count) return;
+                ContextMenu m = new ContextMenu();
+                string one = msgs[idx].Text == null ? "" : msgs[idx].Text;
+                if (one.Length > 0)
+                {
+                    MenuItem c1 = new MenuItem(msgs[idx].User ? "复制这条（我说的）" : "复制这条回复");
+                    c1.Click += delegate { try { Clipboard.SetText(one); } catch { } };
+                    m.MenuItems.Add(c1);
+                }
+                MenuItem c2 = new MenuItem("复制全部对话");
+                c2.Click += delegate { try { Clipboard.SetText(BuildTranscript()); } catch { } };
+                m.MenuItems.Add(c2);
+                m.Show(list, e.Location);
+            };
             Controls.Add(list);
 
             // 任务计划栏（右侧，任务计划插件）：模型经 task_plan 工具驱动，✓=已完成 ▶=进行中 ○=待办
@@ -484,6 +503,8 @@ namespace OfficeAgent.Host
                 if (msgs[i].CachedTextH > ChunkMaxTextH()) SplitLongFinal(i);
             }
             UpdateCtxLabel();
+            // 重开会话/窗口后直接落在最新一条（0.8.4 用户反馈：原来回到顶部还得自己滚到底）
+            try { if (list.Items.Count > 0) list.TopIndex = list.Items.Count - 1; } catch { }
             MarkDirty();
         }
 
@@ -506,6 +527,19 @@ namespace OfficeAgent.Host
         }
 
         public void FocusInput() { input.Focus(); }
+
+        // 整段对话导出为纯文本（右键"复制全部对话"用；跳过空气泡与附件卡）
+        string BuildTranscript()
+        {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < msgs.Count; i++)
+            {
+                string t = msgs[i].Text;
+                if (t == null || t.Length == 0) continue;
+                sb.Append(msgs[i].User ? "【我】" : "【助手】").Append(t).Append("\r\n");
+            }
+            return sb.ToString();
+        }
 
         public void SetContextFiles(string[] files)
         {

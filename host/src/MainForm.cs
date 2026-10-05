@@ -457,9 +457,19 @@ namespace OfficeAgent.Host
             }
             SessionInfo s = sessionList.Items[e.Index] as SessionInfo;
             if (s == null) return;
+            // 0.8.4 用户要求：当前选中的会话用边框包住（否则分不清选的是哪个）
+            bool sel = e.Index == sessionList.SelectedIndex;
+            if (sel)
+            {
+                using (GraphicsPath gp = RoundRect(pill, 10))
+                {
+                    using (SolidBrush b = new SolidBrush(Color.FromArgb(232, 240, 254))) g.FillPath(b, gp);
+                    using (Pen p = new Pen(Color.FromArgb(62, 99, 221), 1.6F)) g.DrawPath(p, gp);
+                }
+            }
             TextRenderer.DrawText(g, s.Title.Length == 0 ? "（无标题会话）" : s.Title, sessionList.Font,
                 new Rectangle(pill.X + 26, pill.Y + 2, pill.Width - 88, pill.Height - 4),
-                s.Archived ? Color.FromArgb(150, 153, 168) : Color.FromArgb(70, 73, 84),
+                sel ? Color.FromArgb(24, 60, 160) : (s.Archived ? Color.FromArgb(150, 153, 168) : Color.FromArgb(70, 73, 84)),
                 TextFormatFlags.EndEllipsis | TextFormatFlags.VerticalCenter);
             TextRenderer.DrawText(g, s.Archived ? "已归档" : RelTime(s.Updated), new Font("Microsoft YaHei UI", 8F),
                 new Rectangle(pill.Right - 58, pill.Y + 7, 50, 18), Color.FromArgb(150, 153, 168), TextFormatFlags.Right);

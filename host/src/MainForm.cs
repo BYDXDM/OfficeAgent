@@ -193,7 +193,7 @@ namespace OfficeAgent.Host
             btnNewChat.Location = new Point(18, 68);
             btnNewChat.Size = new Size(192, 34);
             btnNewChat.Cursor = Cursors.Hand;
-            btnNewChat.Click += delegate { chat.NewConversation(); SelectPage(1); chat.FocusInput(); };
+            btnNewChat.Click += delegate { chat.NewConversation(); SelectPage(1); chat.FocusInput(); sessionList.Invalidate(); };
             sidebar.Controls.Add(btnNewChat);
 
             sessionList = new SideList();
@@ -219,6 +219,7 @@ namespace OfficeAgent.Host
                 SessionInfo si = item as SessionInfo;
                 if (si == null) return;                  // 分隔行等不可点
                 chat.LoadSession(si.Id); SelectPage(1);
+                sessionList.Invalidate();   // 重画：选中高亮外边框要跟着当前会话走
             };
             sessionList.MouseMove += new MouseEventHandler(delegate(object s, MouseEventArgs e) {
                 int idx = sessionList.IndexFromPoint(e.Location);
@@ -457,14 +458,20 @@ namespace OfficeAgent.Host
             }
             SessionInfo s = sessionList.Items[e.Index] as SessionInfo;
             if (s == null) return;
-            // 0.8.4 用户要求：当前选中的会话用边框包住（否则分不清选的是哪个）
-            bool sel = e.Index == sessionList.SelectedIndex;
+            // ★ 当前选中会话用外边框高亮包围（用户要求：范围要明显）。
+            //   注意**不能**用 sessionList.SelectedIndex 判断：该列表在点击后会立刻把
+            //   SelectedIndex 重置为 -1（为避免系统蓝条），所以它恒为 -1，
+            //   0.8.4 加的选中边框因此从来没画出来过（死代码）。改为按**当前会话 id** 比。
+            string curSid = null;
+            try { curSid = chat == null ? null : chat.CurrentSessionId; } catch { }
+            bool sel = curSid != null && curSid.Length > 0 && s.Id == curSid;
             if (sel)
             {
                 using (GraphicsPath gp = RoundRect(pill, 10))
                 {
-                    using (SolidBrush b = new SolidBrush(Color.FromArgb(232, 240, 254))) g.FillPath(b, gp);
-                    using (Pen p = new Pen(Color.FromArgb(62, 99, 221), 1.6F)) g.DrawPath(p, gp);
+                    using (SolidBrush b = new SolidBrush(Color.FromArgb(226, 236, 254))) g.FillPath(b, gp);
+                    // 2px 实线边框：比 1.6px 更醒目，选中范围一眼可辨
+                    using (Pen p = new Pen(Color.FromArgb(62, 99, 221), 2.0F)) g.DrawPath(p, gp);
                 }
             }
             TextRenderer.DrawText(g, s.Title.Length == 0 ? "（无标题会话）" : s.Title, sessionList.Font,
@@ -696,7 +703,7 @@ namespace OfficeAgent.Host
             newConv.BackColor = Color.White;
             newConv.ForeColor = Color.FromArgb(24, 26, 32);
             newConv.Cursor = Cursors.Hand;
-            newConv.Click += delegate { chat.NewConversation(); SelectPage(1); chat.FocusInput(); };
+            newConv.Click += delegate { chat.NewConversation(); SelectPage(1); chat.FocusInput(); sessionList.Invalidate(); };
             p.Controls.Add(tip);
             p.Controls.Add(goChat);
             p.Controls.Add(newConv);

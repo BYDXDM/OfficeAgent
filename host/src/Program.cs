@@ -598,7 +598,7 @@ namespace OfficeAgent.Host
             wobj("Memo2", new int[] { 128, 71, 140, 19 });
             wstr("李奎远");
             wstr("宋体");
-            wobj("Memo3", new int[] { 192, 71, 64, 19 });
+            wobj("Memo3", new int[] { 300, 71, 64, 19 });
             wstr("07:47-     ");
             wstr("宋体");
             wobj("Memo4", new int[] { 256, 71, 64, 19 });
@@ -610,7 +610,7 @@ namespace OfficeAgent.Host
             wobj("Memo6", new int[] { 128, 96, 140, 19 });
             wstr("王五");
             wstr("宋体");
-            wobj("Memo7", new int[] { 192, 96, 64, 19 });
+            wobj("Memo7", new int[] { 300, 96, 64, 19 });
             wstr("     -     ");
             wstr("宋体");
             File.WriteAllBytes(frp, w.ToArray());
@@ -631,6 +631,59 @@ namespace OfficeAgent.Host
                 check("转出内容含标题与人名", wb != null && wb.Contains("员工上下班时间表") && wb.Contains("李奎远"));
                 string missing;
                 check("frp 非法文件给友好报错", FrpReport.ToText(frp + ".nope", out missing) == "" && missing != null);
+            }
+
+            // ===== 考勤分析（analyze_attendance 核心）：扩展合成样例为考勤结构 =====
+            // 员工列 L=376；日期行 01 二/02 三/03 四；工时段含跨零点晚班与无打卡日
+            w.Add(0x19); w.Add(0x00);
+            wstr("虚拟打印机");
+            wobj("Memo20", new int[] { 376, 37, 140, 19 });
+            wstr("李奎远");
+            wstr("宋体");
+            wobj("Memo21", new int[] { 64, 37, 192, 19 });
+            wstr("常白班");
+            wstr("宋体");
+            wobj("Memo30", new int[] { 64, 60, 64, 17 });
+            wstr("01 二");
+            wstr("宋体");
+            wobj("Memo31", new int[] { 128, 60, 64, 17 });
+            wstr("02 三");
+            wstr("宋体");
+            wobj("Memo36", new int[] { 192, 60, 64, 17 });
+            wstr("03 四");
+            wstr("宋体");
+            wobj("Memo33", new int[] { 64, 80, 64, 35 });
+            wstr("07:35-11:40");
+            wstr("宋体");
+            wobj("Memo34", new int[] { 128, 80, 64, 35 });
+            wstr("23:00-07:00");
+            wstr("宋体");
+            wobj("Memo35", new int[] { 192, 80, 64, 35 });
+            wstr("-");
+            wstr("宋体");
+            File.WriteAllBytes(frp, w.ToArray());
+
+            string aerr2;
+            string rep = FrpReport.AnalyzeAttendance(frp, out aerr2);
+            check("考勤解析成功且含员工", aerr2 == null && rep.Contains("李奎远"));
+            Console.WriteLine(rep);   // 报告本体打进测试输出（既是文档也便于排错）
+            // 07:35-11:40 = 4h05m = 4.08；23:00-07:00 跨零点 = 8h；合计 12.08
+            check("工时含跨零点段（12.08 小时）", rep.Contains("12.08"));
+            check("出勤天数=2", rep.Contains("出勤 2 天"));
+            check("03 日(四) 识别为无打卡工作日", rep.Contains("3日(四)") && rep.Contains("无打卡工作日 1 天"));
+            check("口径待确认提示在报告中", rep.Contains("口径"));
+
+            // 真实样例（环境变量 OA_FRP_SAMPLE 指向时才跑，保持测试确定性）
+            string realPath = null;
+            try { realPath = Environment.GetEnvironmentVariable("OA_FRP_SAMPLE"); } catch { }
+            if (realPath != null && File.Exists(realPath))
+            {
+                string rerr;
+                string rrep = FrpReport.AnalyzeAttendance(realPath, out rerr);
+                check("真实样例解析成功", rerr == null && rrep.Length > 100);
+                check("真实样例含已知员工与考期", rrep.Contains("李奎远") && rrep.Contains("2026-09-01"));
+                Console.WriteLine("  （真实样例报告 " + rrep.Length + " 字符）");
+                try { File.WriteAllText(Path.Combine(Path.GetTempPath(), "oa_att_report.txt"), rrep, Encoding.UTF8); } catch { }
             }
 
             Console.WriteLine(failed == 0 ? "frptest ALL PASS" : ("frptest FAILED=" + failed));

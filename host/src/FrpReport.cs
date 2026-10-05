@@ -294,5 +294,348 @@ namespace OfficeAgent.Host
             sheets.Add(sheet);
             return MiniXlsxWrite.Save(outXlsx, sheets);
         }
+
+        // ============================================================
+        // 考勤分析（0.8.5）：从模板对象结构还原「员工 → 日期 → 打卡段」。
+        //
+        // 归属规则（实样验证）：
+        //   名字单元格 = L==376 且纯中文 2-4 字（同位重叠时取流序靠后者=打印在上层）；
+        //   日期行    = 一行内 ≥3 个「DD 星期」形如 "01 二" 的单元格，归属其上方最近的名字；
+        //   打卡段    = 同一列 L、位于该日期行之下、下一日期行之前的对象文本，
+        //               形如 "07:33-11:40"（完整）/"07:47-"（缺下班）/"-07:27"（缺上班，
+        //               晚班跨零点下班）/ "-"（无打卡）；"晚转白/白转晚/常白班" 是班次标记。
+        // 工时口径（确定性部分）：完整段 (end-start)，end<=start 视为跨零点 +24h；
+        //   半段不计工时、列入"打卡不完整"；工作日（一~五）全天无打卡 = 缺勤/请假候选——
+        //   两者无法从打卡数据区分，须由 agent 向用户确认口径（反问铁律）。
+        // ============================================================
+        public class AttDay
+        {
+            public int Day = 0;
+            public string Weekday = "";
+            public List<string> Segments = new List<string>();   // 原始段文本
+            public double Hours = 0;                              // 完整段工时
+            public bool HasIncomplete = false;                    // 有半段打卡
+        }
+
+        public class AttEmp
+        {
+            public string Name = "";
+            public string Shift = "";
+            public List<AttDay> Days = new List<AttDay>();
+            public double TotalHours = 0;
+            public int DaysWorked = 0;
+            public List<string> NoPunchWorkdays = new List<string>();   // 工作日无任何打卡（缺勤/请假候选）
+            public List<string> Incomplete = new List<string>();         // 打卡不完整明细
+        }
+
+        static bool IsDateLabel(string t)
+        {
+            // "01 二" / "9"（个别日期行单元格只剩数字）
+            string s = (t ?? "").Trim();
+            if (s.Length == 0) return false;
+            int sp = s.IndexOf(' ');
+            string num = sp > 0 ? s.Substring(0, sp) : s;
+            if (num.Length == 0 || num.Length > 2) return false;
+            for (int i = 0; i < num.Length; i++) { if (num[i] < '0' || num[i] > '9') return false; }
+            int v = int.Parse(num);
+            if (sp > 0)
+            {
+                string wd = s.Substring(sp + 1).Trim();
+                if (wd.Length == 1 && "一二三四五六日".IndexOf(wd) >= 0) return v >= 1 && v <= 31;
+                return false;
+            }
+            return v >= 1 && v <= 31;
+        }
+
+        static bool IsTimeSeg(string t)
+        {
+            // "HH:MM-HH:MM" / "HH:MM-" / "-HH:MM" / "-"（两侧可带空格）
+            string s = (t ?? "").Trim();
+            if (s.Length == 0) return false;
+            if (s == "-") return true;
+            int dash = s.IndexOf('-');
+            if (dash < 0) return false;
+            string a = s.Substring(0, dash).Trim();
+            string b = s.Substring(dash + 1).Trim();
+            if (a.Length == 0 && b.Length == 0) return true;
+            if (a.Length > 0 && !IsHHMM(a)) return false;
+            if (b.Length > 0 && !IsHHMM(b)) return false;
+            return true;
+        }
+
+        static bool IsHHMM(string s)
+        {
+            if (s == null || s.Length != 5 || s[2] != ':') return false;
+            for (int i = 0; i < 5; i++)
+            {
+                if (i == 2) continue;
+                if (s[i] < '0' || s[i] > '9') return false;
+            }
+            int h = int.Parse(s.Substring(0, 2));
+            int m = int.Parse(s.Substring(3, 2));
+            return h <= 23 && m <= 59;
+        }
+
+        // 段时长（小时）；-1 = 无法计算（半段）
+        static double SegHours(string seg)
+        {
+            string s = (seg ?? "").Trim();
+            if (s == "-") return -1;
+            int dash = s.IndexOf('-');
+            if (dash < 0) return -1;
+            string a = s.Substring(0, dash).Trim();
+            string b = s.Substring(dash + 1).Trim();
+            if (a.Length == 0 || b.Length == 0) return -1;
+            if (!IsHHMM(a) || !IsHHMM(b)) return -1;
+            double ta = int.Parse(a.Substring(0, 2)) + int.Parse(a.Substring(3, 2)) / 60.0;
+            double tb = int.Parse(b.Substring(0, 2)) + int.Parse(b.Substring(3, 2)) / 60.0;
+            if (tb <= ta) tb += 24;   // 晚班跨零点
+            double d = tb - ta;
+            if (d > 16) return -1;    // 超过 16 小时的"段"视为解析异常，不计
+            return d;
+        }
+
+        static bool IsShiftMark(string t)
+        {
+            string s = (t ?? "").Trim();
+            return s == "常白班" || s == "白转晚" || s == "晚转白";
+        }
+
+        static List<AttEmp> ParseAttendance(List<FrpObj> objs, out string period)
+        {
+            period = "";
+            List<FrpObj> withText = new List<FrpObj>();
+            for (int i = 0; i < objs.Count; i++)
+            {
+                string ct = CleanCell(objs[i].Text);
+                if (ct.Length > 0) { objs[i].Text = ct; withText.Add(objs[i]); }
+            }
+            // 考期
+            for (int i = 0; i < withText.Count; i++)
+            {
+                string t = withText[i].Text;
+                int p = t.IndexOf("--");
+                if (p > 4 && t.Length > p + 2)
+                {
+                    string a = t.Substring(0, p).Trim();
+                    string b2 = t.Substring(p + 2).Trim();
+                    if (a.Length >= 8 && b2.Length >= 8 && a[4] == '-' && b2[4] == '-') { period = a + " ~ " + b2; break; }
+                }
+            }
+            // 名字单元格（L=376 纯中文 2-4 字；同位重叠取流序靠后者=打印在上层）。
+            // ★ 模板存在同位叠名的遗留对象（实样：卢忠华/杨春胜、何加纯/凌炜彬、周少宁/莫达华、杨开荣/樊燕芳），
+            //   两名都真实存在于名册时无法从几何判断谁可见——取靠后者并在报告标注，由用户核对。
+            List<FrpObj> names = new List<FrpObj>();
+            for (int i = 0; i < withText.Count; i++)
+            {
+                FrpObj o = withText[i];
+                if (o.L != 376) continue;
+                string t = o.Text.Trim();
+                if (t.Length < 2 || t.Length > 4) continue;
+                bool cjk = true;
+                for (int k = 0; k < t.Length; k++) { if (t[k] < 0x4e00 || t[k] > 0x9fff) { cjk = false; break; } }
+                if (!cjk) continue;
+                bool dup = false;
+                for (int k = 0; k < names.Count; k++)
+                {
+                    if (names[k].T == o.T) { names[k] = o; dup = true; break; }   // 同位重叠：后者在上层
+                }
+                if (!dup) names.Add(o);
+            }
+            StringBuilder overlapped = new StringBuilder();
+            {
+                Dictionary<int, string> seenT = new Dictionary<int, string>();
+                for (int i = 0; i < withText.Count; i++)
+                {
+                    FrpObj o = withText[i];
+                    if (o.L != 376 || o.Text.Trim().Length < 2 || o.Text.Trim().Length > 4) continue;
+                    bool cjk2 = true;
+                    string t2 = o.Text.Trim();
+                    for (int k = 0; k < t2.Length; k++) { if (t2[k] < 0x4e00 || t2[k] > 0x9fff) { cjk2 = false; break; } }
+                    if (!cjk2) continue;
+                    if (seenT.ContainsKey(o.T) && seenT[o.T] != t2)
+                        overlapped.Append(seenT[o.T]).Append("/").Append(t2).Append(" ");
+                    else if (!seenT.ContainsKey(o.T)) seenT[o.T] = t2;
+                }
+            }
+
+            // 员工登记（T → 员工）
+            Dictionary<int, AttEmp> empByT = new Dictionary<int, AttEmp>();
+            List<AttEmp> emps = new List<AttEmp>();
+            foreach (FrpObj nm in names)
+            {
+                AttEmp e = new AttEmp();
+                e.Name = nm.Text.Trim();
+                empByT[nm.T] = e;
+                emps.Add(e);
+            }
+
+            // 全局按 (T,L) 走一遍，模拟读表人：
+            //   日期行（≥3 个「DD 星期」）→ 归属当前员工（其上方最近的名字），并记下列→天号；
+            //   打卡段 → 归属其上方最近的日期行（而不是最近的名字——名字行会与上一员工的时间行重叠）；
+            //   班次标记（常白班/白转晚/晚转白）→ 当前员工。
+            withText.Sort(delegate(FrpObj a, FrpObj c)
+            {
+                if (a.T != c.T) return a.T - c.T;
+                return a.L - c.L;
+            });
+
+            AttEmp curEmp = null;
+            AttEmp rowEmp = null;                 // 当前日期行所属员工
+            Dictionary<int, int> colDay = null;   // 当前日期行：列 L → 天号
+            Dictionary<int, string> colWd = null;
+            Dictionary<string, AttDay> acc = new Dictionary<string, AttDay>();   // (员工,天号) → 日
+            int layerT = -1;
+            List<FrpObj> layer = new List<FrpObj>();
+            Action flushLayer = delegate
+            {
+                if (layer.Count == 0) return;
+                int cnt = 0;
+                foreach (FrpObj o in layer) { if (IsDateLabel(o.Text)) cnt++; }
+                if (cnt >= 3)
+                {
+                    // 新日期行
+                    rowEmp = curEmp;
+                    colDay = new Dictionary<int, int>();
+                    colWd = new Dictionary<int, string>();
+                    foreach (FrpObj o in layer)
+                    {
+                        if (!IsDateLabel(o.Text)) continue;
+                        string s2 = o.Text.Trim();
+                        int sp2 = s2.IndexOf(' ');
+                        int day = int.Parse(sp2 > 0 ? s2.Substring(0, sp2) : s2);
+                        if (!colDay.ContainsKey(o.L)) { colDay[o.L] = day; colWd[o.L] = sp2 > 0 ? s2.Substring(sp2 + 1).Trim() : ""; }
+                    }
+                }
+                else
+                {
+                    // 打卡段层：归当前日期行
+                    if (rowEmp != null && colDay != null)
+                    {
+                        foreach (FrpObj o in layer)
+                        {
+                            if (!colDay.ContainsKey(o.L)) continue;
+                            if (IsDateLabel(o.Text)) continue;
+                            string[] lines = o.Text.Split(new char[] { '\r', '\n' });
+                            for (int li = 0; li < lines.Length; li++)
+                            {
+                                string seg = lines[li].Trim();
+                                if (seg.Length == 0) continue;
+                                if (IsShiftMark(seg)) { if (rowEmp.Shift.Length == 0) rowEmp.Shift = seg; continue; }
+                                if (!IsTimeSeg(seg)) continue;
+                                int day = colDay[o.L];
+                                string key = rowEmp.Name + "#" + day;
+                                if (!acc.ContainsKey(key))
+                                {
+                                    AttDay ad = new AttDay();
+                                    ad.Day = day; ad.Weekday = colWd[o.L];
+                                    acc[key] = ad;
+                                }
+                                if (acc[key].Segments.Count < 4) acc[key].Segments.Add(seg);
+                            }
+                        }
+                    }
+                }
+                layer = new List<FrpObj>();
+            };
+
+            for (int i = 0; i < withText.Count; i++)
+            {
+                FrpObj o = withText[i];
+                if (o.T != layerT) { flushLayer(); layerT = o.T; }
+                // 名字/班次在进入层处理前先结算（名字切换当前员工）
+                if (o.L == 376)
+                {
+                    flushLayer();
+                    if (empByT.ContainsKey(o.T)) curEmp = empByT[o.T];
+                    continue;
+                }
+                if (IsShiftMark(o.Text)) { flushLayer(); if (curEmp != null && curEmp.Shift.Length == 0) curEmp.Shift = o.Text; continue; }
+                layer.Add(o);
+            }
+            flushLayer();
+
+            // 归集：acc → 各员工 Days（按天号排序；同员工同天号来自多个日期行的已在 key 里合并）
+            foreach (AttEmp e in emps)
+            {
+                List<int> ds = new List<int>();
+                Dictionary<int, AttDay> byDay = new Dictionary<int, AttDay>();
+                foreach (KeyValuePair<string, AttDay> kv in acc)
+                {
+                    int hz = kv.Key.IndexOf('#');
+                    if (kv.Key.Substring(0, hz) != e.Name) continue;
+                    int d = int.Parse(kv.Key.Substring(hz + 1));
+                    if (!byDay.ContainsKey(d)) { byDay[d] = kv.Value; ds.Add(d); }
+                }
+                ds.Sort();
+                foreach (int d in ds) e.Days.Add(byDay[d]);
+            }
+            return emps;
+        }
+
+        // 考勤分析报告（agent 转述；请假/缺勤口径由 agent 向用户确认后自行统计）
+        public static string AnalyzeAttendance(string path, out string err)
+        {
+            byte[] b;
+            err = null;
+            try { b = File.ReadAllBytes(path); }
+            catch (Exception ex) { err = "读取失败: " + ex.Message; return ""; }
+            List<FrpObj> objs = ParseObjects(b);
+            if (objs.Count == 0) { err = "不是有效的 frp 模板"; return ""; }
+            string period;
+            List<AttEmp> emps = ParseAttendance(objs, out period);
+            if (emps.Count == 0) { err = "未识别到员工考勤区块"; return ""; }
+
+            StringBuilder sb = new StringBuilder();
+            sb.Append("考勤解析结果（frp 打印模板）");
+            if (period.Length > 0) sb.Append("　考期：" + period);
+            sb.Append("\n口径说明：工时=完整打卡段之和（晚班跨零点自动 +24h）；\"HH:MM-\"或\"-HH:MM\"=打卡不完整，不计工时；");
+            sb.Append("工作日（一~五）全天无打卡列为「无打卡工作日」——缺勤还是请假无法从打卡数据区分，需向用户确认口径后统计。\n");
+            int ti2 = 0;
+            foreach (AttEmp e in emps)
+            {
+                e.TotalHours = 0; e.DaysWorked = 0; e.NoPunchWorkdays = new List<string>(); e.Incomplete = new List<string>();
+                foreach (AttDay d in e.Days)
+                {
+                    double dayH = 0;
+                    foreach (string s in d.Segments)
+                    {
+                        double h = SegHours(s);
+                        if (h >= 0) dayH += h;
+                        else if (s != "-") d.HasIncomplete = true;
+                    }
+                    d.Hours = Math.Round(dayH, 2);
+                    if (dayH > 0) e.DaysWorked++;
+                    string tag = d.Day + "日(" + (d.Weekday.Length == 0 ? "?" : d.Weekday) + ")";
+                    if (d.Segments.Count == 0 || (d.Segments.Count == 1 && d.Segments[0] == "-"))
+                    {
+                        if (d.Weekday != "六" && d.Weekday != "日") e.NoPunchWorkdays.Add(tag);
+                    }
+                    if (d.HasIncomplete) e.Incomplete.Add(tag + "[" + string.Join("/", d.Segments.ToArray()) + "]");
+                    e.TotalHours += dayH;
+                }
+                ti2++;
+                sb.Append("\n【" + e.Name + "】" + (e.Shift.Length > 0 ? "（" + e.Shift + "）" : "")
+                    + " 出勤 " + e.DaysWorked + " 天，工时 " + Math.Round(e.TotalHours, 2) + " 小时");
+                List<string> np = new List<string>();
+                for (int k = 0; k < e.NoPunchWorkdays.Count; k++) { if (!np.Contains(e.NoPunchWorkdays[k])) np.Add(e.NoPunchWorkdays[k]); }
+                List<string> ic = new List<string>();
+                for (int k = 0; k < e.Incomplete.Count; k++) { if (!ic.Contains(e.Incomplete[k])) ic.Add(e.Incomplete[k]); }
+                if (np.Count > 0)
+                    sb.Append("；无打卡工作日 " + np.Count + " 天（" + string.Join("、", np.ToArray()) + "）");
+                if (ic.Count > 0)
+                    sb.Append("；打卡不完整 " + ic.Count + " 处（" + string.Join("、", ic.ToArray()) + "）");
+                // 每日明细（供 agent 按用户口径统计请假/缺勤）
+                StringBuilder det = new StringBuilder();
+                foreach (AttDay d in e.Days)
+                {
+                    det.Append(d.Day + "日" + (d.Weekday.Length == 0 ? "" : d.Weekday) + ":"
+                        + (d.Segments.Count == 0 ? "-" : string.Join("/", d.Segments.ToArray())) + " ");
+                }
+                if (det.Length > 0) sb.Append("\n  明细：" + det.ToString().TrimEnd());
+            }
+            sb.Append("\n（共 " + ti2 + " 名员工。请假次数/缺勤扣时需用户口径：无打卡工作日算缺勤还是请假？请假标记是什么？标准日工时多少？）");
+            return sb.ToString();
+        }
     }
 }

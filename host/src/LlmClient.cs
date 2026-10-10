@@ -154,7 +154,7 @@ namespace OfficeAgent.Host
             return b.Contains("bigmodel.cn") || b.Contains("zhipu");
         }
 
-        static string WebSearchToolsJson()
+        internal static string WebSearchToolsJson()
         {
             return "[{\"type\":\"web_search\",\"web_search\":{\"enable\":true}}]";
         }
@@ -669,7 +669,13 @@ namespace OfficeAgent.Host
                     case '\n': sb.Append("\\n"); break;
                     case '\r': sb.Append("\\r"); break;
                     case '\t': sb.Append("\\t"); break;
-                    default: sb.Append(ch); break;
+                    default:
+                        // 其余控制字符（0x00-0x1F）在 JSON 里必须写成 \uXXXX：原样输出会让
+                        // **整个请求体**非法（网关 400 "Unrecognized character"），
+                        // 而工具结果里完全可能带回文件里的控制字节。
+                        if (ch < ' ') sb.Append("\\u").Append(((int)ch).ToString("x4"));
+                        else sb.Append(ch);
+                        break;
                 }
             }
             return sb.ToString();

@@ -51,11 +51,11 @@ namespace OfficeAgent.Host
             return Run(client, config, sysPrompt, userPayload, onToolLog, onPlanTool, history, null);
         }
 
-        public static Result Run(LlmClient client, AppConfig config, string sysPrompt, string userPayload,
-            Action<string> onToolLog, Func<string, string> onPlanTool,
-            System.Collections.Generic.IEnumerable<LlmTurn> history, Action<string> onDelta)
+        // 发给模型的工具清单（内置 schema + 技能投影）拼成一个 JSON 数组。
+        // 抽出来是为了让 /jsontest 能直接校验这份 JSON——它是手写的字符串常量，
+        // 少写一个反斜杠就会让整个请求被网关 400 拒绝（v0.9.8 前的真实事故）。
+        internal static string BuildToolsJson(AppConfig config)
         {
-            Result r = new Result();
             string tools = AgentTools.SchemasJson(config != null && config.PluginPlan);
             // 技能工具（规划层第一期）：把 skills 注册表投影成额外的 function-calling 工具，
             // 让模型能直接调用会计/Excel/Word 技能，而不是只会用 CSV 文本糊表。
@@ -63,6 +63,15 @@ namespace OfficeAgent.Host
             string skillTools = AgentTools.SkillSchemasJson(EnvDetect.FindRoot());
             if (skillTools != null && skillTools.Length > 0 && tools != null && tools.Length > 0)
                 tools = tools.Substring(0, tools.Length - 1) + "," + skillTools + "]";
+            return tools;
+        }
+
+        public static Result Run(LlmClient client, AppConfig config, string sysPrompt, string userPayload,
+            Action<string> onToolLog, Func<string, string> onPlanTool,
+            System.Collections.Generic.IEnumerable<LlmTurn> history, Action<string> onDelta)
+        {
+            Result r = new Result();
+            string tools = BuildToolsJson(config);
             List<string> products = new List<string>();
             ConvertEngine conv = new ConvertEngine();
             conv.SofficePath = ConvertEngine.FindSoffice(EnvDetect.FindRoot());

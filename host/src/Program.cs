@@ -51,6 +51,7 @@ namespace OfficeAgent.Host
             bool bridgeTest = false;
             bool planTest = false;
         bool perfTest = false;
+            bool jsonTest = false;
             string[] skillRunArgs = null;
             string[] agentTestArgs = null;
             string[] reconArgs = null;
@@ -81,6 +82,7 @@ namespace OfficeAgent.Host
                 else if (a == "/bridgetest") bridgeTest = true;
                 else if (a == "/plantest") planTest = true;
         else if (a == "/perftest") perfTest = true;
+                else if (a == "/jsontest") jsonTest = true;
                 else if (a == "/skillrun")
                 {
                     List<string> rest = new List<string>();
@@ -116,7 +118,7 @@ namespace OfficeAgent.Host
 
             // CLI 无头链同样落审计（设计方案 §7.3：每个动作可审计；GUI 的 app_start 在 MainForm）
             if (selftest || guardTest || maskTest || intentTest || suggestTest || skillTest || caretTest
-                || auditTest || detectTest || bridgeTest || planTest || perfTest || toolidTest || urlTest || frpTest || dropTest || formulaTest
+                || auditTest || detectTest || bridgeTest || planTest || perfTest || jsonTest || toolidTest || urlTest || frpTest || dropTest || formulaTest
                 || safetyTest || menuTest
                 || gridTestInput != null
                 || skillRunArgs != null || agentTestArgs != null || reconArgs != null || mergeArgs != null
@@ -286,6 +288,14 @@ namespace OfficeAgent.Host
                 try { AllocConsole(); } catch { }
                 try { Console.OutputEncoding = Encoding.UTF8; } catch { }
                 return RunPerfTest();
+            }
+
+            if (jsonTest)
+            {
+                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
+                try { AllocConsole(); } catch { }
+                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                return RunJsonTest();
             }
 
             if (skillRunArgs != null)
@@ -1992,6 +2002,142 @@ namespace OfficeAgent.Host
     //   ② 磁盘检测阈值恰好卡在 2GB，可用空间在阈值上下浮动时会 Ok↔Missing 抖动。
     //      迟滞的高低水位算错过一次（5L/2 整数除法 → 高水位退化为 2GB，迟滞为零）。
     // 本用例把这些语义钉住，防止回归。
+    // /jsontest —— 请求体 JSON 合法性自测（2026-10-05 真机事故的回归闸门）。
+    // 事故：AgentTools 的手写 schema 里「下载\表格」漏写一个反斜杠 → 请求体出现非法转义
+    // `\表`，网关回 HTTP 400 "Unrecognized character escape"，只有服务端堆栈、指不到源头，
+    // 用户侧表现为「转换失败／表做不出来」。两条防线：先证明校验器抓得住这个错，
+    // 再把三条真实链路（工具 schema／联网搜索工具／消息体）逐个验一遍。
+    static int RunJsonTest()
+    {
+        int failed = 0;
+        const string BS = "\\";    // 一个字面反斜杠
+
+        // ── 0. 校验器自身的可信度 ────────────────────────────────────────────
+        // 反向对照：必须抓出事故里那串非法转义。少了这条，「校验器写得太松」会让后面
+        // 所有 [OK] 全部失去意义。
+        string badLit = MiniJson.Validate("{\"a\":\"" + BS + "表\"}");
+        bool t0 = badLit != null;
+        if (!t0) failed++;
+        Console.WriteLine((t0 ? "[OK]  " : "[FAIL] ") + "反向对照：裸反斜杠+汉字判为非法" +
+            (t0 ? "（" + badLit + "）" : "—— 竟然判为合法，后面的结论都不可信"));
+
+        string goodLit = MiniJson.Validate("{\"a\":\"" + BS + BS + "表格\"}");
+        bool t0b = goodLit == null;
+        if (!t0b) failed++;
+        Console.WriteLine((t0b ? "[OK]  " : "[FAIL] ") + "双反斜杠（修复后的形状）判为合法" +
+            (t0b ? "" : "：" + goodLit));
+
+        string[] okSamples = { "{}", "[]", "123", "-0.5e10", "\"\"", "{\"a\":[1,2,3]}", "[true,false,null]" };
+        string[] badSamples = { "{", "{\"a\":}", "{\"a\":1,}", "[1,2", "\"x", "{\"a\"1}", "01x", "{} {}" };
+        int okGood = 0, okBad = 0;
+        for (int i = 0; i < okSamples.Length; i++) if (MiniJson.Validate(okSamples[i]) == null) okGood++;
+        for (int i = 0; i < badSamples.Length; i++) if (MiniJson.Validate(badSamples[i]) != null) okBad++;
+        bool t0c = okGood == okSamples.Length && okBad == badSamples.Length;
+        if (!t0c) failed++;
+        Console.WriteLine((t0c ? "[OK]  " : "[FAIL] ") + "校验器边界样本：合法 " + okGood + "/" +
+            okSamples.Length + " 通过，非法 " + okBad + "/" + badSamples.Length + " 被拒");
+
+        // ── 1. 内置工具 schema ──────────────────────────────────────────────
+        string e1 = MiniJson.Validate(AgentTools.SchemasJson(false));
+        bool t1 = e1 == null;
+        if (!t1) failed++;
+        Console.WriteLine((t1 ? "[OK]  " : "[FAIL] ") + "内置工具 schema（不含 task_plan）合法" +
+            (t1 ? "" : "：" + e1));
+
+        string e2 = MiniJson.Validate(AgentTools.SchemasJson(true));
+        bool t2 = e2 == null;
+        if (!t2) failed++;
+        Console.WriteLine((t2 ? "[OK]  " : "[FAIL] ") + "内置工具 schema（含 task_plan）合法" +
+            (t2 ? "" : "：" + e2));
+
+        // ── 2. 技能工具投影（本机无技能时是空串） ────────────────────────────
+        string sk = AgentTools.SkillSchemasJson(EnvDetect.FindRoot());
+        if (sk == null || sk.Length == 0)
+            Console.WriteLine("[OK]  技能工具投影为空（本机无技能，无需拼接）");
+        else
+        {
+            string e3 = MiniJson.Validate("[" + sk + "]");
+            bool t3 = e3 == null;
+            if (!t3) failed++;
+            Console.WriteLine((t3 ? "[OK]  " : "[FAIL] ") + "技能工具 schema 合法（" + sk.Length + " 字符）" +
+                (t3 ? "" : "：" + e3));
+        }
+
+        // ── 3. 真正发给模型的合并结果 + 联网搜索工具 ─────────────────────────
+        string e4 = MiniJson.Validate(AgentLoop.BuildToolsJson(null));
+        bool t4 = e4 == null;
+        if (!t4) failed++;
+        Console.WriteLine((t4 ? "[OK]  " : "[FAIL] ") + "AgentLoop.BuildToolsJson 合法" + (t4 ? "" : "：" + e4));
+
+        string e5 = MiniJson.Validate(LlmClient.WebSearchToolsJson());
+        bool t5 = e5 == null;
+        if (!t5) failed++;
+        Console.WriteLine((t5 ? "[OK]  " : "[FAIL] ") + "联网搜索工具 schema 合法" + (t5 ? "" : "：" + e5));
+
+        // ── 4. 消息体：最脏的内容走一遍转义 ──────────────────────────────────
+        // 反斜杠（事故那串的来源）、结尾反斜杠、引号、换行、制表符、控制字符 0x01
+        // （旧版 JsonEscape 不转义它 → 整个请求体非法）、中文、emoji 代理对。
+        string dirty = "反斜杠" + BS + "表 尾部" + BS + " 引号\" 换行\n 制表\t 控制\u0001 汉字表 emoji\ud83d\ude00";
+        List<LlmTurn> turns = new List<LlmTurn>();
+        turns.Add(new LlmTurn("system", dirty));
+        turns.Add(new LlmTurn("user", dirty));
+        turns.Add(new LlmTurn("tool@call_1", dirty));
+        string msgs = LlmClient.BuildMessagesJson(dirty, turns);
+        string e6 = MiniJson.Validate(msgs);
+        bool t6 = e6 == null;
+        if (!t6) failed++;
+        Console.WriteLine((t6 ? "[OK]  " : "[FAIL] ") + "消息体（脏内容 system/user/tool）合法" +
+            (t6 ? "" : "：" + e6));
+
+        string e7 = MiniJson.Validate("{\"model\":\"test\",\"messages\":" + msgs + "}");
+        bool t7 = e7 == null;
+        if (!t7) failed++;
+        Console.WriteLine((t7 ? "[OK]  " : "[FAIL] ") + "完整请求体（model+messages）合法" +
+            (t7 ? "" : "：" + e7));
+
+        // 往返一致：解析回来必须一字不差——证明转义不是「看起来合法但改了内容」。
+        List<Dictionary<string, string>> parsed = MiniJson.ParseObjects(msgs);
+        bool t8 = parsed.Count == 4;
+        if (t8)
+        {
+            t8 = MiniJson.Get(parsed[0], "role") == "system"
+              && MiniJson.Get(parsed[0], "content") == dirty
+              && MiniJson.Get(parsed[2], "role") == "user"
+              && MiniJson.Get(parsed[2], "content") == dirty
+              && MiniJson.Get(parsed[3], "role") == "tool"
+              && MiniJson.Get(parsed[3], "tool_call_id") == "call_1"
+              && MiniJson.Get(parsed[3], "content") == dirty;
+        }
+        if (!t8) failed++;
+        Console.WriteLine((t8 ? "[OK]  " : "[FAIL] ") + "转义往返一致（4 条消息内容原样还原）" +
+            (t8 ? "" : "：只解析出 " + parsed.Count + " 条"));
+
+        // ── 5. assistant_raw 原样回显（带 tool_calls 的原始消息） ────────────
+        string rawArgs = "{" + BS + "\"path" + BS + "\":" + BS + "\"a.xlsx" + BS + "\"}";
+        string rawMsg = "{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\","
+            + "\"type\":\"function\",\"function\":{\"name\":\"create_spreadsheet\",\"arguments\":\""
+            + rawArgs + "\"}}]}";
+        bool t9 = MiniJson.Validate(rawMsg) == null;
+        if (!t9) failed++;
+        Console.WriteLine((t9 ? "[OK]  " : "[FAIL] ") + "自测样本自身（assistant_raw 原始消息）合法");
+
+        if (t9)
+        {
+            List<LlmTurn> turns2 = new List<LlmTurn>();
+            turns2.Add(new LlmTurn("user", "hi"));
+            turns2.Add(new LlmTurn("assistant_raw", rawMsg));
+            string msgs2 = LlmClient.BuildMessagesJson("sys", turns2);
+            string e9 = MiniJson.Validate(msgs2);
+            bool t10 = e9 == null && msgs2.IndexOf(rawMsg) >= 0;
+            if (!t10) failed++;
+            Console.WriteLine((t10 ? "[OK]  " : "[FAIL] ") + "assistant_raw 原样回显后仍合法且未改内容" +
+                (t10 ? "" : "：" + (e9 != null ? e9 : "内容未原样保留")));
+        }
+
+        Console.WriteLine(failed == 0 ? "jsontest ALL PASS" : ("jsontest FAILED=" + failed));
+        return failed == 0 ? 0 : 2;
+    }
+
     static int RunDetectTest()
     {
         int failed = 0;

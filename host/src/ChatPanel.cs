@@ -114,9 +114,22 @@ namespace OfficeAgent.Host
         int copyOnBtnIdx = -1;        // 悬停位置是否正落在该条的复制按钮上
         Rectangle copyBtnRect;        // 复制按钮命中区（每次绘制后更新）
         int copyBtnMsg = -1;          // copyBtnRect 属于哪条消息
+        int copyDoneIdx = -1;         // 刚复制过的消息（按钮提示从「复制」切成「已复制」）
 
         int LeftMargin() { return (list.Width > 900) ? 170 : 20; }
         int AvailWidth() { return Math.Min(MaxTextWidth, Math.Max(200, list.Width - LeftMargin() - 60)); }
+
+        // 局部重绘：只刷某一条消息的条目矩形。整表 list.Invalidate() 会让原生 ListBox
+        // 先擦背景再逐条重画，拖选/悬停时整屏发白闪一下（真机反馈「选中对话框时会闪烁」）。
+        void InvalidateItem(int idx)
+        {
+            if (idx < 0 || idx >= msgs.Count) { list.Invalidate(); return; }
+            Rectangle r;
+            try { r = list.GetItemRectangle(idx); }
+            catch { list.Invalidate(); return; }
+            if (r.Height <= 0) { list.Invalidate(); return; }
+            list.Invalidate(r);
+        }
 
         // 单块气泡的文本高度上限：大屏用固定值；列表视口更矮时随之收缩。
         // ListBox 滚到底时视口只能停在一个条目的顶部，条目本身比视口高的话，
@@ -195,14 +208,22 @@ namespace OfficeAgent.Host
                 if (e.Button != MouseButtons.Left) return;
                 int idx = list.IndexFromPoint(e.Location);
                 if (idx < 0 || idx >= msgs.Count) return;
-                if (copyBtnMsg == idx && copyBtnRect.Contains(e.Location)) { CopyMsgText(idx); return; }
+                if (copyBtnMsg == idx && copyBtnRect.Contains(e.Location))
+                {
+                    copyDoneIdx = idx;                 // 提示切到「已复制」
+                    CopyMsgText(idx);
+                    InvalidateItem(idx);
+                    return;
+                }
                 if (msgs[idx].AttachPath.Length > 0) return;      // 附件卡片不参与选词
                 int ci = CharIndexAt(idx, e.Location);
                 if (ci < 0) return;
+                int prevSel = selIdx;
                 ClearAllSel();
                 selIdx = idx; selAnchor = ci; selDragging = true;
                 msgs[idx].SelStart = ci; msgs[idx].SelLen = 0;
-                list.Invalidate();
+                if (prevSel >= 0 && prevSel != idx) InvalidateItem(prevSel);
+                InvalidateItem(idx);
             };
             // 移动：悬停（复制按钮）+ 拖选扩展
             list.MouseMove += delegate(object s, MouseEventArgs e)
@@ -211,9 +232,11 @@ namespace OfficeAgent.Host
                 int onBtn = (idx >= 0 && idx == copyBtnMsg && copyBtnRect.Contains(e.Location)) ? idx : -1;
                 if (idx != copyHoverIdx || onBtn != copyOnBtnIdx)
                 {
+                    int oldHover = copyHoverIdx;
                     copyHoverIdx = idx; copyOnBtnIdx = onBtn;
                     try { list.Cursor = onBtn >= 0 ? Cursors.Hand : Cursors.Default; } catch { }
-                    list.Invalidate();
+                    if (oldHover >= 0 && oldHover != idx) InvalidateItem(oldHover);
+                    InvalidateItem(idx);
                 }
                 if (selDragging && selIdx >= 0 && selIdx < msgs.Count)
                 {
@@ -222,7 +245,7 @@ namespace OfficeAgent.Host
                     {
                         int a = Math.Min(selAnchor, ci), z = Math.Max(selAnchor, ci);
                         msgs[selIdx].SelStart = a; msgs[selIdx].SelLen = z - a;
-                        list.Invalidate();
+                        InvalidateItem(selIdx);
                     }
                 }
             };
@@ -230,16 +253,18 @@ namespace OfficeAgent.Host
             {
                 if (e.Button != MouseButtons.Left || !selDragging) return;
                 selDragging = false;
+                int prevSel = selIdx;
                 if (selIdx >= 0 && selIdx < msgs.Count && !msgs[selIdx].HasSel) selIdx = -1;
-                list.Invalidate();
+                InvalidateItem(prevSel);
             };
             list.MouseLeave += delegate
             {
                 if (copyHoverIdx != -1 || copyOnBtnIdx != -1)
                 {
+                    int oldHover = copyHoverIdx;
                     copyHoverIdx = -1; copyOnBtnIdx = -1;
                     try { list.Cursor = Cursors.Default; } catch { }
-                    list.Invalidate();
+                    InvalidateItem(oldHover);
                 }
             };
             list.KeyDown += delegate(object s, KeyEventArgs e)
@@ -249,7 +274,12 @@ namespace OfficeAgent.Host
                     string sel = SelectedTextOf();
                     if (sel.Length > 0) { try { Clipboard.SetText(sel); } catch { } e.Handled = true; }
                 }
-                else if (e.KeyCode == Keys.Escape && selIdx >= 0) { ClearAllSel(); list.Invalidate(); }
+                else if (e.KeyCode == Keys.Escape && selIdx >= 0)
+                {
+                    int prevSel = selIdx;
+                    ClearAllSel();
+                    InvalidateItem(prevSel);
+                }
             };
             Controls.Add(list);
 
@@ -2486,11 +2516,13 @@ namespace OfficeAgent.Host
             m.CachedTextW = Math.Max(60, Math.Min(avail, ts.Width + 2 * TextInsetX + 8));
             string header = (m.User ? "你" : "助手") + "  " + m.Time;
             m.CachedHeaderW = TextRenderer.MeasureText(header, NameFont).Width;
-            // Last 条多留 ~30px：悬停时在气泡**下方**画「一键复制」按钮（0.9.7）。
-            // 按钮底 = top + textH + 20 + 2 + 20，故末条至少要留到 textH+48。
-            if (m.First && m.Last) m.CachedHeight = 34 + m.CachedTextH + 16 + 20;
+            // Last 条要留出「一键复制」按钮 + 悬停提示的整段高度（0.9.7）。
+            // 按钮 20 + 间隙 2/3 + 提示约 23 + 余量，共约 50px：旧版只留到按钮底
+            // （textH+48），提示会越出条目矩形，被 g.SetClip 裁掉、又被下一行的白底盖住
+            // ——真机反馈「复制完的提示会被遮挡」（2026-10-05）。
+            if (m.First && m.Last) m.CachedHeight = 34 + m.CachedTextH + 16 + 42;
             else if (m.First) m.CachedHeight = 34 + m.CachedTextH + 4;
-            else if (m.Last) m.CachedHeight = m.CachedTextH + 14 + 36;
+            else if (m.Last) m.CachedHeight = m.CachedTextH + 14 + 58;
             else m.CachedHeight = m.CachedTextH + 4;
             m.CachedAvail = avail;
         }
@@ -2683,7 +2715,7 @@ namespace OfficeAgent.Host
                 TextRenderer.DrawText(g, m.Text, TextFont, trU,
                     Color.FromArgb(20, 40, 90),
                     TextFormatFlags.WordBreak | TextFormatFlags.VerticalCenter);
-                DrawCopyButton(g, e.Index, m, bubble);
+                DrawCopyButton(g, e.Index, m, bubble, e.Bounds);
             }
             else
             {
@@ -2705,13 +2737,13 @@ namespace OfficeAgent.Host
                 TextRenderer.DrawText(g, m.Text, TextFont, trA,
                     m.Error ? Color.FromArgb(178, 58, 58) : Color.FromArgb(28, 30, 38),
                     TextFormatFlags.WordBreak | TextFormatFlags.VerticalCenter);
-                DrawCopyButton(g, e.Index, m, bubble);
+                DrawCopyButton(g, e.Index, m, bubble, e.Bounds);
             }
             g.ResetClip();
         }
 
         // 悬停时在气泡**下方左侧**画「一键复制」按钮 + 「复制」提示（0.9.7 用户要求，参照其截图）
-        void DrawCopyButton(Graphics g, int idx, ChatMsg m, Rectangle bubble)
+        void DrawCopyButton(Graphics g, int idx, ChatMsg m, Rectangle bubble, Rectangle itemBounds)
         {
             if (m.AttachPath.Length > 0) return;
             if (!m.Last) return;          // 只在分块末条显示，避免一条消息出现多个按钮
@@ -2736,9 +2768,14 @@ namespace OfficeAgent.Host
             }
             if (on)
             {
-                string tip = "复制";
+                string tip = (idx == copyDoneIdx) ? "已复制" : "复制";
                 Size ts = TextRenderer.MeasureText(tip, NameFont);
-                Rectangle tr = new Rectangle(btn.X + (bw - ts.Width) / 2 - 5, btn.Bottom + 3, ts.Width + 10, ts.Height + 6);
+                int ty = btn.Bottom + 3;
+                // 兜底夹紧：即便条目预留高度算错，提示也不许越出条目矩形
+                // （越界 = 被 g.SetClip 裁掉 + 被下一行的白底覆盖）
+                if (ty + ts.Height + 6 > itemBounds.Bottom - 2)
+                    ty = itemBounds.Bottom - 2 - (ts.Height + 6);
+                Rectangle tr = new Rectangle(btn.X + (bw - ts.Width) / 2 - 5, ty, ts.Width + 10, ts.Height + 6);
                 using (GraphicsPath gp = RoundRect(tr, 4))
                 using (SolidBrush b = new SolidBrush(Color.FromArgb(46, 48, 58))) g.FillPath(b, gp);
                 TextRenderer.DrawText(g, tip, NameFont, tr, Color.White,
@@ -2797,6 +2834,44 @@ namespace OfficeAgent.Host
                 ItemHeight = 60;
                 IntegralHeight = false;
                 SelectionMode = SelectionMode.None;   // 自绘气泡无选中概念；禁用后系统蓝条不再穿模
+            }
+
+            [StructLayout(LayoutKind.Sequential)]
+            struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+
+            [DllImport("user32.dll")]
+            static extern bool GetUpdateRect(IntPtr hWnd, out RECT lpRect, bool bErase);
+
+            // 原生 ListBox 自己处理 WM_PAINT，构造函数里那两个 SetStyle 其实不生效：每次重绘都会
+            // 先 WM_ERASEBKGND 把待绘区域擦成白底，再逐条自绘 → 选中/悬停时那一行先白一下再变回来，
+            // 就是肉眼看到的闪烁（真机反馈「选中对话框时会闪烁」，2026-10-05）。
+            // 这里在**待擦区域完全落在条目带内**时跳过擦背景：自绘分支会用 BackColor 铺满 e.Bounds，
+            // 整块区域仍会被画满，不留残影；一旦区域越出条目带（列表末尾空白、滚动条、空列表）就照
+            // 原样擦，避免留下未绘制像素。
+            // ★ 不要改用 WS_EX_COMPOSITED：实测给这个控件加该扩展样式会让 CreateWindowEx 直接失败
+            //   （Win32Exception「创建窗口句柄时出错」），整个窗口都建不出来（droptest 复现）。
+            protected override void WndProc(ref Message m)
+            {
+                if (m.Msg == 0x0014 && Items.Count > 0)   // WM_ERASEBKGND
+                {
+                    try
+                    {
+                        RECT r;
+                        if (GetUpdateRect(Handle, out r, false))
+                        {
+                            Rectangle first = GetItemRectangle(0);
+                            Rectangle last = GetItemRectangle(Items.Count - 1);
+                            if (r.Top >= first.Top && r.Bottom <= last.Bottom &&
+                                r.Left >= first.Left && r.Right <= first.Right)
+                            {
+                                m.Result = (IntPtr)1;   // 已处理：不擦背景
+                                return;
+                            }
+                        }
+                    }
+                    catch { }
+                }
+                base.WndProc(ref m);
             }
         }
 

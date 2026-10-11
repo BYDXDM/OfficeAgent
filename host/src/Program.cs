@@ -77,7 +77,12 @@ namespace OfficeAgent.Host
                 else if (a == "/formulatest") formulaTest = true;
                 else if (a == "/gridtest" && i + 1 < args.Length) { gridTestInput = args[i + 1]; i += 1; }
                 else if (a == "/skilltest") skillTest = true;
-                else if (a == "/audittest") auditTest = true;
+                else if (a == "/audittest")
+                {
+                    auditTest = true;
+                    // 自测隔离：重定向审计目录，必须赶在下面那句 AuditLog.Record("app_start","cli") 之前生效。
+                    AuditLog.DirOverride = Path.Combine(Path.GetTempPath(), "oa_audittest");
+                }
                 else if (a == "/detecttest") detectTest = true;
                 else if (a == "/bridgetest") bridgeTest = true;
                 else if (a == "/plantest") planTest = true;
@@ -2217,6 +2222,13 @@ namespace OfficeAgent.Host
     static int RunAuditTest()
     {
         int failed = 0;
+        // 每次从空目录开跑：断言的是"这一轮 8 线程写入后链自洽"，不是历史累积。
+        // 重定向已由参数解析处设置（必须早于 app_start 那句 Record）。
+        try
+        {
+            if (Directory.Exists(AuditLog.Dir())) Directory.Delete(AuditLog.Dir(), true);
+        }
+        catch (Exception ex) { Console.WriteLine("[WARN] 清理自测审计目录失败: " + ex.Message); }
         Console.WriteLine("审计文件: " + AuditLog.FilePath());
 
         // 1. 多线程并发写入（同进程内）

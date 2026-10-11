@@ -292,13 +292,32 @@ namespace OfficeAgent.Core
             }
             list.Add(py);
 
-            // 后续版本组件（M1/M2 落地，不阻塞 M0 全绿）
+            // 离线 wheel 仓：**既要缓存齐、也要已装进 runtime**。
+            // 曾经这里只报"缓存有没有"，于是 store\wheels 一直躺着 22 个 whl 而没人解压，
+            // 技能一跑就 No module named 'openpyxl'（/plantest 四项红）。现在按"已装"判定。
             DetectItem wheels = new DetectItem();
-            wheels.Id = "wheels"; wheels.Name = "离线 wheel 仓（技能依赖）"; wheels.Order = 11;
-            wheels.State = DetectState.Info;
+            wheels.Id = "wheels"; wheels.Name = "技能依赖 wheel（openpyxl 等）"; wheels.Order = 11;
             string whlDir = Path.Combine(Path.Combine(root, "store"), "wheels");
-            wheels.Detail = Directory.Exists(whlDir) && Directory.GetFiles(whlDir, "*.whl").Length > 0
-                ? "已有 wheel 缓存" : "M2 组件：tools\\download-payload 或 pip download 填充 store\\wheels";
+            string siteDir = Path.Combine(Path.Combine(Path.Combine(Path.Combine(root, "runtime"), "py38"),
+                "Lib"), "site-packages");
+            int whlCount = Directory.Exists(whlDir) ? Directory.GetFiles(whlDir, "*.whl").Length : 0;
+            if (whlCount == 0)
+            {
+                // 没有缓存就无从解压，报 Info 而不是 Missing——否则会反复弹一个修不好的窗口
+                wheels.State = DetectState.Info;
+                wheels.Detail = "M2 组件：tools\\download-payload 或 pip download 填充 store\\wheels";
+            }
+            else if (Directory.Exists(Path.Combine(siteDir, "openpyxl")))
+            {
+                wheels.State = DetectState.Ok;
+                wheels.Detail = "已装入 runtime\\py38\\Lib\\site-packages（store\\wheels 缓存 " + whlCount + " 个）";
+            }
+            else
+            {
+                // 以 openpyxl 作哨兵：它是技能脚本最常用的依赖，缺它 /plantest 必红
+                wheels.State = DetectState.Missing; wheels.FixKey = "install_wheels";
+                wheels.Detail = "缓存 " + whlCount + " 个 whl 但未装入 runtime\\py38\\Lib\\site-packages，解压即可补全";
+            }
             list.Add(wheels);
 
             DetectItem lo = new DetectItem();

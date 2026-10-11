@@ -72,6 +72,8 @@ namespace OfficeAgent.Boot
                         return UnpackPy38(root);
                     case "unpack_lo76":
                         return UnpackLo76(root);
+                    case "install_wheels":
+                        return InstallWheels(root);
                     default:
                         return "未知修复动作 " + item.FixKey;
                 }
@@ -179,6 +181,32 @@ namespace OfficeAgent.Boot
             if (zips.Length == 0) return "payload\\lo76 下没有 zip（M1 组件，暂可跳过）";
             string target = Path.Combine(root, "lo76");
             return Unzip.Extract(zips[0], target, 600000);
+        }
+
+        // 技能依赖：把 store\wheels 下的 wheel 逐个解压进 site-packages。
+        // wheel 本身就是 zip，直接平铺解压即可 import（少数 .data/ 目录不影响导入），
+        // 因此不需要 pip，也不需要新增进程启动点（红线：子进程只走 ProcRunner 白名单）。
+        // 两个架构变体成对存放，按本机位宽只解一侧；其余 py3-none-any 架构无关，全解。
+        static string InstallWheels(string root)
+        {
+            string dir = Path.Combine(Path.Combine(root, "store"), "wheels");
+            if (!Directory.Exists(dir)) return "离线 wheel 缺失: store\\wheels";
+            string skip = EnvDetect.Is64OS() ? "-win32.whl" : "-win_amd64.whl";
+            string site = Path.Combine(Path.Combine(Path.Combine(Path.Combine(root, "runtime"), "py38"),
+                "Lib"), "site-packages");
+            int ok = 0;
+            string firstErr = null;
+            foreach (string f in Directory.GetFiles(dir, "*.whl"))
+            {
+                if (!f.EndsWith(".whl", StringComparison.OrdinalIgnoreCase)) continue;
+                if (f.EndsWith(skip, StringComparison.OrdinalIgnoreCase)) continue;
+                string err = Unzip.Extract(f, site, 180000);
+                if (err == null) ok++;
+                else if (firstErr == null) firstErr = Path.GetFileName(f) + " — " + err;
+            }
+            if (ok == 0) return firstErr == null ? "store\\wheels 下没有可解压的 wheel" : firstErr;
+            // 部分失败也返回错误：让引导器报红，用户重跑 /fix 即可（解压幂等）
+            return firstErr;
         }
 
         // zip 顶层若是单一子目录，则把其内容上移一层

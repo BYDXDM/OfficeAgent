@@ -26,10 +26,18 @@ namespace OfficeAgent.Host
         //   （同一 prev 被两条后续记录引用）→ VerifyChain 会误报"审计日志可能被篡改"。
         //   审计哈希链的价值全在于"任何异常都可检出"，因此这种**正常并发造成的假告警**
         //   必须消除：任何一次写之前都要重新读尾部，并持有跨进程文件锁。
-        static readonly string LockFile = Path.Combine(Dir(), "audit.lock");
+        // 锁文件路径必须**每次现算**：Dir() 可被 DirOverride 重定向（自测隔离），
+        // 若缓存成 static readonly，重定向后锁仍落在旧目录，隔离随即失效。
+        static string LockFile { get { return Path.Combine(Dir(), "audit.lock"); } }
+
+        // 审计目录重定向（仅自测使用）。默认 %LOCALAPPDATA%\OfficeAgent；
+        // /audittest 把它指向临时目录，于是用例既不依赖、也不污染真实审计日志——
+        // 此前它直接断言生产文件，一条历史损坏就足以让它永远 FAIL。
+        public static string DirOverride;
 
         public static string Dir()
         {
+            if (DirOverride != null && DirOverride.Length > 0) return DirOverride;
             return Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "OfficeAgent");
         }

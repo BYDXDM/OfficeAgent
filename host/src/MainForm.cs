@@ -14,7 +14,7 @@ namespace OfficeAgent.Host
 {
     public partial class MainForm : Form
     {
-        const string Version = "0.9.9";
+        const string Version = "0.9.10";
 
         class NavEntry
         {

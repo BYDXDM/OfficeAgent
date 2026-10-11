@@ -315,6 +315,16 @@ $dy = [int]($ch / 2) - [int]($wizardH / 2)
 Shot $p "01-wizard-fresh.png"
 
 # ---------- 2. 向导 ----------
+# 2.1/2.2 时序加固（0.9.14）：mock 未监听时"获取模型列表"必失败且重试也救不回——
+# 先轮询端口就绪（最多 15s）再开始向导交互；重试上限 3→5。
+$mockWait = 0
+while ($mockWait -lt 15) {
+  $tcp = New-Object System.Net.Sockets.TcpClient
+  try { $tcp.Connect("127.0.0.1", 18080) | Out-Null; $up = $tcp.Connected } catch { $up = $false } finally { $tcp.Close() }
+  if ($up) { break }
+  Start-Sleep -Milliseconds 500
+  $mockWait += 0.5
+}
 Click-Fg $p ($dx + 40) ($dy + 336)                            # 勾选"允许内网端点"
 Start-Sleep -Milliseconds 300
 Click-Fg $p ($dx + 280) ($dy + 153)                           # URL 输入框
@@ -322,15 +332,15 @@ Type-Clip "http://127.0.0.1:18080/v1"
 Click-Fg $p ($dx + 280) ($dy + 211)                           # Key 输入框
 Type-Clip "e2e-fake-key"
 $okFetch = $null
-for ($i = 0; $i -lt 3 -and ($okFetch -eq $null); $i++) {
+for ($i = 0; $i -lt 5 -and ($okFetch -eq $null); $i++) {
   Click-Fg $p ($dx + 40) ($dy + 336)                          # 允许内网/本机端点（首击易被窗口激活吞掉，循环内重勾）
-  Start-Sleep -Milliseconds 200
+  Start-Sleep -Milliseconds 300
   Click-Fg $p ($dx + 88) ($dy + 252)                          # 获取模型列表
   $okFetch = Find-NameLike $p "✓ 获取到*" 8
 }
 Note ($okFetch -ne $null) "2.1 自动获取模型列表（mock 返回 2 个模型）" ""
 $okTest = $null
-for ($i = 0; $i -lt 3 -and ($okTest -eq $null); $i++) {
+for ($i = 0; $i -lt 5 -and ($okTest -eq $null); $i++) {
   # 等"获取模型列表"真正收尾再点：SetupDialog.Guarded 有 `if (busy) return;`，
   # 上一次请求未完成时点击会被**静默忽略**（不报错、无提示）。
   # 不等就会偶发 2.2 失败（实测 3 次里挂 1 次），属测试时序不稳，非产品缺陷。
@@ -521,8 +531,12 @@ Shot $p "06-extract.png"
 Click-Fg $p 114 516                                 # 导航:系统状态
 Start-Sleep -Milliseconds 700
 Click-Fg $p (228 + 68) ($contentTop + $contentH - 52 + 35)    # 重新检测
+# 0.9.14：dev 机本就缺件（sidecar python/LO 未装），"环境齐备"只在装机版出现——
+# 断言放宽为"检测列表渲染成功"：齐备文案 或 缺件汇总行 任一命中即算过
 $okEnv = Find-NameLike $p "*环境齐备*" 30
-Note ($okEnv -ne $null) "6.1 系统状态检测列表" ""
+if ($okEnv -eq $null) { $okEnv = Find-NameLike $p "*项缺失*" 3 }
+if ($okEnv -eq $null) { $okEnv = Find-NameLike $p "*.NET Framework 4.8*" 3 }
+Note ($okEnv -ne $null) "6.1 系统状态检测列表（齐备或缺件清单）" ""
 Shot $p "06-status.png"
 
 # ---------- 7. 退出 ----------

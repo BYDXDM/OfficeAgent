@@ -316,17 +316,24 @@ namespace OfficeAgent.Host
                             if (ftxt == null || ftxt.Length == 0) ftxt = "(共享公式)";
                             if (ftxt.Length > 128) ftxt = ftxt.Substring(0, 128) + "…";
                             pendingFormula = ftxt;
-                            // ReadElementContentAsString 已推进越过 </f>，随后的 <v> 照常解析。
+                            // ReadElementContentAsString 把阅读器推进到 </f> 之后的**节点**上，
+                            // 只有两种可能：紧随的 <v> 起始节点，或 </c> 结束节点。
                             //
-                            // ★ 但若 </f> 之后**紧跟 </c>**（本格只有公式、没有 <v> 缓存值），
-                            //   主循环的 r.Read() 会直接越过 </c> → 下方 EndElement("c") 分支
-                            //   永不触发，本格既不提交、也走不到"无缓存公式"处理。
-                            //   实测两种 xlsx 形态会走不同分支：
-                            //     · <f>内容</f></c>      → 被跳过（本函数生成的文件就是这种）
-                            //     · <f/>（自闭合，共享公式）→ 正常落到 EndElement("c")
-                            //   导出时前者会静默丢格、后者会写出 "=公式" 文本，两者都必须在此统一。
-                            if (r.NodeType == XmlNodeType.EndElement && r.LocalName == "c")
+                            // ★ 关键：若停在 <v> 上，绝不能交回主循环 r.Read()——那会跳进 <v>
+                            //   内部，下方 Element("v") 分支永远不触发，缓存值被静默丢弃。
+                            //   真实 Excel/WPS 文件的公式格普遍带缓存值（本程序自己写的 xlsx
+                            //   才是"只有公式没有值"），此前所有公式格被误判为"无缓存值"：
+                            //   导出 CSV 变成一墙公式文本（用户当成乱码），缓存值 20/40/40 全丢。
+                            if (r.NodeType == XmlNodeType.Element && r.LocalName == "v")
                             {
+                                val = r.ReadElementContentAsString();
+                                if (curCol >= 0 && curCol < maxCols)
+                                    cells[curCol] = ResolveCell(val, cellType, styleIdx);
+                                haveCell = false;
+                            }
+                            else if (r.NodeType == XmlNodeType.EndElement && r.LocalName == "c")
+                            {
+                                // 本格只有公式、没有 <v> 缓存值（共享公式从格 / 程序化生成的文件）
                                 if (curCol >= 0 && curCol < maxCols)
                                     cells[curCol] = UncachedFormulaValue(pendingFormula);
                                 haveCell = false;

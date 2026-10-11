@@ -41,6 +41,7 @@ namespace OfficeAgent.Host
             bool urlTest = false;
             bool frpTest = false;
             bool dropTest = false;
+            bool xlsxCacheTest = false;
             bool safetyTest = false;
             bool menuTest = false;
             bool formulaTest = false;
@@ -72,6 +73,7 @@ namespace OfficeAgent.Host
                 else if (a == "/urltest") urlTest = true;
                 else if (a == "/frptest") frpTest = true;
                 else if (a == "/droptest") dropTest = true;
+                else if (a == "/xlsxcachetest") xlsxCacheTest = true;
                 else if (a == "/safetytest") safetyTest = true;
                 else if (a == "/menutest") menuTest = true;
                 else if (a == "/formulatest") formulaTest = true;
@@ -123,7 +125,7 @@ namespace OfficeAgent.Host
 
             // CLI 无头链同样落审计（设计方案 §7.3：每个动作可审计；GUI 的 app_start 在 MainForm）
             if (selftest || guardTest || maskTest || intentTest || suggestTest || skillTest || caretTest
-                || auditTest || detectTest || bridgeTest || planTest || perfTest || jsonTest || toolidTest || urlTest || frpTest || dropTest || formulaTest
+                || auditTest || detectTest || bridgeTest || planTest || perfTest || jsonTest || toolidTest || urlTest || frpTest || dropTest || xlsxCacheTest || formulaTest
                 || safetyTest || menuTest
                 || gridTestInput != null
                 || skillRunArgs != null || agentTestArgs != null || reconArgs != null || mergeArgs != null
@@ -245,6 +247,14 @@ namespace OfficeAgent.Host
                 try { AllocConsole(); } catch { }
                 try { Console.OutputEncoding = Encoding.UTF8; } catch { }
                 return RunFormulaTest();
+            }
+
+            if (xlsxCacheTest)
+            {
+                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
+                try { AllocConsole(); } catch { }
+                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                return RunXlsxCacheTest();
             }
 
             if (skillTest)
@@ -1522,6 +1532,76 @@ namespace OfficeAgent.Host
                 Console.WriteLine((ok ? "[OK]  " : "[FAIL] ") + c[0] + "  allowLan=" + c[1] + "  => " + verdict + (r == null ? "" : "  (" + r + ")"));
             }
             Console.WriteLine(failed == 0 ? "ALL PASS" : (failed + " FAILED"));
+            return failed == 0 ? 0 : 2;
+        }
+
+        // /xlsxcachetest —— 外部 xlsx 公式缓存值读取回归（0.9.11）。
+        // 真实 Excel/WPS 文件的公式格形如 <f>公式</f><v>缓存值</v>（共享公式从格为 <f t="shared" si="0"/>）。
+        // 此前主循环读完 <f> 后直接 r.Read()：阅读器明明停在紧随的 <v> 起始节点上，
+        // 却被跳进 <v> 内部，Element("v") 分支永不触发 → 缓存值全部静默丢失，
+        // 所有公式格被误判"无缓存值"——导出 CSV 成一墙公式文本（用户看到的"乱码"）。
+        // 手工构造最小 xlsx 锁死行为：A1 共享主格(缓存20) A2 共享从格(缓存40)
+        // A3 共享从格(无缓存) A4 普通公式(缓存40) A5 普通公式(无缓存) B1=10。
+        static int RunXlsxCacheTest()
+        {
+            int failed = 0;
+            Action<string, bool> check = delegate(string name, bool cond)
+            {
+                Console.WriteLine((cond ? "  ok    " : "  FAIL  ") + name);
+                if (!cond) failed++;
+            };
+            string path = Path.Combine(Path.GetTempPath(), "oa_xlsxcachetest.xlsx");
+            try
+            {
+                List<MiniZipEntryOut> ents = new List<MiniZipEntryOut>();
+                XlsxSkeleton.Add(ents, "[Content_Types].xml", XlsxSkeleton.ContentTypes(1, false));
+                XlsxSkeleton.Add(ents, "_rels/.rels", XlsxSkeleton.RootRels());
+                XlsxSkeleton.Add(ents, "xl/workbook.xml", XlsxSkeleton.WorkbookXml("<sheet name=\"S\" sheetId=\"1\" r:id=\"rId1\"/>"));
+                XlsxSkeleton.Add(ents, "xl/_rels/workbook.xml.rels", XlsxSkeleton.SheetsRels(1));
+                string sheet =
+                    "<row r=\"1\"><c r=\"A1\"><f t=\"shared\" ref=\"A1:A3\" si=\"0\">B1*2</f><v>20</v></c><c r=\"B1\"><v>10</v></c></row>" +
+                    "<row r=\"2\"><c r=\"A2\"><f t=\"shared\" si=\"0\"/><v>40</v></c></row>" +
+                    "<row r=\"3\"><c r=\"A3\"><f t=\"shared\" si=\"0\"/></c></row>" +
+                    "<row r=\"4\"><c r=\"A4\"><f>B1*4</f><v>40</v></c></row>" +
+                    "<row r=\"5\"><c r=\"A5\"><f>B1*5</f></c></row>";
+                XlsxSkeleton.Add(ents, "xl/worksheets/sheet1.xml",
+                    XlsxSkeleton.XmlHead + "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData>" +
+                    sheet + "</sheetData></worksheet>");
+                using (FileStream fs = new FileStream(path, FileMode.Create)) MiniZipWriter.Write(fs, ents);
+
+                List<string[]> rows = new List<string[]>();
+                int uncached = -1;
+                string err = null;
+                XlsxBook book = XlsxBook.Open(path);
+                try
+                {
+                    book.BlankUncachedFormula = true;
+                    // 注意：StreamRows 复用同一个 cells 数组逐行回调，必须拷贝快照，
+                    // 否则 rows 里 5 个引用全指向最后一行的最终状态
+                    err = book.StreamRows(0, 8, delegate(string[] r)
+                    {
+                        string[] copy = new string[r.Length];
+                        Array.Copy(r, copy, r.Length);
+                        rows.Add(copy);
+                    });
+                    uncached = book.UncachedFormulaCount;
+                }
+                finally { book.Dispose(); }
+                check("读取无错误", err == null);
+                check("读到 5 行", rows.Count == 5);
+                if (rows.Count >= 5)
+                {
+                    check("A1 共享主格取缓存值 20", rows[0][0] == "20");
+                    check("B1 普通数值 10", rows[0][1] == "10");
+                    check("A2 共享从格取缓存值 40", rows[1][0] == "40");
+                    check("A3 共享从格无缓存值→置空", rows[2][0] == null || rows[2][0] == "");
+                    check("A4 普通公式取缓存值 40", rows[3][0] == "40");
+                    check("A5 无缓存值→置空", rows[4][0] == null || rows[4][0] == "");
+                    check("无缓存公式计数=2", uncached == 2);
+                }
+            }
+            finally { try { File.Delete(path); } catch { } }
+            Console.WriteLine(failed == 0 ? "xlsxcachetest ALL PASS" : ("xlsxcachetest FAILED=" + failed));
             return failed == 0 ? 0 : 2;
         }
 

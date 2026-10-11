@@ -48,6 +48,18 @@ namespace OfficeAgent.Host
         }
     }
 
+    // 自绘面板通用双缓冲：从别的应用切回/拖窗/悬停时，每个裸 Panel 各自"先擦背景再画"
+    // 就是一帧中间态，整屏逐控件闪白（Win7 无 DWM）。AllPaintingInWmPaint+OptimizedDoubleBuffer
+    // 对 UserPaint 面板生效（与原生 ListBox 不同——后者只能走 WM_ERASEBKGND 拦截，0.9.12）。
+    class BufferedPanel : Panel
+    {
+        public BufferedPanel()
+        {
+            DoubleBuffered = true;
+            SetStyle(ControlStyles.ResizeRedraw, true);
+        }
+    }
+
     public partial class ChatPanel : Panel
     {
         public event Action OnOpenSettings;
@@ -118,6 +130,25 @@ namespace OfficeAgent.Host
 
         int LeftMargin() { return (list.Width > 900) ? 170 : 20; }
         int AvailWidth() { return Math.Min(MaxTextWidth, Math.Max(200, list.Width - LeftMargin() - 60)); }
+
+        // 单条目高度变化的原生更新：LB_SETITEMHEIGHT(0x01A0) 在 OwnerDrawVariable 下只作用于
+        // 指定项，配合"从该条目顶到列表底"的局部失效，替代 ReMeasure 的整表 Clear+重挂——
+        // 流式期间高度逐节拍变化时，每 100ms 全量重挂=全表重绘=肉眼闪烁（0.9.12）。
+        // 调用方须先 MeasureMsg 使 CachedHeight 就绪；列表/消息数不同步或异常时回退整表重挂。
+        void UpdateItemHeight(int idx)
+        {
+            if (idx < 0 || idx >= msgs.Count || list.Items.Count != msgs.Count) { ReMeasure(); return; }
+            ChatMsg m = msgs[idx];
+            try
+            {
+                SendMessage(list.Handle, 0x01A0, (IntPtr)idx, (IntPtr)Math.Max(1, m.CachedHeight));
+                Rectangle r = list.GetItemRectangle(idx);
+                Rectangle tail = Rectangle.FromLTRB(0, Math.Max(0, r.Top - 2),
+                    list.ClientRectangle.Right, list.ClientRectangle.Bottom);
+                list.Invalidate(tail);
+            }
+            catch { ReMeasure(); }
+        }
 
         // 局部重绘：只刷某一条消息的条目矩形。整表 list.Invalidate() 会让原生 ListBox
         // 先擦背景再逐条重画，拖选/悬停时整屏发白闪一下（真机反馈「选中对话框时会闪烁」）。
@@ -309,14 +340,14 @@ namespace OfficeAgent.Host
             Controls.Add(planPanel);
             list.BringToFront();   // Fill 最后停靠，吃掉剩余宽度
 
-            Panel bottom2 = new Panel();
+            Panel bottom2 = new BufferedPanel();
             bottom = bottom2;
             bottom2.Dock = DockStyle.Bottom;
             bottom2.Height = 118;
             bottom2.BackColor = Color.White;
             bottom2.Paint += Bottom_Paint;
 
-            inputBorder = new Panel();
+            inputBorder = new BufferedPanel();
             inputBorder.Location = new Point(150, 12);
             inputBorder.Size = new Size(700, 66);
             inputBorder.Paint += InputBorder_Paint;
@@ -390,7 +421,7 @@ namespace OfficeAgent.Host
             ctxLabel.Location = new Point(24, 84);
 
             // WorkBuddy 式引用条：输入框上方横排"格式徽标+文件名"小片（拖入/@ 引用后可见，点 × 移除）
-            fileStrip = new Panel();
+            fileStrip = new BufferedPanel();
             fileStrip.Location = new Point(150, 12);
             fileStrip.Size = new Size(700, 40);   // 0.9.4：随引用片放大（原 30）
             fileStrip.BackColor = Color.White;
@@ -458,8 +489,8 @@ namespace OfficeAgent.Host
                         msgs[pendingIdx].Text = "思考中… " + secs + "s";
                         msgs[pendingIdx].CachedTextH = -1;
                         msgs[pendingIdx].CachedHeight = -1;
-                        ReMeasure();
-                        dirty = true;
+                        MeasureMsg(msgs[pendingIdx], AvailWidth());
+                        UpdateItemHeight(pendingIdx);   // 0.9.12：秒数文本高度恒定，单条重绘替代每秒整表重挂
                     }
                 }
                 if (!dirty) return;
@@ -571,6 +602,7 @@ namespace OfficeAgent.Host
         {
             if (list == null || msgs.Count == 0) return;
             int top = list.TopIndex;
+            list.MarkFullErase();   // 重挂后条目带可能变矮：下一帧恢复一次全量擦背景防残影
             list.BeginUpdate();
             list.Items.Clear();
             foreach (ChatMsg m in msgs) list.Items.Add(m);
@@ -679,6 +711,7 @@ namespace OfficeAgent.Host
             list.Items.Clear();
             lock (llmHistory) { llmHistory.Clear(); }
             sessionRows = new List<string[]>(rows);
+            list.BeginUpdate();   // 0.9.12：逐条 Add 每条一帧、长消息分块又逐个重挂——包住后整次加载只出一帧
             foreach (string[] r in rows)
             {
                 if (r[0] == "file")
@@ -699,12 +732,14 @@ namespace OfficeAgent.Host
                 list.Items.Add(m);
                 lock (llmHistory) { llmHistory.Add(new LlmTurn(m.User ? "user" : "assistant", r[2])); }
             }
-            // 长消息重建分块（倒序插入不影响前面的索引）
+            // 长消息重建分块（倒序插入不影响前面的索引；SplitLongFinal→ReMeasure 的
+            // BeginUpdate 引用计数嵌套安全，EndUpdate 后整次加载只出一帧）
             for (int i = msgs.Count - 1; i >= 0; i--)
             {
                 MeasureMsg(msgs[i], AvailWidth());
                 if (msgs[i].CachedTextH > ChunkMaxTextH()) SplitLongFinal(i);
             }
+            list.EndUpdate();
             UpdateCtxLabel();
             // 重开会话/窗口后直接落在最新一条（0.8.4 用户反馈：原来回到顶部还得自己滚到底）
             try { if (list.Items.Count > 0) list.TopIndex = list.Items.Count - 1; } catch { }
@@ -1215,7 +1250,7 @@ namespace OfficeAgent.Host
                 int oldH = sm.CachedHeight;
                 sm.CachedTextH = -1; sm.CachedHeight = -1; sm.CachedAvail = -1;
                 MeasureMsg(sm, AvailWidth());
-                if (sm.CachedHeight != oldH) ReMeasure();
+                if (sm.CachedHeight != oldH) UpdateItemHeight(streamingBubble);   // 0.9.12：单条目高度更新替代整表重挂
                 // 文本增长后必须重挂条目让原生列表重测高度（OwnerDrawVariable 只在增删时测），
                 // 否则条目高度停在空文本的尺寸：总滚动高度偏小（滚不到底）+ 内容溢出（视觉重叠）
                 dirty = true;   // 交给同一定时器里的滚动/重绘逻辑
@@ -1472,8 +1507,15 @@ namespace OfficeAgent.Host
             if (idx >= 0 && idx < msgs.Count)
             {
                 msgs[idx].Text = text;
-                msgs[idx].CachedTextH = -1; msgs[idx].CachedHeight = -1;
-                ReMeasure();   // 文本变了高度也会变，让原生列表重测（同 FlushStream 注释）
+                // 0.9.12：先测高——高度不变只刷单条（TailOfLog 固定行数，多数节拍高度恒定），
+                // 变了走单条目高度更新；都不再整表 Clear+重挂。且本方法由后台线程同步
+                // Invoke 进来，重挂会绕过 flushTimer 节流，逐条日志一帧。
+                ChatMsg sm = msgs[idx];
+                int oldH = sm.CachedHeight;
+                sm.CachedTextH = -1; sm.CachedHeight = -1; sm.CachedAvail = -1;
+                MeasureMsg(sm, AvailWidth());
+                if (sm.CachedHeight != oldH) UpdateItemHeight(idx);
+                else InvalidateItem(idx);
                 MarkDirty();
             }
         }
@@ -2090,8 +2132,8 @@ namespace OfficeAgent.Host
                     if (t.Length > 0) planSteps.Add(new string[] { t, "0" });
                 }
                 if (planSteps.Count == 0) { planPanel.Visible = false; return "计划为空，请提供步骤列表"; }
-                planPanel.Visible = true;
-                planPanel.Width = 264;
+                planPanel.Width = 264;       // 0.9.12：先定宽再显示——Dock=Right 宽度变化会整树重排，
+                planPanel.Visible = true;    // 顺序反了=一次展开两次全盘布局（聊天列表跟着白擦一次）
             }
             else if (action == "done")
             {
@@ -2346,7 +2388,12 @@ namespace OfficeAgent.Host
                 if (config.PluginHist && !isError && text != null && !text.StartsWith("✗"))
                     MemoryStore.AppendHistory("assistant", text);
                 if (!isError) { SplitLongFinal(idx); SaveSession(); }
-                else { ReMeasure(); }   // 错误气泡同样换了大文本，也要重测（SplitLongFinal 已含重测）
+                else
+                {
+                    // 0.9.12：错误气泡同样换了大文本，但只需单条目高度更新，不必整表重挂
+                    MeasureMsg(msgs[idx], AvailWidth());
+                    UpdateItemHeight(idx);
+                }
             }
             MarkDirty();
         }
@@ -2850,26 +2897,39 @@ namespace OfficeAgent.Host
             // 原样擦，避免留下未绘制像素。
             // ★ 不要改用 WS_EX_COMPOSITED：实测给这个控件加该扩展样式会让 CreateWindowEx 直接失败
             //   （Win32Exception「创建窗口句柄时出错」），整个窗口都建不出来（droptest 复现）。
+            bool fullErase;   // 缩带后需要一次全量擦背景（见 MarkFullErase）
+
+            // 条目重挂/删除后条目带可能比上一帧矮：旧帧残留在带下的像素若照常跳过擦除
+            // 会成残影——ReMeasure 调此方法，下一次（有内容的）WM_ERASEBKGND 恢复原样擦一次。
+            public void MarkFullErase() { fullErase = true; }
+
             protected override void WndProc(ref Message m)
             {
-                if (m.Msg == 0x0014 && Items.Count > 0)   // WM_ERASEBKGND
+                if (m.Msg == 0x0014)   // WM_ERASEBKGND
                 {
-                    try
+                    bool skip = false;
+                    if (Items.Count > 0 && !fullErase)
                     {
-                        RECT r;
-                        if (GetUpdateRect(Handle, out r, false))
+                        try
                         {
-                            Rectangle first = GetItemRectangle(0);
-                            Rectangle last = GetItemRectangle(Items.Count - 1);
-                            if (r.Top >= first.Top && r.Bottom <= last.Bottom &&
-                                r.Left >= first.Left && r.Right <= first.Right)
+                            RECT r;
+                            if (GetUpdateRect(Handle, out r, false))
                             {
-                                m.Result = (IntPtr)1;   // 已处理：不擦背景
-                                return;
+                                Rectangle first = GetItemRectangle(0);
+                                // 0.9.12：边界放宽到整个客户区（原条件 r.Bottom <= last.Bottom
+                                // 在"内容总高 < 视口"——新会话/短对话/从别的应用切回来时——必然
+                                // 失败 → 整块擦背景再逐行重绘 = Win7 无 DWM 下肉眼白闪）。
+                                // 条目带与带下方都无自绘内容依赖擦除：每行 DrawItem 自己铺满
+                                // e.Bounds 背景、带下空白恒为 BackColor，跳过擦除无残影。
+                                if (r.Top >= first.Top && r.Left >= 0 &&
+                                    r.Right <= ClientSize.Width && r.Bottom <= ClientSize.Height)
+                                    skip = true;
                             }
                         }
+                        catch { }
                     }
-                    catch { }
+                    if (fullErase && Items.Count > 0) fullErase = false;   // 只在有内容的一帧消费
+                    if (skip) { m.Result = (IntPtr)1; return; }
                 }
                 base.WndProc(ref m);
             }

@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
@@ -14,7 +15,7 @@ namespace OfficeAgent.Host
 {
     public partial class MainForm : Form
     {
-        const string Version = "0.9.11";
+        const string Version = "0.9.12";
 
         class NavEntry
         {
@@ -30,7 +31,7 @@ namespace OfficeAgent.Host
         int[] pageToNav;            // 页索引 → 导航列表索引
         bool navReentry = false;
         bool sessionReentry = false;
-        ListBox sessionList;
+        SideList sessionList;
         Button btnNewChat;
         int sessionHover = -1;
         bool showArchived = false;                  // 侧边栏是否显示已归档会话
@@ -77,6 +78,7 @@ namespace OfficeAgent.Host
             StartPosition = FormStartPosition.CenterScreen;
             MinimumSize = new Size(940, 620);
             AllowDrop = true;
+            DoubleBuffered = true;   // 0.9.12：窗体自身擦+画合并——从别的应用切回时不再整屏白闪一帧
             DragEnter += new DragEventHandler(OnDragEnter);
             DragDrop += new DragEventHandler(OnDragDrop);
             BackColor = Color.White;
@@ -92,13 +94,13 @@ namespace OfficeAgent.Host
             pageTitle.Font = new Font("Microsoft YaHei UI", 14F, FontStyle.Bold);
             pageTitle.Location = new Point(24, 14);
             pageTitle.AutoSize = true;
-            Panel header = new Panel();
+            Panel header = new BufferedPanel();   // 0.9.12：大面板双缓冲——切回窗口/拖窗时逐控件"擦+画"白闪
             header.Dock = DockStyle.Top;
             header.Height = 52;
             header.BackColor = Color.White;
             header.Controls.Add(pageTitle);
 
-            content = new Panel();
+            content = new BufferedPanel();
             content.Dock = DockStyle.Fill;
             content.BackColor = Color.White;
 
@@ -120,7 +122,7 @@ namespace OfficeAgent.Host
 
         void BuildSidebar()
         {
-            sidebar = new Panel();
+            sidebar = new BufferedPanel();   // 0.9.12：含自定义 Sidebar_Paint，双缓冲后擦+画合并为一帧
             sidebar.Dock = DockStyle.Left;
             sidebar.Width = 228;
             sidebar.BackColor = Color.FromArgb(244, 244, 246);
@@ -314,6 +316,7 @@ namespace OfficeAgent.Host
                 WorkspaceStore.EnsureInit(config);
                 sessionCache = SessionStore.List();
                 WorkspaceInfo act = WorkspaceStore.Active(config);
+                sessionList.MarkFullErase();   // 列表条目会变少（归档/删除/切工作区）：防带下残影
                 sessionList.BeginUpdate();
                 sessionList.Items.Clear();
                 sessionList.Items.Add("会话");
@@ -546,12 +549,54 @@ namespace OfficeAgent.Host
             return gp;
         }
 
-        // 侧边栏列表通用双缓冲（悬停逐帧 Invalidate，无缓冲会闪）
+        // 侧边栏列表（悬停逐帧 Invalidate，无缓冲会闪）。注意：构造里那两个 SetStyle 对
+        // 原生 ListBox 不生效（它自己处理 WM_PAINT）——与 ChatPanel.BufferedMsgList 同款，
+        // 真正防闪靠 WM_ERASEBKGND 条件拦截（0.9.12；此前 SideList 等于裸奔）。
         class SideList : ListBox
         {
             public SideList()
             {
                 SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint, true);
+            }
+
+            [StructLayout(LayoutKind.Sequential)]
+            struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+
+            [DllImport("user32.dll")]
+            static extern bool GetUpdateRect(IntPtr hWnd, out RECT lpRect, bool bErase);
+
+            bool fullErase;
+
+            // 列表重建后条目带可能变矮：下一次（有内容的）擦背景照原样执行一次防残影
+            public void MarkFullErase() { fullErase = true; }
+
+            protected override void WndProc(ref Message m)
+            {
+                if (m.Msg == 0x0014)   // WM_ERASEBKGND
+                {
+                    bool skip = false;
+                    if (Items.Count > 0 && !fullErase)
+                    {
+                        try
+                        {
+                            RECT r;
+                            if (GetUpdateRect(Handle, out r, false))
+                            {
+                                Rectangle first = GetItemRectangle(0);
+                                // 条目带+带下方空白均无自绘内容依赖擦除（DrawItem 自铺 e.Bounds、
+                                // 带下空白恒为 BackColor），更新区落在客户区内即跳过擦除——
+                                // 鼠标扫过侧栏每次悬停变化都整表失效，Win7 无 DWM 下逐帧白闪。
+                                if (r.Top >= first.Top && r.Left >= 0 &&
+                                    r.Right <= ClientSize.Width && r.Bottom <= ClientSize.Height)
+                                    skip = true;
+                            }
+                        }
+                        catch { }
+                    }
+                    if (fullErase && Items.Count > 0) fullErase = false;
+                    if (skip) { m.Result = (IntPtr)1; return; }
+                }
+                base.WndProc(ref m);
             }
         }
 

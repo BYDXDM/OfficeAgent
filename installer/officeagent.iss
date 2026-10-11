@@ -63,8 +63,12 @@ Source: "..\skills\*"; DestDir: "{app}\skills"; Flags: ignoreversion recursesubd
 ; 内置资源模板（make-ppt 的 PPT 模板 / excel-formulas.json 公式大全）。
 ; 0.7.x 漏打包 templates 导致全新安装的 create_presentation 找不到模板——两个 SKU 都必须带。
 Source: "..\templates\*"; DestDir: "{app}\templates"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "..\tests\fixtures\recon\flow.csv"; DestDir: "{app}\tests"; Flags: ignoreversion
-Source: "..\tests\fixtures\recon\ledger.csv"; DestDir: "{app}\tests"; Flags: ignoreversion
+; 无头自测用的样本文件。DestDir 必须与 host/src/Program.cs 里的 EnvDetect.FindRoot()+"tests\fixtures\..." 逐级对齐：
+; 0.9.9 之前这里把两个 csv 平铺进 {app}\tests，导致装完后 /intents 与 /suggesttest 因找不到文件而失败。
+Source: "..\tests\fixtures\recon\flow.csv"; DestDir: "{app}\tests\fixtures\recon"; Flags: ignoreversion
+Source: "..\tests\fixtures\recon\ledger.csv"; DestDir: "{app}\tests\fixtures\recon"; Flags: ignoreversion
+Source: "..\tests\fixtures\invoice-sample.pdf"; DestDir: "{app}\tests\fixtures"; Flags: ignoreversion
+Source: "..\tests\fixtures\gb18030.csv"; DestDir: "{app}\tests\fixtures"; Flags: ignoreversion
 #if SKU == "complete"
 ; full offline SKU: payload bundled (~900MB incl. LibreOffice 7.6.7)
 ; 不设 skipifsourcedoesntexist —— complete SKU 的意义就是"离线齐套"，

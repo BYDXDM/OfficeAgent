@@ -573,11 +573,20 @@ namespace OfficeAgent.Host
             return emps;
         }
 
-        // 考勤分析报告（agent 转述；请假/缺勤口径由 agent 向用户确认后自行统计）
+        // 考勤分析报告（agent 转述；请假/缺勤口径由 agent 向用户确认后自行统计）。
+        // 报告文本用真名——姓名假名化在工具边界统一做（AgentTools → NameMasking），解析器保持纯净。
         public static string AnalyzeAttendance(string path, out string err)
+        {
+            List<string> roster;
+            return AnalyzeAttendance(path, out err, out roster);
+        }
+
+        // 带名单重载（0.9.13）：roster=报告里的员工姓名（解析序），供 NameMasking 注册假名映射
+        public static string AnalyzeAttendance(string path, out string err, out List<string> roster)
         {
             byte[] b;
             err = null;
+            roster = new List<string>();
             try { b = File.ReadAllBytes(path); }
             catch (Exception ex) { err = "读取失败: " + ex.Message; return ""; }
             List<FrpObj> objs = ParseObjects(b);
@@ -585,6 +594,7 @@ namespace OfficeAgent.Host
             string period;
             List<AttEmp> emps = ParseAttendance(objs, out period);
             if (emps.Count == 0) { err = "未识别到员工考勤区块"; return ""; }
+            foreach (AttEmp e in emps) roster.Add(e.Name);
 
             StringBuilder sb = new StringBuilder();
             sb.Append("考勤解析结果（frp 打印模板）");
@@ -636,6 +646,31 @@ namespace OfficeAgent.Host
             }
             sb.Append("\n（共 " + ti2 + " 名员工。请假次数/缺勤扣时需用户口径：无打卡工作日算缺勤还是请假？请假标记是什么？标准日工时多少？）");
             return sb.ToString();
+        }
+
+        // 考勤模板的员工名单（0.9.13）：供附带 .frp 文件时的姓名假名化（NameMasking.Register）。
+        // 门控必须严：解析出考期、名单 ≥3 人、全表 ≥5 个打卡时间段（HH:MM 结构）——
+        // L=376 纯中文列在非考勤模板里可能是普通工序词（精车/热处理…），不满足就返回空表不脱敏。
+        public static List<string> ExtractAttendanceNames(string path)
+        {
+            List<string> res = new List<string>();
+            try
+            {
+                byte[] b = File.ReadAllBytes(path);
+                List<FrpObj> objs = ParseObjects(b);
+                if (objs.Count == 0) return res;
+                string period;
+                List<AttEmp> emps = ParseAttendance(objs, out period);
+                if (emps.Count < 3 || period.Length == 0) return res;
+                int segs = 0;
+                foreach (AttEmp e in emps)
+                    foreach (AttDay d in e.Days)
+                        foreach (string s in d.Segments) { if (s != null && s.Length > 0 && s != "-") segs++; }
+                if (segs < 5) return res;
+                foreach (AttEmp e in emps) res.Add(e.Name);
+            }
+            catch { }
+            return res;
         }
     }
 }

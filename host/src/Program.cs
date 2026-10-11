@@ -894,6 +894,14 @@ namespace OfficeAgent.Host
             check("03 日(四) 识别为无打卡工作日", rep.Contains("3日(四)") && rep.Contains("无打卡工作日 1 天"));
             check("口径待确认提示在报告中", rep.Contains("口径"));
 
+            // 0.9.13：姓名假名层（NameMasking）——真名只在工具边界换「员工NN」，显示时还原
+            NameMasking.Reset();
+            NameMasking.Register(new string[] { "张三", "李四五" });
+            check("假名 Mask 一致化", NameMasking.Mask("张三和李四五出勤") == "员工01和员工02出勤");
+            check("假名 Restore 还原", NameMasking.Restore("员工01 出勤 3 天；员工02 出勤 1 天") == "张三 出勤 3 天；李四五 出勤 1 天");
+            check("编造员工号原样保留", NameMasking.Restore("员工99 没有名单") == "员工99 没有名单");
+            NameMasking.Reset();
+
             // 真实样例（环境变量 OA_FRP_SAMPLE 指向时才跑，保持测试确定性）
             string realPath = null;
             try { realPath = Environment.GetEnvironmentVariable("OA_FRP_SAMPLE"); } catch { }
@@ -903,6 +911,8 @@ namespace OfficeAgent.Host
                 string rrep = FrpReport.AnalyzeAttendance(realPath, out rerr);
                 check("真实样例解析成功", rerr == null && rrep.Length > 100);
                 check("真实样例含已知员工与考期", rrep.Contains("李奎远") && rrep.Contains("2026-09-01"));
+                List<string> roster = FrpReport.ExtractAttendanceNames(realPath);
+                check("真实样例考勤名单提取（假名层输入）", roster != null && roster.Count >= 3);
                 Console.WriteLine("  （真实样例报告 " + rrep.Length + " 字符）");
                 try { File.WriteAllText(Path.Combine(Path.GetTempPath(), "oa_att_report.txt"), rrep, Encoding.UTF8); } catch { }
             }

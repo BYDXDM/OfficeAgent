@@ -680,6 +680,7 @@ namespace OfficeAgent.Host
             msgs.Clear();
             list.Items.Clear();
             llmHistory.Clear();          // 新会话 = 模型上下文一并清空
+            NameMasking.Reset();         // 0.9.13：新会话新名单，假名映射一并作废
             sessionRows.Clear();
             planSteps.Clear();
             planPanel.Visible = false;   // 计划栏随新会话收起
@@ -711,9 +712,16 @@ namespace OfficeAgent.Host
             list.Items.Clear();
             lock (llmHistory) { llmHistory.Clear(); }
             sessionRows = new List<string[]>(rows);
+            // 0.9.13：先注册名单行（namemap），再重建对话——llmHistory 全程假名
+            NameMasking.Reset();
+            foreach (string[] r in rows)
+            {
+                if (r[0] == "namemap") NameMasking.Register((r[2] ?? "").Split('|'));
+            }
             list.BeginUpdate();   // 0.9.12：逐条 Add 每条一帧、长消息分块又逐个重挂——包住后整次加载只出一帧
             foreach (string[] r in rows)
             {
+                if (r[0] == "namemap") continue;   // 0.9.13：名单行已在上面注册，不进气泡
                 if (r[0] == "file")
                 {
                     // 附件卡片行：不进模型上下文，只还原卡片
@@ -730,7 +738,8 @@ namespace OfficeAgent.Host
                 m.Text = r[2];
                 msgs.Add(m);
                 list.Items.Add(m);
-                lock (llmHistory) { llmHistory.Add(new LlmTurn(m.User ? "user" : "assistant", r[2])); }
+                // 0.9.13：存档是真名，回传模型的上下文必须过一遍假名（名单行已注册）
+                lock (llmHistory) { llmHistory.Add(new LlmTurn(m.User ? "user" : "assistant", NameMasking.Mask(r[2]))); }
             }
             // 长消息重建分块（倒序插入不影响前面的索引；SplitLongFinal→ReMeasure 的
             // BeginUpdate 引用计数嵌套安全，EndUpdate 后整次加载只出一帧）
@@ -758,7 +767,10 @@ namespace OfficeAgent.Host
                 {
                     if (r[0] == "user" && r[2].Length > 0) { title = r[2].Length > 24 ? r[2].Substring(0, 24) : r[2]; break; }
                 }
-                SessionStore.Save(sessionId, title, new List<string[]>(sessionRows), CurrentWorkspaceId());
+                List<string[]> outRows = new List<string[]>(sessionRows);
+                if (NameMasking.HasNames)   // 0.9.13：名单随会话存档，重开后假名编号/还原仍一致
+                    outRows.Add(new string[] { "namemap", "", string.Join("|", NameMasking.Roster().ToArray()) });
+                SessionStore.Save(sessionId, title, outRows, CurrentWorkspaceId());
                 if (OnSessionSaved != null) { try { OnSessionSaved(); } catch { } }
             }
             catch { }
@@ -1100,6 +1112,7 @@ namespace OfficeAgent.Host
             // 消息里/拖拽上下文中的文本文件 → 直接读出内容附进提问（修：AI 看不到 txt 等基本文件）
             string fileCtx = BuildFileContext(text, maskHits);
             if (config.PrivacyLevel == 1) question = MaskEngine.Mask(question, maskHits);
+            if (config.PrivacyLevel == 1) question = NameMasking.Mask(question);   // 0.9.13：会话名单里的真名同样不出网
             AuditLog.Record("llm_call",
                 (maskHits.Count > 0 ? "masked[" + string.Join(",", maskHits.ToArray()) + "] " : "plain ") +
                 "len=" + (question.Length + fileCtx.Length));
@@ -1157,7 +1170,15 @@ namespace OfficeAgent.Host
                     if (fe == null && ft != null && ft.Length > 0)
                     {
                         if (ft.Length > 6000) ft = ft.Substring(0, 6000) + "\n…[截断，可用工具 read_text_file 读更多]";
-                        if (config.PrivacyLevel == 1) ft = MaskEngine.Mask(ft, maskHits);
+                        if (config.PrivacyLevel == 1)
+                        {
+                            // 0.9.13：考勤模板先登记员工名单，再对附带文本做姓名假名化——
+                            // 模型看到的横表里只有「员工01…」，真名不出本机
+                            List<string> roster = FrpReport.ExtractAttendanceNames(p);
+                            if (roster.Count > 0) NameMasking.Register(roster);
+                            ft = MaskEngine.Mask(ft, maskHits);
+                            ft = NameMasking.Mask(ft);
+                        }
                         sb.Append("\n\n【附带文件 ").Append(p).Append("】（frp 打印模板，已解析为表格文本）\n").Append(ft);
                     }
                     else
@@ -1340,6 +1361,9 @@ namespace OfficeAgent.Host
             //   但提示词约束不住，所以这里做**确定性检测**：声称保存了文件、而本回合
             //   Products 为空 → 补一条醒目的纠正说明，避免用户按假路径去找文件。
             r.FinalText = GuardFabricatedProduct(r.FinalText, r.Products == null ? 0 : r.Products.Count);
+            // 0.9.13：模型产出里的「员工NN」在显示/落档边界还原真名；r.FinalText 本身保持假名——
+            // llmHistory 与长期记忆（MemoryStore）继续喂假名，真名不回传模型。
+            string finalShow = NameMasking.Restore(r.FinalText);
             if (r.UsedTools && r.ToolLog.Length > 0)
             {
                 // 工具调用记录留在原气泡；最终答复另起一条（顺序：日志在上、答复在下）
@@ -1350,8 +1374,8 @@ namespace OfficeAgent.Host
                     msgs[idx].CachedTextH = -1; msgs[idx].CachedHeight = -1;
                     SplitLongFinal(idx);   // 完整日志按高度分块，避免单条超出视口又看不到底
                 }
-                int fidx = Append("assistant", r.FinalText, false, false);
-                if (config.PluginHist) MemoryStore.AppendHistory("assistant", r.FinalText);
+                int fidx = Append("assistant", finalShow, false, false);
+                if (config.PluginHist) MemoryStore.AppendHistory("assistant", r.FinalText);   // 长期记忆会被回喂模型：保持假名
                 if (fidx >= 0 && fidx < msgs.Count)
                 {
                     msgs[fidx].Time = msgs[fidx].Time + " · " + (elapsedMs / 1000.0).ToString("0.0") + "s";
@@ -1360,7 +1384,7 @@ namespace OfficeAgent.Host
             }
             else
             {
-                FinishReply(idx, r.FinalText, false, elapsedMs);
+                FinishReply(idx, finalShow, false, elapsedMs);
             }
             lock (llmHistory)
             {
@@ -1371,7 +1395,7 @@ namespace OfficeAgent.Host
             // 会话存档记「显示文本」：用户存原文（非脱敏载荷），助手存最终答复
             string now = DateTime.Now.ToString("HH:mm");
             sessionRows.Add(new string[] { "user", now, lastUserDisplay.Length > 0 ? lastUserDisplay : userPayloadForHistory });
-            sessionRows.Add(new string[] { "assistant", now, r.FinalText });
+            sessionRows.Add(new string[] { "assistant", now, finalShow });
             UpdateCtxLabel();
             SaveSession();
             // 工具产物 → 附件卡片（跟在回复后面，点击进预览；去重避免重复转换出重复卡）

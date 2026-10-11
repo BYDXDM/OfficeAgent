@@ -133,6 +133,9 @@ namespace OfficeAgent.Host
             ok = true;
             try
             {
+                // 0.9.13：模型产出里的「员工NN」在此统一还原真名——工具产物（建表/导出）
+                // 和文件路径参数都用真名。名单为空时是 no-op。
+                argsJson = NameMasking.Restore(argsJson ?? "");
                 Current = cfg;   // 安全兜底判定需要配置（总开关/白名单）
                 Dictionary<string, string> a = ParseArgs(argsJson);
                 switch (name)
@@ -163,10 +166,17 @@ namespace OfficeAgent.Host
                     case "excel_formula_reference":
                         return FormulaReference.Lookup(GetStr(a, "keyword"), GetStr(a, "category"), GetStr(a, "name"), out ok);
                     case "analyze_attendance": {
-                        string aErr;
-                        string r7 = FrpReport.AnalyzeAttendance(GetStr(a, "path"), out aErr);
+                        string aErr; List<string> roster;
+                        string r7 = FrpReport.AnalyzeAttendance(GetStr(a, "path"), out aErr, out roster);
                         ok = aErr == null;
-                        if (ok) AuditLog.Record("file_read", "agent_attendance " + GetStr(a, "path"));
+                        if (ok)
+                        {
+                            // 0.9.13：报告里的真名在此换「员工NN」再回传模型——名单登记进会话
+                            // 映射，模型答复中的假名由 ChatPanel 显示时还原。真名不出本机。
+                            NameMasking.Register(roster);
+                            AuditLog.Record("file_read", "agent_attendance " + GetStr(a, "path"));
+                            return NameMasking.Mask(r7);
+                        }
                         return r7; }
                     case "repair_environment": return RepairEnvironment();
                     case "delete_file": return DeleteFile(GetStr(a, "path"), out ok);

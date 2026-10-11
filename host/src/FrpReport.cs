@@ -600,7 +600,8 @@ namespace OfficeAgent.Host
             sb.Append("考勤解析结果（frp 打印模板）");
             if (period.Length > 0) sb.Append("　考期：" + period);
             sb.Append("\n口径说明：工时=完整打卡段之和（晚班跨零点自动 +24h）；\"HH:MM-\"或\"-HH:MM\"=打卡不完整，不计工时；");
-            sb.Append("工作日（一~五）全天无打卡列为「无打卡工作日」——缺勤还是请假无法从打卡数据区分，需向用户确认口径后统计。\n");
+            sb.Append("工作日（一~五）全天无打卡列为「无打卡工作日」——缺勤还是请假无法从打卡数据区分，需向用户确认口径后统计。");
+            sb.Append("报告附默认口径速览（标准 8h/工作日、工作日无打卡=缺勤、周六日不计）；口径不符请说明，按你的口径重算。\n");
             int ti2 = 0;
             foreach (AttEmp e in emps)
             {
@@ -632,7 +633,11 @@ namespace OfficeAgent.Host
                 List<string> ic = new List<string>();
                 for (int k = 0; k < e.Incomplete.Count; k++) { if (!ic.Contains(e.Incomplete[k])) ic.Add(e.Incomplete[k]); }
                 if (np.Count > 0)
+                {
                     sb.Append("；无打卡工作日 " + np.Count + " 天（" + string.Join("、", np.ToArray()) + "）");
+                    // 默认口径速览（0.9.14）：不再干等口径反问，急着用可直接采纳，讲究的再纠正
+                    sb.Append("；默认口径计缺勤 " + np.Count + " 天（约扣 " + (np.Count * 8) + "h）");
+                }
                 if (ic.Count > 0)
                     sb.Append("；打卡不完整 " + ic.Count + " 处（" + string.Join("、", ic.ToArray()) + "）");
                 // 每日明细（供 agent 按用户口径统计请假/缺勤）

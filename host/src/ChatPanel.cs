@@ -183,6 +183,10 @@ namespace OfficeAgent.Host
 
         static Font NameFont = new Font("Microsoft YaHei UI", 8.25F);
         static Font TextFont = new Font("Microsoft YaHei UI", 9.75F);
+        // 附件卡片字体（0.9.14 提为静态：原来每次重绘每张卡 new 三个 Font，GDI 句柄 churn）
+        static readonly Font AttachTagFont = new Font("Microsoft YaHei UI", 8F, FontStyle.Bold);
+        static readonly Font AttachNameFont = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
+        static readonly Font AttachMetaFont = new Font("Microsoft YaHei UI", 8F);
 
         public ChatPanel(AppConfig cfg)
         {
@@ -2753,15 +2757,15 @@ namespace OfficeAgent.Host
                 using (GraphicsPath gp = RoundRect(icon, 6))
                 using (SolidBrush b = new SolidBrush(ic)) g.FillPath(b, gp);
                 string tag = ext.Length == 0 ? "FILE" : (ext.Length > 3 ? ext.Substring(0, 3) : ext);
-                TextRenderer.DrawText(g, tag, new Font("Microsoft YaHei UI", 8F, FontStyle.Bold), icon, Color.White,
+                TextRenderer.DrawText(g, tag, AttachTagFont, icon, Color.White,
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
                 string nm = Path.GetFileName(m.AttachPath);
                 string sz = "";
                 try { long b2 = new FileInfo(m.AttachPath).Length; sz = b2 >= 1024 ? (b2 / 1024.0).ToString("0.#") + " KB" : b2 + " B"; } catch { }
-                TextRenderer.DrawText(g, nm, new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+                TextRenderer.DrawText(g, nm, AttachNameFont,
                     new Rectangle(left + 56, top + 4, bubbleW - 68, 20), Color.FromArgb(28, 30, 38),
                     TextFormatFlags.EndEllipsis);
-                TextRenderer.DrawText(g, sz + "  ·  点击预览", new Font("Microsoft YaHei UI", 8F),
+                TextRenderer.DrawText(g, sz + "  ·  点击预览", AttachMetaFont,
                     new Rectangle(left + 56, top + 24, bubbleW - 68, 18), Color.FromArgb(150, 153, 168),
                     TextFormatFlags.EndEllipsis);
                 return;

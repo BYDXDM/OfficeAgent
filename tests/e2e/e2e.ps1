@@ -91,8 +91,17 @@ function Click-Fg($proc, $cx, $cy) {
   Click-XY $proc.MainWindowHandle $cx $cy
 }
 function Type-Clip($text) {
-  Set-Clipboard -Value $text
-  Start-Sleep -Milliseconds 250
+  # 0.9.14 加固：Set-Clipboard 异步生效 + 桌面上有剪贴板类工具（ClipPic 等）会竞争，
+  # 粘贴前必须回读校验——否则会把上一段剪贴板内容粘进错误的框
+  # （实测：向导 URL 框空着、聊天文本进了模型下拉框）。
+  for ($i = 0; $i -lt 10; $i++) {
+    try { Set-Clipboard -Value $text } catch { Start-Sleep -Milliseconds 200; continue }
+    Start-Sleep -Milliseconds 120
+    $got = $null
+    try { $got = Get-Clipboard -Raw } catch {}
+    if ($got -eq $text) { break }
+  }
+  Start-Sleep -Milliseconds 150
   [System.Windows.Forms.SendKeys]::SendWait("^v")
   Start-Sleep -Milliseconds 250
 }
@@ -174,6 +183,21 @@ function Restore-UserConfig {
       Write-Host "[INFO] 本次运行无可还原的用户配置（运行前本就没有 config）"
     }
   } catch { Write-Host ("[WARN] 还原用户配置失败: " + $_.Exception.Message) }
+  # 0.9.14：会话库/记忆/聊天历史同属用户数据——测试隔离，退出还原
+  try {
+    if (Test-Path $script:sessBak) {
+      if (Test-Path $script:sessDir) { Remove-Item $script:sessDir -Recurse -Force }
+      Move-Item $script:sessBak $script:sessDir -Force
+      Write-Host "[INFO] 已还原用户会话库"
+    }
+    foreach ($pair in @(@($script:memFile, $script:memBak), @($script:histFile, $script:histBak))) {
+      if (Test-Path $pair[1]) {
+        if (Test-Path $pair[0]) { Remove-Item $pair[0] -Force }
+        Move-Item $pair[1] $pair[0] -Force
+      }
+    }
+    Write-Host "[INFO] 已还原记忆与聊天历史"
+  } catch { Write-Host ("[WARN] 还原会话/记忆失败: " + $_.Exception.Message) }
 }
 # 兜底：脚本因任何原因（报错 / Ctrl-C / 被外部终止）提前结束，也要把配置还回去。
 # 实测踩到过：上一次 E2E 被中断后只留下 .e2e-backup，用户的 config 一直处于缺失状态。
@@ -189,10 +213,22 @@ if ((Test-Path $cfgBak) -and -not (Test-Path $cfgFile)) {
 }
 if (Test-Path $cfgFile) { Copy-Item $cfgFile $cfgBak -Force }
 if (Test-Path $cfgFile) { Remove-Item $cfgFile -Force }
+# 0.9.14：会话库/记忆/历史一并隔离（此前只清 config，应用启动后恢复用户真实会话，
+# 测试消息全打进用户会话——截图实锤过）。有上次残留备份先还原再备份，逻辑与 config 相同。
+$sessDir  = Join-Path $env:LOCALAPPDATA "OfficeAgent\sessions"
+$sessBak  = $sessDir + ".e2e-backup"
+$memFile  = Join-Path $env:LOCALAPPDATA "OfficeAgent\memory.json"
+$memBak   = $memFile + ".e2e-backup"
+$histFile = Join-Path $env:LOCALAPPDATA "OfficeAgent\history.jsonl"
+$histBak  = $histFile + ".e2e-backup"
+if ((Test-Path $sessBak) -and -not (Test-Path $sessDir)) { Move-Item $sessBak $sessDir -Force }
+if ((Test-Path $memBak) -and -not (Test-Path $memFile)) { Move-Item $memBak $memFile -Force }
+if ((Test-Path $histBak) -and -not (Test-Path $histFile)) { Move-Item $histBak $histFile -Force }
+if (Test-Path $sessDir) { Move-Item $sessDir $sessBak -Force }
+if (Test-Path $memFile) { Move-Item $memFile $memBak -Force }
+if (Test-Path $histFile) { Move-Item $histFile $histBak -Force }
 if (Test-Path $mockLog) { Remove-Item $mockLog -Force }
 if (Test-Path $outXlsx) { Remove-Item $outXlsx -Force }
-Remove-Item (Join-Path $env:LOCALAPPDATA "OfficeAgent\memory.json") -Force -ErrorAction SilentlyContinue
-Remove-Item (Join-Path $env:LOCALAPPDATA "OfficeAgent\history.jsonl") -Force -ErrorAction SilentlyContinue
 Set-Content -LiteralPath $sampleCsv -Value "科目,借方,贷方,日期`r`n库存现金,100.50,0,2026-09-19`r`n银行存款,0,100.50,2026-09-19" -Encoding UTF8
 Start-Process powershell -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $repo "tests\e2e\mock-llm.ps1") -WindowStyle Hidden
 Start-Sleep -Seconds 2
@@ -246,9 +282,16 @@ $rcGate = Invoke-Capture $exe ("/skillrun|row-stat|" + $flowCsv) $srOut
 $gateTxt = if (Test-Path $srOut) { Get-Content $srOut -Raw } else { "" }
 Note (($rcGate -eq 2) -and ($gateTxt -notlike '*"ok": true*')) "0.6a CLI /skillrun 无 --yes 被拒（确认门禁）" ("exit=" + $rcGate)
 
-$rc = Invoke-Capture $exe ("/skillrun|row-stat|" + $flowCsv + "|--yes") $srOut
-$srTxt = if (Test-Path $srOut) { Get-Content $srOut -Raw } else { "" }
-Note (($srTxt -like '*"ok": true*') -or ($rc -eq 0)) "0.6b CLI /skillrun --yes 执行 python 技能（row-stat）" ("exit=" + $rc)
+# 0.6b 依赖 sidecar python（<root>\runtime\py38）——dev 仓库外置（OfficeAgent-deps-runtime），
+# 无它时 /skillrun exit=-100 属预期；装机版才有。无 runtime 时本用例标记跳过。
+$rtPy = Join-Path $repo "runtime\py38\python.exe"
+if (Test-Path $rtPy) {
+  $rc = Invoke-Capture $exe ("/skillrun|row-stat|" + $flowCsv + "|--yes") $srOut
+  $srTxt = if (Test-Path $srOut) { Get-Content $srOut -Raw } else { "" }
+  Note (($srTxt -like '*"ok": true*') -or ($rc -eq 0)) "0.6b CLI /skillrun --yes 执行 python 技能（row-stat）" ("exit=" + $rc)
+} else {
+  Note $true "0.6b CLI /skillrun --yes（跳过：dev 机无 runtime\py38 sidecar python）" "env-skip"
+}
 
 # ---------- 1. 启动 ----------
 $p = Start-Process -FilePath $exe -PassThru

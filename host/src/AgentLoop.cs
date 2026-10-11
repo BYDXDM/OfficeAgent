@@ -238,7 +238,11 @@ namespace OfficeAgent.Host
                                     }
                                 }
                                 result = TruncToolResult(result);
-                                // 读型工具重放时明确告知：这次是重新读取，结果可能与上面不同
+                                // 0.9.14：所有工具结果回模型的统一出口——会话名单内的真名
+                                // （xlsx/csv/txt 读取、转换产物清单等路径）在此假名化。
+                                // 名单空 = no-op；analyze_attendance 已在工具侧 Mask，此处幂等。
+                                result = NameMasking.Mask(result);
+                                // 读型工具重放时明确告知：这次是重新读取，结果可能与上面那次不同
                                 if (seenTimes >= 1)
                                 {
                                     result = "（注意：这是对同一目标的重新读取，内容可能与上面那次不同）\n" + result;

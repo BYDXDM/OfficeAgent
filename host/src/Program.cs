@@ -23,6 +23,49 @@ namespace OfficeAgent.Host
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern bool AttachConsole(int processId);
         const int ATTACH_PARENT_PROCESS = -1;
+        [DllImport("kernel32.dll")]
+        static extern IntPtr GetStdHandle(int std);
+        [DllImport("kernel32.dll")]
+        static extern uint GetFileType(IntPtr h);
+        const int STD_OUTPUT_HANDLE = -11;
+        const uint FILE_TYPE_CHAR = 0x0002;   // 控制台字符设备（区别于重定向的磁盘文件/管道）
+
+        // CLI 头部控制台接线（0.9.14 收敛：原先是散在 ~30 处的三行 try/catch）。
+        // 分两条路：
+        //   真 console → Attach/Alloc + OutputEncoding=UTF8（控制台 API 路）。
+        //   重定向（文件/管道）→ winexe 没有控制台句柄，OutputEncoding setter 会抛
+        //   IOException（探针实测），输出回落 ANSI——E2E 按 UTF-8 读输出文件就全挂
+        //   （0.9.14 实录：/gridtest 内容全对却断言失败）。改把 stdout 直接换成
+        //   UTF-8 StreamWriter，绕开控制台 API。
+        // 另：Git Bash 直跑"挂死"的真因是 MSYS 把 /jsontest 这类参数转成了路径
+        // （MSYS2_ARG_CONV_EXCL='*' 可免），与控制台无关——参数落空后走了 GUI 而已。
+        static void AttachCli()
+        {
+            bool console = false;
+            try
+            {
+                IntPtr h = GetStdHandle(STD_OUTPUT_HANDLE);
+                console = h != IntPtr.Zero && (long)h != -1 && GetFileType(h) == FILE_TYPE_CHAR;
+            }
+            catch { }
+            if (console)
+            {
+                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
+                try { AllocConsole(); } catch { }
+                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+            }
+            else
+            {
+                try
+                {
+                    StreamWriter sw = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false));
+                    sw.AutoFlush = true;
+                    Console.SetOut(sw);
+                }
+                catch { }
+            }
+        }
+
 
         [DllImport("user32.dll")]
         static extern bool SetProcessDPIAware();
@@ -147,225 +190,169 @@ namespace OfficeAgent.Host
 
             if (guardTest)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunGuardTest();
             }
 
             if (maskTest)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunMaskTest();
             }
 
             if (intentTest)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunIntents();
             }
 
             if (suggestTest)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunSuggestTest();
             }
 
             if (gridTestInput != null)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunGridTest(gridTestInput);
             }
 
             if (caretTest)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunCaretTest();
             }
 
             if (toolidTest)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunToolIdTest();
             }
 
             if (dropTest)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunDropTest();
             }
 
             if (frpTest)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunFrpTest();
             }
 
             if (urlTest)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunUrlTest();
             }
 
             if (menuTest)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunMenuTest();
             }
 
             if (safetyTest)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunSafetyTest();
             }
 
             if (formulaTest)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunFormulaTest();
             }
 
             if (xlsxCacheTest)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunXlsxCacheTest();
             }
 
             if (skillTest)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunSkillTest();
             }
 
             if (auditTest)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunAuditTest();
             }
 
             if (detectTest)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunDetectTest();
             }
 
             if (bridgeTest)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunBridgeTest();
             }
 
             if (planTest)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunPlanTest();
             }
 
             if (perfTest)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunPerfTest();
             }
 
             if (jsonTest)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunJsonTest();
             }
 
             if (skillRunArgs != null)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunSkillRun(skillRunArgs);
             }
 
             if (agentTestArgs != null)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunAgentTest(agentTestArgs);
             }
 
             if (reconArgs != null)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunRecon(reconArgs);
             }
 
             if (mergeArgs != null)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunMerge(mergeArgs);
             }
 
             if (invoiceArgs != null)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunInvoices(invoiceArgs);
             }
 
             if (pdfTextInput != null)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunPdfText(pdfTextInput);
             }
 
             if (selftest)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 string root = EnvDetect.FindRoot();
                 Console.WriteLine("root=" + root);
                 foreach (DetectItem it in EnvDetect.DetectAll(root))
@@ -377,17 +364,13 @@ namespace OfficeAgent.Host
 
             if (convertInput != null)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunConvert(convertInput, convertTarget);
             }
 
             if (renderInput != null)
             {
-                try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
-                try { AllocConsole(); } catch { }
-                try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+                AttachCli();
                 return RunRenderPdf(renderInput, renderOutput);
             }
 
